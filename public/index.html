@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIMoney Lab — ranked ways to make money with AI</title>
+<meta name="description" content="Priority-ranked AI money-making opportunities, research briefs, live experiments, and the autonomous research agent log.">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead-inner">
+    <div>
+      <p class="brand">AIMoney Lab</p>
+      <h1>Every way to make money with AI, ranked.</h1>
+      <p class="lede">Agents research around the clock. You test, kill, and scale. Scores re-optimize as evidence lands.</p>
+    </div>
+    <div class="masthead-side">
+      <div class="agent-pill" id="agent-pill" title="Latest research run">
+        <span class="dot" id="agent-dot"></span>
+        <span id="agent-text">agent: …</span>
+      </div>
+      <div class="masthead-actions">
+        <button id="btn-run" class="btn ghost" type="button">Run research now</button>
+        <button id="btn-admin" class="btn" type="button">Admin</button>
+      </div>
+    </div>
+  </div>
+  <nav class="tabs" aria-label="Sections">
+    <button class="tab active" data-tab="priority" type="button">Priority list</button>
+    <button class="tab" data-tab="experiments" type="button">Experiments <span class="count" id="exp-count"></span></button>
+    <button class="tab" data-tab="research" type="button">Research log</button>
+    <span class="formula">score = 100 · value · confidence · fit / (effort + 1)</span>
+  </nav>
+</header>
+
+<main>
+  <section id="tab-priority" class="tabpanel">
+    <div class="toolbar">
+      <div class="filters" role="group" aria-label="Status filter">
+        <button class="chip active" data-status="" type="button">All</button>
+        <button class="chip" data-status="backlog" type="button">Backlog</button>
+        <button class="chip" data-status="researching" type="button">Researching</button>
+        <button class="chip" data-status="testing" type="button">Testing</button>
+        <button class="chip" data-status="scaling" type="button">Scaling</button>
+        <button class="chip" data-status="killed" type="button">Killed</button>
+      </div>
+      <button id="btn-add" class="btn small" type="button">+ Add opportunity</button>
+    </div>
+    <div class="table-wrap">
+      <table class="ledger" id="ledger">
+        <thead>
+          <tr>
+            <th class="num">#</th>
+            <th>Opportunity</th>
+            <th>Status</th>
+            <th class="num">Score</th>
+            <th title="Realistic monthly revenue at modest scale">Value</th>
+            <th title="Weeks of focused work to first dollar">Effort</th>
+            <th title="Strength of evidence">Conf.</th>
+            <th title="Leverage of your existing stack">Fit</th>
+            <th class="num">$/mo</th>
+            <th>First $</th>
+          </tr>
+        </thead>
+        <tbody id="ledger-body">
+          <tr><td colspan="10" class="muted">Loading priority list…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-experiments" class="tabpanel hidden">
+    <div class="toolbar">
+      <p class="muted" id="exp-summary">No experiments yet.</p>
+      <button id="btn-add-exp" class="btn small" type="button">+ Log experiment</button>
+    </div>
+    <div class="board" id="board"></div>
+  </section>
+
+  <section id="tab-research" class="tabpanel hidden">
+    <div class="table-wrap">
+      <table class="ledger" id="runs">
+        <thead>
+          <tr><th>Run</th><th>Trigger</th><th>Finished</th><th>Status</th>
+          <th class="num">Signals</th><th class="num">Added</th><th class="num">Updated</th>
+          <th class="num">Briefs</th><th class="num">AI calls</th><th>Error</th></tr>
+        </thead>
+        <tbody id="runs-body">
+          <tr><td colspan="10" class="muted">Loading research log…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<aside id="drawer" class="drawer hidden" aria-label="Opportunity detail">
+  <div class="drawer-head">
+    <button id="drawer-close" class="btn ghost small" type="button">← Back to list</button>
+    <span class="muted mono" id="drawer-slug"></span>
+  </div>
+  <div id="drawer-body"></div>
+</aside>
+<div id="drawer-scrim" class="scrim hidden"></div>
+
+<dialog id="modal"><form method="dialog" id="modal-form"></form></dialog>
+<div id="toast" class="toast hidden" role="status"></div>
+
+<footer>
+  <span>AIMoney Lab · scores recompute on every write · killed ideas stay listed with post-mortems</span>
+  <span class="mono muted" id="rev"></span>
+</footer>
+<script src="/app.js" defer></script>
+</body>
+</html>

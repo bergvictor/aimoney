@@ -1,0 +1,15 @@
+{
+  "name": "aimoney",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AIMoney Lab — ranked AI money-making opportunities, research briefs, experiments, and a cron research agent (Cloudflare Pages + Worker + D1).",
+  "scripts": {
+    "deploy": "./deploy/deploy.sh",
+    "verify": "./deploy/verify.sh",
+    "worker:dev": "wrangler dev --config worker/wrangler.toml",
+    "pages:dev": "wrangler pages dev public --d1 DB=aimoney"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

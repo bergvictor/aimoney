@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "project": "aimoney",
+  "description": "AIMoney Lab — ranked AI money-making opportunities, research briefs, experiments, autonomous research agent.",
+  "source": { "remote": "origin", "repo": "bergvictor/aimoney", "branch": "master" },
+  "build": {
+    "type": "cloudflare-pages-git-connected",
+    "pages_build_output_dir": "public",
+    "pages_build_command": "(none — static)",
+    "worker_build": "wrangler deploy --config worker/wrangler.toml (also .github/workflows on push)",
+    "script": "deploy/deploy.sh",
+    "verify_script": "deploy/verify.sh"
+  },
+  "cloudflare": {
+    "account_id": "97120bae9770152d66a6881976a2a2d4",
+    "pages_project": "aimoney",
+    "pages_branch": "master",
+    "pages_config": "wrangler.toml",
+    "worker_name": "aimoney-research",
+    "worker_config": "worker/wrangler.toml",
+    "worker_cron": "0 */6 * * *",
+    "d1_database": "aimoney",
+    "d1_binding": "DB",
+    "ai_binding": "AI (Workers AI, worker only)",
+    "env_vars": {
+      "ADMIN_TOKEN": "secret — Pages env var + worker secret; one value drives dashboard writes and manual research runs",
+      "RESEARCH_WORKER_URL": "plain — Pages env var pointing at the worker origin (manual trigger button)"
+    },
+    "credentials": "Named external CLOUDFLARE_API_TOKEN (Pages + Workers + D1 + AI edit); never version credential values"
+  },
+  "verification": {
+    "revision_path": "/release.json",
+    "sites": ["https://aimoney.pages.dev"],
+    "api_health": "https://aimoney.pages.dev/api/health",
+    "api_priority": "https://aimoney.pages.dev/api/opportunities",
+    "api_runs": "https://aimoney.pages.dev/api/runs",
+    "worker_status": "https://aimoney-research.levitinvlad.workers.dev/",
+    "markers": {
+      "dashboard": "AIMoney Lab",
+      "app_js": "renderLedger",
+      "health": "\"ok\":true",
+      "worker": "\"agent\":\"research-v1\""
+    }
+  }
+}

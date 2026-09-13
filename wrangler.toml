@@ -1,0 +1,16 @@
+name = "aimoney"
+# NOTE: Pages config files do not support account_id (wrangler rejects it). Pin the
+# deploy account (levitinvlad@hotmail) via env var instead:
+#   CLOUDFLARE_ACCOUNT_ID=97120bae9770152d66a6881976a2a2d4
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = "public"
+
+# D1 database. Create it once, then fill in the id:
+#   wrangler d1 create aimoney
+#   wrangler d1 execute aimoney --file=d1/schema.sql
+#   wrangler d1 execute aimoney --file=d1/seed.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "aimoney"
+database_id = "REPLACE_AFTER_CREATE"

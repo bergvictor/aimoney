@@ -1,0 +1,21 @@
+name = "aimoney-research"
+main = "src/index.js"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Research cadence: every 6 hours. The agent is idempotent (signals deduped,
+# briefs versioned), so overlapping or retried runs are harmless.
+[triggers]
+crons = ["0 */6 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "aimoney"
+database_id = "REPLACE_AFTER_CREATE"
+
+[ai]
+binding = "AI"
+
+# Manual runs: set once, never commit the value.
+#   wrangler secret put ADMIN_TOKEN --config worker/wrangler.toml
+# Same value as the Pages ADMIN_TOKEN env var so one token drives the dashboard.

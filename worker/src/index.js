@@ -1,0 +1,283 @@
+// AIMoney research agent — Cloudflare Worker.
+// Cron (every 6h) + manual POST /run. Scans public sources for AI-money
+// signals, dedupes against the D1 priority list with Workers AI, adds new
+// opportunities and briefs, and logs every run. The agent PROPOSES; the human
+// owns the testing workflow (it never moves status to testing/scaling/killed).
+
+const AI_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+const AI_FALLBACK = "@cf/mistral/mistral-7b-instruct-v0.1";
+const MAX_SIGNALS_PER_SOURCE = 8;
+const MAX_AI_SIGNALS = 10;
+const MAX_AI_CALLS = 4;
+const FETCH_TIMEOUT_MS = 12000;
+
+const HN_QUERIES = ["AI passive income", "AI SaaS revenue", "AI automation agency", "make money with AI"];
+const REDDIT_QUERIES = ["AI side income", "AI SaaS", "AI agency"];
+const REDDITS = "SideProject+Entrepreneur+alphaandbeta+startups";
+const GITHUB_QUERIES = ["ai-saas-boilerplate", "ai-money", "ai-side-project"];
+
+const json = (data, status = 200) =>
+  new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+
+async function timedFetch(url, opts = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, { ...opts, signal: ctrl.signal, redirect: "follow" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function hnSignals() {
+  const out = [];
+  for (const q of HN_QUERIES) {
+    try {
+      const r = await timedFetch(
+        `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(q)}&tags=story&hitsPerPage=${MAX_SIGNALS_PER_SOURCE}`);
+      const j = await r.json();
+      for (const h of (j.hits || [])) {
+        if (!h.title) continue;
+        out.push({
+          source: "hn", external_id: String(h.objectID || h.title),
+          title: String(h.title).slice(0, 300),
+          url: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
+          snippet: `HN: ${h.points || 0} points, ${h.num_comments || 0} comments.`,
+          published_at: h.created_at || "",
+        });
+      }
+    } catch { /* source hiccup must not kill the run */ }
+  }
+  return out;
+}
+
+async function redditSignals() {
+  const out = [];
+  for (const q of REDDIT_QUERIES) {
+    try {
+      const r = await timedFetch(
+        `https://www.reddit.com/r/${REDDITS}/search.json?q=${encodeURIComponent(q)}&sort=new&limit=${MAX_SIGNALS_PER_SOURCE}&restrict_sr=on`,
+        { headers: { "User-Agent": "aimoney-lab/0.1 research (contact: local)" } });
+      const j = await r.json();
+      for (const c of ((j.data || {}).children || [])) {
+        const d = c.data || {};
+        if (!d.title) continue;
+        out.push({
+          source: "reddit", external_id: String(d.id || d.title),
+          title: String(d.title).slice(0, 300),
+          url: `https://www.reddit.com${d.permalink || ""}`,
+          snippet: `r/${d.subreddit}: ${d.score || 0} upvotes. ${(d.selftext || "").slice(0, 280)}`,
+          published_at: d.created_utc ? new Date(d.created_utc * 1000).toISOString() : "",
+        });
+      }
+    } catch { /* 429s happen; HN usually carries the run */ }
+  }
+  return out;
+}
+
+async function githubSignals() {
+  const out = [];
+  const since = new Date(Date.now() - 90 * 864e5).toISOString().slice(0, 10);
+  for (const q of GITHUB_QUERIES.slice(0, 2)) {
+    try {
+      const r = await timedFetch(
+        `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}+created:>${since}&sort=stars&order=desc&per_page=${MAX_SIGNALS_PER_SOURCE}`,
+        { headers: { "User-Agent": "aimoney-lab/0.1", "Accept": "application/vnd.github+json" } });
+      const j = await r.json();
+      for (const repo of (j.items || [])) {
+        out.push({
+          source: "github", external_id: String(repo.id || repo.full_name),
+          title: `${repo.full_name}: ${repo.description || "no description"}`.slice(0, 300),
+          url: repo.html_url || "",
+          snippet: `GitHub: ${repo.stargazers_count || 0} stars. ${(repo.description || "").slice(0, 240)}`,
+          published_at: repo.created_at || "",
+        });
+      }
+    } catch { /* unauth rate limit is 10 req/min; fine at this volume */ }
+  }
+  return out;
+}
+
+async function aiComplete(env, state, messages) {
+  if (state.ai_calls >= MAX_AI_CALLS) throw new Error("ai call budget spent");
+  state.ai_calls++;
+  try {
+    const r = await env.AI.run(AI_MODEL, { messages, max_tokens: 1500 });
+    return r.response || "";
+  } catch {
+    const r = await env.AI.run(AI_FALLBACK, { messages, max_tokens: 1500 });
+    return r.response || "";
+  }
+}
+
+function parseJsonArray(text) {
+  const m = String(text || "").match(/\[[\s\S]*\]/);
+  if (!m) return [];
+  try {
+    const v = JSON.parse(m[0]);
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
+const clamp10 = (v, d = 5) => {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? Math.min(10, Math.max(1, n)) : d;
+};
+const slugify = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+const scoreOf = (o) => Math.round(100 * ((o.value * o.confidence * o.fit) / (o.effort + 1)) * 10) / 10;
+
+async function runResearch(env, trigger) {
+  const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0 };
+  const run = await env.DB.prepare(
+    "INSERT INTO agent_runs (agent, trigger) VALUES ('research-v1', ?) RETURNING id")
+    .bind(trigger).first().catch(() => null);
+  // D1 RETURNING support varies; fall back to last_row_id lookup.
+  let runId = run && run.id;
+  if (!runId) {
+    const r = await env.DB.prepare(
+      "SELECT id FROM agent_runs WHERE agent='research-v1' ORDER BY id DESC LIMIT 1").first();
+    runId = r ? r.id : null;
+  }
+  const finish = (status, error = "") =>
+    runId ? env.DB.prepare(
+      `UPDATE agent_runs SET finished_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+       status=?, signals_seen=?, added=?, updated=?, briefs=?, ai_calls=?, error=?
+       WHERE id=?`
+    ).bind(status, state.seen, state.added, state.updated, state.briefs,
+      state.ai_calls, String(error).slice(0, 1000), runId).run().catch(() => null) : null;
+
+  try {
+    // 1. Collect signals (bounded, independent — one dead source is fine).
+    const batches = await Promise.allSettled([hnSignals(), redditSignals(), githubSignals()]);
+    const signals = batches.flatMap((b) => (b.status === "fulfilled" ? b.value : []));
+    state.seen = signals.length;
+    for (const s of signals) {
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO signals (source, external_id, title, url, snippet, published_at)
+         VALUES (?,?,?,?,?,?)`
+      ).bind(s.source, s.external_id, s.title, s.url, s.snippet, s.published_at).run();
+    }
+    const fresh = await env.DB.prepare(
+      "SELECT * FROM signals WHERE processed = 0 ORDER BY id DESC LIMIT ?")
+      .bind(MAX_AI_SIGNALS).all().then((r) => r.results || []);
+    if (!fresh.length) {
+      await finish("ok");
+      return { status: "ok", note: "no fresh signals", ...state };
+    }
+
+    // 2. One AI pass: classify signals against the live priority list.
+    const opps = await env.DB.prepare(
+      "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
+      .all().then((r) => r.results || []);
+    const classifyPrompt = [
+      { role: "system", content: "You triage money-making-with-AI leads. Reply with ONLY a JSON array, no prose." },
+      { role: "user", content:
+        `PRIORITY LIST (id | slug | title | status | score):\n` +
+        opps.map((o) => `${o.id} | ${o.slug} | ${o.title} | ${o.status} | ${o.score}`).join("\n") +
+        `\n\nFRESH SIGNALS (n | source | title | snippet | url):\n` +
+        fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.snippet} | ${s.url}`).join("\n") +
+        `\n\nFor each signal index 0..${fresh.length - 1} emit one object:
+{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id|null,"title":"...","one_liner":"...","category":"...","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"why":"..."}.
+Rules: "new" only for a genuinely NEW money-making method not on the list (be strict — variants are "supports" or "noise"). value=realistic monthly revenue at modest scale (10≈$10k+/mo). effort=weeks to first dollar (10≈6+ months). confidence=evidence strength. fit=leverage of automation/bot/content skills. "supports" needs the matching opportunity_id.` },
+    ];
+    const verdicts = parseJsonArray(await aiComplete(env, state, classifyPrompt));
+    for (const v of verdicts) {
+      const sig = fresh[v.n];
+      if (!sig) continue;
+      if (v.action === "new" && v.title) {
+        const slug = slugify(v.title) || `agent-${sig.id}`;
+        const o = { value: clamp10(v.value), effort: clamp10(v.effort),
+          confidence: clamp10(v.confidence, 3), fit: clamp10(v.fit) };
+        try {
+          const r = await env.DB.prepare(
+            `INSERT INTO opportunities (slug, title, one_liner, category, status,
+             value, effort, confidence, fit, score, source, source_url, notes)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          ).bind(slug, String(v.title).slice(0, 200), String(v.one_liner || "").slice(0, 500),
+            String(v.category || "other").slice(0, 40), "researching",
+            o.value, o.effort, o.confidence, o.fit, scoreOf(o),
+            "agent", String(sig.url || "").slice(0, 500),
+            `Agent proposal: ${String(v.why || "").slice(0, 1000)}`).run();
+          state.added++;
+          await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
+            .bind(r.meta.last_row_id, sig.id).run();
+        } catch {
+          await env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id).run();
+        }
+      } else if (v.action === "supports" && v.opportunity_id) {
+        state.updated++;
+        await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
+          .bind(v.opportunity_id, sig.id).run();
+        await env.DB.prepare(
+          `UPDATE opportunities SET notes = substr(notes || ?, 1, 8000),
+           updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`)
+          .bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`,
+            v.opportunity_id).run().catch(() => null);
+      } else {
+        await env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id).run();
+      }
+    }
+
+    // 3. One AI pass: brief the highest-scored opportunity that has no brief.
+    const bare = await env.DB.prepare(
+      `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
+       WHERE b.id IS NULL ORDER BY o.score DESC LIMIT 1`).first();
+    if (bare) {
+      const sigs = await env.DB.prepare(
+        "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
+        .bind(bare.id).all().then((r) => r.results || []);
+      const text = await aiComplete(env, state, [
+        { role: "system", content: "You write terse, practical research briefs. Reply with ONLY a JSON object, no prose." },
+        { role: "user", content:
+          `Write a research brief for this AI money-making opportunity as JSON:
+{"summary":"2-3 sentences","what_works":"tactics as bullet lines","numbers":[{"claim":"...","source":"..."}],"risks":"...","first_steps":"numbered lines for week 1"}.
+Opportunity: ${bare.title} — ${bare.one_liner}
+Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") || "(none — use general knowledge, mark confidence accordingly)"}` },
+      ]);
+      try {
+        const m = String(text).match(/\{[\s\S]*\}/);
+        const b = JSON.parse(m ? m[0] : "{}");
+        await env.DB.prepare(
+          `INSERT INTO briefs (opportunity_id, version, summary, what_works,
+           numbers_json, risks, first_steps, sources_json, author)
+           VALUES (?,1,?,?,?,?,?,?,'agent')`
+        ).bind(bare.id, String(b.summary || ""), String(b.what_works || ""),
+          JSON.stringify(b.numbers || []), String(b.risks || ""),
+          String(b.first_steps || ""),
+          JSON.stringify(sigs.map((s) => ({ title: s.title, url: s.url })))).run();
+        state.briefs++;
+      } catch { /* malformed brief JSON: skip, briefs stay human-seeded */ }
+    }
+
+    await finish("ok");
+    return { status: "ok", ...state };
+  } catch (e) {
+    await finish("error", e && e.message || e);
+    return { status: "error", error: String(e && e.message || e), ...state };
+  }
+}
+
+export default {
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(runResearch(env, "cron").catch(() => null));
+  },
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/") {
+      const last = await env.DB.prepare(
+        "SELECT * FROM agent_runs ORDER BY id DESC LIMIT 1").first().catch(() => null);
+      return json({ ok: true, agent: "research-v1", last_run: last });
+    }
+    if (request.method === "POST" && url.pathname === "/run") {
+      const want = (env.ADMIN_TOKEN || "").trim();
+      const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+      if (!want || got !== want) return json({ error: "unauthorized" }, 401);
+      return json(await runResearch(env, "manual"));
+    }
+    return json({ error: "not found" }, 404);
+  },
+};
