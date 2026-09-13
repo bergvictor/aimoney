@@ -4,12 +4,20 @@
 // opportunities and briefs, and logs every run. The agent PROPOSES; the human
 // owns the testing workflow (it never moves status to testing/scaling/killed).
 
-const AI_MODEL = "@cf/meta/llama-3.1-8b-instruct";
-const AI_FALLBACK = "@cf/mistral/mistral-7b-instruct-v0.1";
+// Time budget: waitUntil is cancelled 30s after the response (proven live via
+// wrangler tail), and the manual path shares it — so the whole pass must fit.
+// Cron gets longer, but the pass is engineered for <30s everywhere: parallel
+// sources, ONE batched D1 round-trip per phase, small AI payloads, and the
+// brief pass self-skips when the clock is nearly spent (it lands next run).
+const AI_CLASSIFY = "@cf/mistral/mistral-7b-instruct-v0.1"; // fast triage
+const AI_BRIEF = "@cf/meta/llama-3.1-8b-instruct";          // quality writing
 const MAX_SIGNALS_PER_SOURCE = 8;
-const MAX_AI_SIGNALS = 10;
+const MAX_AI_SIGNALS = 6;
 const MAX_AI_CALLS = 4;
-const FETCH_TIMEOUT_MS = 8000;
+const FETCH_TIMEOUT_MS = 6000;
+const CLASSIFY_TOKENS = 700;
+const BRIEF_TOKENS = 900;
+const BRIEF_DEADLINE_MS = 18000; // skip the brief pass past this elapsed time
 // Runs stuck in "running" past this are declared dead by the next run.
 const STUCK_RUN_MINUTES = 30;
 
@@ -107,35 +115,19 @@ async function githubSignals() {
   return (await Promise.all(GITHUB_QUERIES.slice(0, 2).map(one))).flat();
 }
 
-async function aiComplete(env, state, messages) {
+async function aiComplete(env, state, model, fallback, maxTokens, messages) {
   if (state.ai_calls >= MAX_AI_CALLS) throw new Error("ai call budget spent");
   state.ai_calls++;
   try {
-    const r = await env.AI.run(AI_MODEL, { messages, max_tokens: 1500 });
+    const r = await env.AI.run(model, { messages, max_tokens: maxTokens });
     return r.response || "";
   } catch {
-    const r = await env.AI.run(AI_FALLBACK, { messages, max_tokens: 1500 });
+    const r = await env.AI.run(fallback, { messages, max_tokens: maxTokens });
     return r.response || "";
   }
 }
 
-function parseJsonArray(text) {
-  const m = String(text || "").match(/\[[\s\S]*\]/);
-  if (!m) return [];
-  try {
-    const v = JSON.parse(m[0]);
-    return Array.isArray(v) ? v : [];
-  } catch {
-    return [];
-  }
-}
-
-const clamp10 = (v, d = 5) => {
-  const n = Math.round(Number(v));
-  return Number.isFinite(n) ? Math.min(10, Math.max(1, n)) : d;
-};
-const slugify = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
-const scoreOf = (o) => Math.round(100 * ((o.value * o.confidence * o.fit) / (o.effort + 1)) * 10) / 10;
+import { clamp10, slugify, scoreOf, parseJsonArray } from "./lib.js";
 
 async function runResearch(env, trigger) {
   const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0 };
@@ -166,15 +158,24 @@ async function runResearch(env, trigger) {
       state.ai_calls, String(error).slice(0, 1000), runId).run().catch(() => null) : null;
 
   try {
+    const t0 = Date.now();
+    // Cron gets a long wall clock; the manual path shares waitUntil's 30s cap.
+    const briefDeadline = trigger === "cron" ? 300000 : BRIEF_DEADLINE_MS;
     // 1. Collect signals (bounded, independent — one dead source is fine).
     const batches = await Promise.allSettled([hnSignals(), redditSignals(), githubSignals()]);
     const signals = batches.flatMap((b) => (b.status === "fulfilled" ? b.value : []));
     state.seen = signals.length;
-    for (const s of signals) {
-      await env.DB.prepare(
+    // ONE batched round-trip instead of ~24 sequential inserts (9s -> 0.5s),
+    // then a heartbeat so the dashboard shows progress even if AI is slow.
+    if (signals.length) {
+      await env.DB.batch(signals.map((s) => env.DB.prepare(
         `INSERT OR IGNORE INTO signals (source, external_id, title, url, snippet, published_at)
          VALUES (?,?,?,?,?,?)`
-      ).bind(s.source, s.external_id, s.title, s.url, s.snippet, s.published_at).run();
+      ).bind(s.source, s.external_id, s.title, s.url, s.snippet, s.published_at)));
+    }
+    if (runId) {
+      await env.DB.prepare("UPDATE agent_runs SET signals_seen=? WHERE id=?")
+        .bind(state.seen, runId).run().catch(() => null);
     }
     const fresh = await env.DB.prepare(
       "SELECT * FROM signals WHERE processed = 0 ORDER BY id DESC LIMIT ?")
@@ -199,7 +200,8 @@ async function runResearch(env, trigger) {
 {"n":i,"action":"new"|"supports"|"noise","opportunity_id":id|null,"title":"...","one_liner":"...","category":"...","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"why":"..."}.
 Rules: "new" only for a genuinely NEW money-making method not on the list (be strict — variants are "supports" or "noise"). value=realistic monthly revenue at modest scale (10≈$10k+/mo). effort=weeks to first dollar (10≈6+ months). confidence=evidence strength. fit=leverage of automation/bot/content skills. "supports" needs the matching opportunity_id.` },
     ];
-    const verdicts = parseJsonArray(await aiComplete(env, state, classifyPrompt));
+    const verdicts = parseJsonArray(await aiComplete(
+      env, state, AI_CLASSIFY, AI_BRIEF, CLASSIFY_TOKENS, classifyPrompt));
     for (const v of verdicts) {
       const sig = fresh[v.n];
       if (!sig) continue;
@@ -237,15 +239,16 @@ Rules: "new" only for a genuinely NEW money-making method not on the list (be st
       }
     }
 
-    // 3. One AI pass: brief the highest-scored opportunity that has no brief.
-    const bare = await env.DB.prepare(
+    // 3. One AI pass: brief the highest-scored opportunity that has no brief —
+    // unless the clock is nearly spent (it lands on a later run instead).
+    const bare = (Date.now() - t0 < briefDeadline) ? await env.DB.prepare(
       `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
-       WHERE b.id IS NULL ORDER BY o.score DESC LIMIT 1`).first();
+       WHERE b.id IS NULL ORDER BY o.score DESC LIMIT 1`).first() : null;
     if (bare) {
       const sigs = await env.DB.prepare(
         "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
         .bind(bare.id).all().then((r) => r.results || []);
-      const text = await aiComplete(env, state, [
+      const text = await aiComplete(env, state, AI_BRIEF, AI_CLASSIFY, BRIEF_TOKENS, [
         { role: "system", content: "You write terse, practical research briefs. Reply with ONLY a JSON object, no prose." },
         { role: "user", content:
           `Write a research brief for this AI money-making opportunity as JSON:

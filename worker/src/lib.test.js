@@ -1,0 +1,50 @@
+// Focused regression tests for the research agent's triage math.
+// Run: npm test  (node --test, no framework)
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { clamp10, slugify, scoreOf, parseJsonArray } from "./lib.js";
+
+describe("scoreOf", () => {
+  it("matches the documented formula", () => {
+    // 100 * (8*8*10)/(3+1) = 16000 — the seeded top pick.
+    assert.equal(scoreOf({ value: 8, effort: 3, confidence: 8, fit: 10 }), 16000);
+    assert.equal(scoreOf({ value: 6, effort: 5, confidence: 5, fit: 8 }), 4000);
+  });
+  it("rewards low effort and punishes high effort", () => {
+    const lo = scoreOf({ value: 5, effort: 1, confidence: 5, fit: 5 });
+    const hi = scoreOf({ value: 5, effort: 10, confidence: 5, fit: 5 });
+    assert.ok(lo > hi * 4);
+  });
+});
+
+describe("clamp10", () => {
+  it("clamps, rounds, and falls back", () => {
+    assert.equal(clamp10(99), 10);
+    assert.equal(clamp10(-3), 1);
+    assert.equal(clamp10(4.6), 5);
+    assert.equal(clamp10("junk"), 5);
+    assert.equal(clamp10(undefined, 3), 3);
+  });
+});
+
+describe("slugify", () => {
+  it("produces URL-safe slugs", () => {
+    assert.equal(slugify("AI UGC Ads for DTC Brands!"), "ai-ugc-ads-for-dtc-brands");
+    assert.equal(slugify("  --x-- "), "x");
+    assert.equal(slugify(""), "");
+  });
+});
+
+describe("parseJsonArray", () => {
+  it("extracts arrays wrapped in model prose", () => {
+    const out = parseJsonArray('Here you go:\n[{"n":0,"action":"noise"}]\nDone.');
+    assert.deepEqual(out, [{ n: 0, action: "noise" }]);
+  });
+  it("returns [] for missing or malformed JSON", () => {
+    assert.deepEqual(parseJsonArray("no json here"), []);
+    assert.deepEqual(parseJsonArray("[{broken"), []);
+    assert.deepEqual(parseJsonArray('{"not":"array"}'), []);
+    assert.deepEqual(parseJsonArray(""), []);
+    assert.deepEqual(parseJsonArray(null), []);
+  });
+});
