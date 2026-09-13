@@ -384,7 +384,8 @@ $("#btn-run").addEventListener("click", async () => {
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
-    toast(`Research done: +${body.added || 0} new, ${body.updated || 0} updated, ${body.briefs || 0} briefs`);
+    toast("Research pass started — watch the Research log tab for results.");
+    setTimeout(refresh, 45000);
     await refresh();
   } catch (e) { toast(`Research failed: ${e.message}`); }
   btn.disabled = false;

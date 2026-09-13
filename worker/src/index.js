@@ -9,7 +9,9 @@ const AI_FALLBACK = "@cf/mistral/mistral-7b-instruct-v0.1";
 const MAX_SIGNALS_PER_SOURCE = 8;
 const MAX_AI_SIGNALS = 10;
 const MAX_AI_CALLS = 4;
-const FETCH_TIMEOUT_MS = 12000;
+const FETCH_TIMEOUT_MS = 8000;
+// Runs stuck in "running" past this are declared dead by the next run.
+const STUCK_RUN_MINUTES = 30;
 
 const HN_QUERIES = ["AI passive income", "AI SaaS revenue", "AI automation agency", "make money with AI"];
 const REDDIT_QUERIES = ["AI side income", "AI SaaS", "AI agency"];
@@ -32,8 +34,10 @@ async function timedFetch(url, opts = {}) {
 }
 
 async function hnSignals() {
-  const out = [];
-  for (const q of HN_QUERIES) {
+  // Queries run in parallel: sequential fetches + one hanging source blew the
+  // fetch-handler wall clock on the first live run (stuck "running" forever).
+  const one = async (q) => {
+    const out = [];
     try {
       const r = await timedFetch(
         `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(q)}&tags=story&hitsPerPage=${MAX_SIGNALS_PER_SOURCE}`);
@@ -49,13 +53,14 @@ async function hnSignals() {
         });
       }
     } catch { /* source hiccup must not kill the run */ }
-  }
-  return out;
+    return out;
+  };
+  return (await Promise.all(HN_QUERIES.map(one))).flat();
 }
 
 async function redditSignals() {
-  const out = [];
-  for (const q of REDDIT_QUERIES) {
+  const one = async (q) => {
+    const out = [];
     try {
       const r = await timedFetch(
         `https://www.reddit.com/r/${REDDITS}/search.json?q=${encodeURIComponent(q)}&sort=new&limit=${MAX_SIGNALS_PER_SOURCE}&restrict_sr=on`,
@@ -73,14 +78,15 @@ async function redditSignals() {
         });
       }
     } catch { /* 429s happen; HN usually carries the run */ }
-  }
-  return out;
+    return out;
+  };
+  return (await Promise.all(REDDIT_QUERIES.map(one))).flat();
 }
 
 async function githubSignals() {
-  const out = [];
   const since = new Date(Date.now() - 90 * 864e5).toISOString().slice(0, 10);
-  for (const q of GITHUB_QUERIES.slice(0, 2)) {
+  const one = async (q) => {
+    const out = [];
     try {
       const r = await timedFetch(
         `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}+created:>${since}&sort=stars&order=desc&per_page=${MAX_SIGNALS_PER_SOURCE}`,
@@ -96,8 +102,9 @@ async function githubSignals() {
         });
       }
     } catch { /* unauth rate limit is 10 req/min; fine at this volume */ }
-  }
-  return out;
+    return out;
+  };
+  return (await Promise.all(GITHUB_QUERIES.slice(0, 2).map(one))).flat();
 }
 
 async function aiComplete(env, state, messages) {
@@ -132,6 +139,14 @@ const scoreOf = (o) => Math.round(100 * ((o.value * o.confidence * o.fit) / (o.e
 
 async function runResearch(env, trigger) {
   const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0 };
+  // Reap runs a killed worker left behind: a "running" row older than the
+  // cutoff is dead by definition (a live run finishes in minutes).
+  await env.DB.prepare(
+    `UPDATE agent_runs SET status='error', finished_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+     error='worker killed mid-run (wall clock); reaped by next run'
+     WHERE agent='research-v1' AND status='running'
+     AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ','now', ?)`
+  ).bind(`-${STUCK_RUN_MINUTES} minutes`).run().catch(() => null);
   const run = await env.DB.prepare(
     "INSERT INTO agent_runs (agent, trigger) VALUES ('research-v1', ?) RETURNING id")
     .bind(trigger).first().catch(() => null);
@@ -265,7 +280,7 @@ export default {
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(runResearch(env, "cron").catch(() => null));
   },
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/") {
       const last = await env.DB.prepare(
@@ -276,7 +291,11 @@ export default {
       const want = (env.ADMIN_TOKEN || "").trim();
       const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
       if (!want || got !== want) return json({ error: "unauthorized" }, 401);
-      return json(await runResearch(env, "manual"));
+      // Accepted, not awaited: a research pass outlives the fetch-handler
+      // wall clock, so it runs in waitUntil exactly like the cron path.
+      // Watch progress at GET / and in the dashboard research log.
+      ctx.waitUntil(runResearch(env, "manual").catch(() => null));
+      return json({ status: "accepted" }, 202);
     }
     return json({ error: "not found" }, 404);
   },
