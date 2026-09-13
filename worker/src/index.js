@@ -175,10 +175,11 @@ async function runResearch(env, trigger) {
          VALUES (?,?,?,?,?,?)`
       ).bind(s.source, s.external_id, s.title, s.url, s.snippet, s.published_at)));
     }
-    if (runId) {
-      await env.DB.prepare("UPDATE agent_runs SET signals_seen=? WHERE id=?")
-        .bind(state.seen, runId).run().catch(() => null);
-    }
+    const mark = (phase) => runId
+      ? env.DB.prepare("UPDATE agent_runs SET signals_seen=?, ai_calls=?, error=? WHERE id=?")
+        .bind(state.seen, state.ai_calls, `phase:${phase}`).run().catch(() => null)
+      : Promise.resolve();
+    await mark("collected");
     const fresh = await env.DB.prepare(
       "SELECT * FROM signals WHERE processed = 0 ORDER BY id DESC LIMIT ?")
       .bind(MAX_AI_SIGNALS).all().then((r) => r.results || []);
@@ -202,8 +203,10 @@ async function runResearch(env, trigger) {
 {"n":i,"action":"new"|"supports"|"noise","opportunity_id":id|null,"title":"...","one_liner":"...","category":"...","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"why":"..."}.
 Rules: "new" only for a genuinely NEW money-making method not on the list (be strict — variants are "supports" or "noise"). value=realistic monthly revenue at modest scale (10≈$10k+/mo). effort=weeks to first dollar (10≈6+ months). confidence=evidence strength. fit=leverage of automation/bot/content skills. "supports" needs the matching opportunity_id.` },
     ];
+    await mark("classify-ai");
     const verdicts = parseJsonArray(await aiComplete(
       env, state, AI_CLASSIFY, AI_BRIEF, CLASSIFY_TOKENS, classifyPrompt));
+    await mark(`classified:${verdicts.length}`);
     for (const v of verdicts) {
       const sig = fresh[v.n];
       if (!sig) continue;
