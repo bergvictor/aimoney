@@ -29,13 +29,16 @@ const GITHUB_QUERIES = ["ai-saas-boilerplate", "ai-money", "ai-side-project"];
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 
-async function timedFetch(url, opts = {}) {
+// The timeout MUST cover the body read, not just the headers: one live run
+// stalled forever on a source that sent headers then trickled the body
+// (the old helper cleared the timer as soon as headers arrived).
+async function timedJson(url, opts = {}) {
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  const t = setTimeout(() => ctrl.abort(`timeout after ${FETCH_TIMEOUT_MS}ms`), FETCH_TIMEOUT_MS);
   try {
     const r = await fetch(url, { ...opts, signal: ctrl.signal, redirect: "follow" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r;
+    return await r.json();
   } finally {
     clearTimeout(t);
   }
@@ -47,9 +50,8 @@ async function hnSignals() {
   const one = async (q) => {
     const out = [];
     try {
-      const r = await timedFetch(
+      const j = await timedJson(
         `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(q)}&tags=story&hitsPerPage=${MAX_SIGNALS_PER_SOURCE}`);
-      const j = await r.json();
       for (const h of (j.hits || [])) {
         if (!h.title) continue;
         out.push({
@@ -70,10 +72,9 @@ async function redditSignals() {
   const one = async (q) => {
     const out = [];
     try {
-      const r = await timedFetch(
+      const j = await timedJson(
         `https://www.reddit.com/r/${REDDITS}/search.json?q=${encodeURIComponent(q)}&sort=new&limit=${MAX_SIGNALS_PER_SOURCE}&restrict_sr=on`,
         { headers: { "User-Agent": "aimoney-lab/0.1 research (contact: local)" } });
-      const j = await r.json();
       for (const c of ((j.data || {}).children || [])) {
         const d = c.data || {};
         if (!d.title) continue;
@@ -96,10 +97,9 @@ async function githubSignals() {
   const one = async (q) => {
     const out = [];
     try {
-      const r = await timedFetch(
+      const j = await timedJson(
         `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}+created:>${since}&sort=stars&order=desc&per_page=${MAX_SIGNALS_PER_SOURCE}`,
         { headers: { "User-Agent": "aimoney-lab/0.1", "Accept": "application/vnd.github+json" } });
-      const j = await r.json();
       for (const repo of (j.items || [])) {
         out.push({
           source: "github", external_id: String(repo.id || repo.full_name),
@@ -115,16 +115,25 @@ async function githubSignals() {
   return (await Promise.all(GITHUB_QUERIES.slice(0, 2).map(one))).flat();
 }
 
-async function aiComplete(env, state, model, fallback, maxTokens, messages) {
+// Every AI call races a timeout: a queued model must fail HONESTLY (and be
+// retried by a later tick) instead of freezing the run past the 30s cap.
+async function aiComplete(env, state, { model, fallback, maxTokens, messages, timeoutMs, retries }) {
   if (state.ai_calls >= MAX_AI_CALLS) throw new Error("ai call budget spent");
-  state.ai_calls++;
-  try {
-    const r = await env.AI.run(model, { messages, max_tokens: maxTokens });
-    return r.response || "";
-  } catch {
-    const r = await env.AI.run(fallback, { messages, max_tokens: maxTokens });
-    return r.response || "";
+  const attempts = [model, ...(retries > 0 ? [fallback] : [])];
+  let lastErr = null;
+  for (const m of attempts) {
+    state.ai_calls++;
+    try {
+      const r = await Promise.race([
+        env.AI.run(m, { messages, max_tokens: maxTokens }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error(`AI timeout after ${timeoutMs}ms (${m})`)), timeoutMs)),
+      ]);
+      return r.response || "";
+    } catch (e) {
+      lastErr = e;
+    }
   }
+  throw lastErr || new Error("AI failed");
 }
 
 import { clamp10, slugify, scoreOf, parseJsonArray } from "./lib.js";
@@ -204,8 +213,12 @@ async function runResearch(env, trigger) {
 Rules: "new" only for a genuinely NEW money-making method not on the list (be strict — variants are "supports" or "noise"). value=realistic monthly revenue at modest scale (10≈$10k+/mo). effort=weeks to first dollar (10≈6+ months). confidence=evidence strength. fit=leverage of automation/bot/content skills. "supports" needs the matching opportunity_id.` },
     ];
     await mark("classify-ai");
-    const verdicts = parseJsonArray(await aiComplete(
-      env, state, AI_CLASSIFY, AI_BRIEF, CLASSIFY_TOKENS, classifyPrompt));
+    const isCron = trigger === "cron";
+    const verdicts = parseJsonArray(await aiComplete(env, state, {
+      model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
+      messages: classifyPrompt,
+      timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
+    }));
     await mark(`classified:${verdicts.length}`);
     for (const v of verdicts) {
       const sig = fresh[v.n];
@@ -253,14 +266,19 @@ Rules: "new" only for a genuinely NEW money-making method not on the list (be st
       const sigs = await env.DB.prepare(
         "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
         .bind(bare.id).all().then((r) => r.results || []);
-      const text = await aiComplete(env, state, AI_BRIEF, AI_CLASSIFY, BRIEF_TOKENS, [
+      await mark("brief-ai");
+      const text = await aiComplete(env, state, {
+        model: AI_BRIEF, fallback: AI_CLASSIFY, maxTokens: BRIEF_TOKENS,
+        timeoutMs: 90000, retries: 1,
+        messages: [
         { role: "system", content: "You write terse, practical research briefs. Reply with ONLY a JSON object, no prose." },
         { role: "user", content:
           `Write a research brief for this AI money-making opportunity as JSON:
 {"summary":"2-3 sentences","what_works":"tactics as bullet lines","numbers":[{"claim":"...","source":"..."}],"risks":"...","first_steps":"numbered lines for week 1"}.
 Opportunity: ${bare.title} — ${bare.one_liner}
 Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") || "(none — use general knowledge, mark confidence accordingly)"}` },
-      ]);
+        ],
+      });
       try {
         const m = String(text).match(/\{[\s\S]*\}/);
         const b = JSON.parse(m ? m[0] : "{}");
