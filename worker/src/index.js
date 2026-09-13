@@ -292,6 +292,21 @@ export default {
         "SELECT * FROM agent_runs ORDER BY id DESC LIMIT 1").first().catch(() => null);
       return json({ ok: true, agent: "research-v1", last_run: last });
     }
+    if (request.method === "GET" && url.pathname === "/ping-ai") {
+      const want = (env.ADMIN_TOKEN || "").trim();
+      const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+      if (!want || got !== want) return json({ error: "unauthorized" }, 401);
+      const t0 = Date.now();
+      try {
+        const r = await env.AI.run(AI_CLASSIFY, {
+          messages: [{ role: "user", content: "Reply with exactly: ok" }],
+          max_tokens: 5,
+        });
+        return json({ ok: true, ms: Date.now() - t0, sample: String(r.response || "").slice(0, 20) });
+      } catch (e) {
+        return json({ ok: false, ms: Date.now() - t0, error: String(e && e.message || e).slice(0, 200) }, 500);
+      }
+    }
     if (request.method === "POST" && url.pathname === "/run") {
       const want = (env.ADMIN_TOKEN || "").trim();
       const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
