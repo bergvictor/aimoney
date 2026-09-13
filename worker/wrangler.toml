@@ -11,7 +11,7 @@ crons = ["0 */6 * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "aimoney"
-database_id = "REPLACE_AFTER_CREATE"
+database_id = "5f04098c-cb7c-4464-b8ae-e9063392ab70"
 
 [ai]
 binding = "AI"
