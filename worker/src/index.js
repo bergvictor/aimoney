@@ -159,8 +159,10 @@ async function runResearch(env, trigger) {
 
   try {
     const t0 = Date.now();
-    // Cron gets a long wall clock; the manual path shares waitUntil's 30s cap.
-    const briefDeadline = trigger === "cron" ? 300000 : BRIEF_DEADLINE_MS;
+    // The manual path shares waitUntil's 30s cap (proven live), so it runs
+    // collect+classify only and always fits. The brief pass runs on cron
+    // ticks, which get a long wall clock; a slow tick still self-skips.
+    const briefDeadline = trigger === "cron" ? 300000 : -1;
     // 1. Collect signals (bounded, independent — one dead source is fine).
     const batches = await Promise.allSettled([hnSignals(), redditSignals(), githubSignals()]);
     const signals = batches.flatMap((b) => (b.status === "fulfilled" ? b.value : []));
