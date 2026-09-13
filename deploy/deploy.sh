@@ -11,7 +11,13 @@ cd "$(dirname "$0")/.."
 : "${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN}"
 export CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN
 
-command -v wrangler >/dev/null 2>&1 || { echo "deploy.sh: wrangler not found (npm i -g wrangler)"; exit 1; }
+if command -v wrangler >/dev/null 2>&1; then
+  WRANGLER="wrangler"
+elif [ -x "./node_modules/.bin/wrangler" ]; then
+  WRANGLER="./node_modules/.bin/wrangler"
+else
+  echo "deploy.sh: wrangler not found (npm i -g wrangler, or npm install here)"; exit 1
+fi
 command -v git >/dev/null 2>&1 || { echo "deploy.sh: git not found"; exit 1; }
 
 REV="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -24,8 +30,8 @@ echo "==> aimoney deploy rev=${REV}"
 # 1. D1 schema (idempotent) + seed (only when the table is empty, so agent and
 # human rows are never overwritten by a redeploy).
 echo "==> D1: schema"
-wrangler d1 execute aimoney --file=d1/schema.sql --remote
-COUNT="$(wrangler d1 execute aimoney --remote --json \
+$WRANGLER d1 execute aimoney --file=d1/schema.sql --remote
+COUNT="$($WRANGLER d1 execute aimoney --remote --json \
   --command "SELECT COUNT(*) AS n FROM opportunities" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['results'][0]['n'])" 2>/dev/null || echo 0)"
 if [ "${COUNT:-0}" = "0" ]; then
@@ -41,10 +47,10 @@ echo "==> stamped public/release.json rev=${REV}"
 
 # 3. Pages site (direct deploy; the Git-connected project redeploys itself on push).
 echo "==> Pages: deploy"
-wrangler pages deploy public --project-name aimoney --commit-dirty=true
+$WRANGLER pages deploy public --project-name aimoney --commit-dirty=true
 
 # 4. Research worker (cron + AI + D1).
 echo "==> Worker: deploy"
-wrangler deploy --config worker/wrangler.toml
+$WRANGLER deploy --config worker/wrangler.toml
 
 echo "==> deployed rev=${REV}; now run ./deploy/verify.sh"
