@@ -44,6 +44,10 @@ describe("parseJsonLines", () => {
     const out = parseJsonLines('```json\n{"n":0,"action":"supports","opportunity_id":3}\n{"n":1,"action":"new","tit');
     assert.deepEqual(out, [{ n: 0, action: "supports", opportunity_id: 3 }]);
   });
+  it("extracts objects from numbered and bulleted lines", () => {
+    const out = parseJsonLines('1. {"n":0,"action":"noise"}\n- {"n":1,"action":"new"} trailing note');
+    assert.deepEqual(out, [{ n: 0, action: "noise" }, { n: 1, action: "new" }]);
+  });
   it("returns [] for missing or malformed JSON", () => {
     assert.deepEqual(parseJsonLines("no json here"), []);
     assert.deepEqual(parseJsonLines("[{broken"), []);

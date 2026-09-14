@@ -21,10 +21,15 @@ export const scoreOf = (o) =>
 export function parseJsonLines(text) {
   const out = [];
   for (const line of String(text || "").split("\n")) {
-    const t = line.trim().replace(/^```(?:json)?/, "").replace(/```$/, "").trim();
-    if (!t.startsWith("{") || !t.endsWith("}")) continue;
+    // Extract the first {...} span per line: models number ("1. {...}"),
+    // bullet ("- {...}"), fence, or trail prose after the object. The old
+    // whole-line check dropped every such line (proven live: 3 ok ticks,
+    // 48 signals, zero verdicts).
+    const m = line.match(/\{.*\}/);
+    if (!m) continue;
     try {
-      out.push(JSON.parse(t));
+      const v = JSON.parse(m[0]);
+      if (v && typeof v === "object" && !Array.isArray(v)) out.push(v);
     } catch {
       continue; // truncated tail line: drop it, keep the rest
     }
