@@ -2,7 +2,7 @@
 // Run: npm test  (node --test, no framework)
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { clamp10, slugify, scoreOf, parseJsonArray } from "./lib.js";
+import { clamp10, slugify, scoreOf, parseJsonLines } from "./lib.js";
 
 describe("scoreOf", () => {
   it("matches the documented formula", () => {
@@ -35,16 +35,19 @@ describe("slugify", () => {
   });
 });
 
-describe("parseJsonArray", () => {
-  it("extracts arrays wrapped in model prose", () => {
-    const out = parseJsonArray('Here you go:\n[{"n":0,"action":"noise"}]\nDone.');
-    assert.deepEqual(out, [{ n: 0, action: "noise" }]);
+describe("parseJsonLines", () => {
+  it("parses one verdict per line, skipping prose", () => {
+    const out = parseJsonLines('Here you go:\n{"n":0,"action":"noise"}\n{"n":1,"action":"new"}\nDone.');
+    assert.deepEqual(out, [{ n: 0, action: "noise" }, { n: 1, action: "new" }]);
+  });
+  it("tolerates fences and keeps verdicts before a truncated tail", () => {
+    const out = parseJsonLines('```json\n{"n":0,"action":"supports","opportunity_id":3}\n{"n":1,"action":"new","tit');
+    assert.deepEqual(out, [{ n: 0, action: "supports", opportunity_id: 3 }]);
   });
   it("returns [] for missing or malformed JSON", () => {
-    assert.deepEqual(parseJsonArray("no json here"), []);
-    assert.deepEqual(parseJsonArray("[{broken"), []);
-    assert.deepEqual(parseJsonArray('{"not":"array"}'), []);
-    assert.deepEqual(parseJsonArray(""), []);
-    assert.deepEqual(parseJsonArray(null), []);
+    assert.deepEqual(parseJsonLines("no json here"), []);
+    assert.deepEqual(parseJsonLines("[{broken"), []);
+    assert.deepEqual(parseJsonLines(""), []);
+    assert.deepEqual(parseJsonLines(null), []);
   });
 });

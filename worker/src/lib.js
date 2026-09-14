@@ -15,15 +15,19 @@ export const slugify = (s) =>
 export const scoreOf = (o) =>
   Math.round(100 * ((o.value * o.confidence * o.fit) / (o.effort + 1)) * 10) / 10;
 
-// The triage model is instructed to reply with ONLY a JSON array, but models
-// wrap output in prose anyway — extract the first [...] block, [] on failure.
-export function parseJsonArray(text) {
-  const m = String(text || "").match(/\[[\s\S]*\]/);
-  if (!m) return [];
-  try {
-    const v = JSON.parse(m[0]);
-    return Array.isArray(v) ? v : [];
-  } catch {
-    return [];
+// The triage model replies with one JSON object per line (NDJSON). A hard
+// token cap truncates ARRAY output into unparseable garbage (proven live:
+// every verdict lost); with NDJSON a cut tail only loses the last lines.
+export function parseJsonLines(text) {
+  const out = [];
+  for (const line of String(text || "").split("\n")) {
+    const t = line.trim().replace(/^```(?:json)?/, "").replace(/```$/, "").trim();
+    if (!t.startsWith("{") || !t.endsWith("}")) continue;
+    try {
+      out.push(JSON.parse(t));
+    } catch {
+      continue; // truncated tail line: drop it, keep the rest
+    }
   }
+  return out;
 }

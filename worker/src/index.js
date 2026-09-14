@@ -15,8 +15,8 @@ const MAX_SIGNALS_PER_SOURCE = 8;
 const MAX_AI_SIGNALS = 6;
 const MAX_AI_CALLS = 4;
 const FETCH_TIMEOUT_MS = 6000;
-const CLASSIFY_TOKENS = 700;
-const BRIEF_TOKENS = 900;
+const CLASSIFY_TOKENS = 1200;
+const BRIEF_TOKENS = 1500;
 const BRIEF_DEADLINE_MS = 18000; // skip the brief pass past this elapsed time
 // Runs stuck in "running" past this are declared dead by the next run.
 const STUCK_RUN_MINUTES = 30;
@@ -136,7 +136,7 @@ async function aiComplete(env, state, { model, fallback, maxTokens, messages, ti
   throw lastErr || new Error("AI failed");
 }
 
-import { clamp10, slugify, scoreOf, parseJsonArray } from "./lib.js";
+import { clamp10, slugify, scoreOf, parseJsonLines } from "./lib.js";
 
 async function runResearch(env, trigger) {
   const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0 };
@@ -202,19 +202,19 @@ async function runResearch(env, trigger) {
       "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
       .all().then((r) => r.results || []);
     const classifyPrompt = [
-      { role: "system", content: "You triage money-making-with-AI leads. Reply with ONLY a JSON array, no prose." },
+      { role: "system", content: "You triage money-making-with-AI leads. Reply with one JSON object per line (NDJSON), no prose, no array, no fences. Keep every value short." },
       { role: "user", content:
-        `PRIORITY LIST (id | slug | title | status | score):\n` +
-        opps.map((o) => `${o.id} | ${o.slug} | ${o.title} | ${o.status} | ${o.score}`).join("\n") +
-        `\n\nFRESH SIGNALS (n | source | title | snippet | url):\n` +
-        fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.snippet} | ${s.url}`).join("\n") +
-        `\n\nFor each signal index 0..${fresh.length - 1} emit one object:
-{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id|null,"title":"...","one_liner":"...","category":"...","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"why":"..."}.
-Rules: "new" only for a genuinely NEW money-making method not on the list (be strict — variants are "supports" or "noise"). value=realistic monthly revenue at modest scale (10≈$10k+/mo). effort=weeks to first dollar (10≈6+ months). confidence=evidence strength. fit=leverage of automation/bot/content skills. "supports" needs the matching opportunity_id.` },
+        `PRIORITY LIST (id | title | status):\n` +
+        opps.map((o) => `${o.id} | ${o.title} | ${o.status}`).join("\n") +
+        `\n\nFRESH SIGNALS (n | source | title | url):\n` +
+        fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
+        `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:
+{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10}
+Rules: "new" only for a genuinely NEW money-making method not on the list (be strict — variants are "supports" or "noise"). value=revenue at modest scale (10≈$10k+/mo). effort=weeks to first dollar (10≈6+ months). confidence=evidence strength. fit=automation/bot/content skill leverage. "supports" needs opportunity_id.` },
     ];
     await mark("classify-ai");
     const isCron = trigger === "cron";
-    const verdicts = parseJsonArray(await aiComplete(env, state, {
+    const verdicts = parseJsonLines(await aiComplete(env, state, {
       model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
       messages: classifyPrompt,
       timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
@@ -236,7 +236,7 @@ Rules: "new" only for a genuinely NEW money-making method not on the list (be st
             String(v.category || "other").slice(0, 40), "researching",
             o.value, o.effort, o.confidence, o.fit, scoreOf(o),
             "agent", String(sig.url || "").slice(0, 500),
-            `Agent proposal: ${String(v.why || "").slice(0, 1000)}`).run();
+            `Agent proposal from ${sig.source} signal "${sig.title}" (${sig.url})`.slice(0, 1000)).run();
           state.added++;
           await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
             .bind(r.meta.last_row_id, sig.id).run();
