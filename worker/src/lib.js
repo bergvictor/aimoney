@@ -18,17 +18,20 @@ export const scoreOf = (o) =>
 // The triage model replies with one JSON object per line (NDJSON). A hard
 // token cap truncates ARRAY output into unparseable garbage (proven live:
 // every verdict lost); with NDJSON a cut tail only loses the last lines.
+// Mistral escapes underscores in keys (opportunity\_id) — invalid JSON that
+// fails every parse. `\_` can never be valid JSON, so stripping the slash is
+// always safe and strictly increases parseability.
+export const repairJson = (s) => String(s || "").replace(/\\_/g, "_");
+
 export function parseJsonLines(text) {
   const out = [];
   for (const line of String(text || "").split("\n")) {
     // Extract the first {...} span per line: models number ("1. {...}"),
-    // bullet ("- {...}"), fence, or trail prose after the object. The old
-    // whole-line check dropped every such line (proven live: 3 ok ticks,
-    // 48 signals, zero verdicts).
+    // bullet ("- {...}"), fence, or trail prose after the object.
     const m = line.match(/\{.*\}/);
     if (!m) continue;
     try {
-      const v = JSON.parse(m[0]);
+      const v = JSON.parse(repairJson(m[0]));
       if (v && typeof v === "object" && !Array.isArray(v)) out.push(v);
     } catch {
       continue; // truncated tail line: drop it, keep the rest

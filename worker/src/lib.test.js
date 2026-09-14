@@ -2,7 +2,7 @@
 // Run: npm test  (node --test, no framework)
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { clamp10, slugify, scoreOf, parseJsonLines } from "./lib.js";
+import { clamp10, slugify, scoreOf, parseJsonLines, repairJson } from "./lib.js";
 
 describe("scoreOf", () => {
   it("matches the documented formula", () => {
@@ -53,5 +53,13 @@ describe("parseJsonLines", () => {
     assert.deepEqual(parseJsonLines("[{broken"), []);
     assert.deepEqual(parseJsonLines(""), []);
     assert.deepEqual(parseJsonLines(null), []);
+  });
+});
+
+describe("repairJson", () => {
+  it("unescapes model-escaped underscores (live Mistral output)", () => {
+    const out = parseJsonLines('0:{"n":0,"action":"new","opportunity\\_id":null,"one\\_liner":"x"}');
+    assert.deepEqual(out, [{ n: 0, action: "new", opportunity_id: null, one_liner: "x" }]);
+    assert.equal(repairJson("a\\_b"), "a_b");
   });
 });

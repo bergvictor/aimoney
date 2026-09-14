@@ -136,7 +136,7 @@ async function aiComplete(env, state, { model, fallback, maxTokens, messages, ti
   throw lastErr || new Error("AI failed");
 }
 
-import { clamp10, slugify, scoreOf, parseJsonLines } from "./lib.js";
+import { clamp10, slugify, scoreOf, parseJsonLines, repairJson } from "./lib.js";
 
 async function runResearch(env, trigger) {
   const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0 };
@@ -210,7 +210,7 @@ async function runResearch(env, trigger) {
         fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
         `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:
 {"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10}
-Rules: "new" only for a genuinely NEW money-making method not on the list (be strict — variants are "supports" or "noise"). value=revenue at modest scale (10≈$10k+/mo). effort=weeks to first dollar (10≈6+ months). confidence=evidence strength. fit=automation/bot/content skill leverage. "supports" needs opportunity_id.` },
+Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to earn money (pricing, revenue, customers, or an obvious buyer) that is NOT on the list. A GitHub repo, tool launch, or tutorial with no business model is noise. A variant of a listed method is "supports" with its numeric id. Confidence above 6 requires named revenue/users in the signal, else 5 or less. opportunity_id must be a numeric id from the list or null, never text.` },
     ];
     await mark("classify-ai");
     const isCron = trigger === "cron";
@@ -220,9 +220,25 @@ Rules: "new" only for a genuinely NEW money-making method not on the list (be st
       timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
     }));
     await mark(`classified:${verdicts.length}`);
+    // Validate: one verdict per signal (first wins), strict action enum,
+    // numeric-or-null opportunity_id (the model once emitted repo names).
+    const seen = new Set();
     for (const v of verdicts) {
-      const sig = fresh[v.n];
-      if (!sig) continue;
+      if (!v || typeof v !== "object") continue;
+      const n = Number(v.n);
+      if (!Number.isInteger(n) || n < 0 || n >= fresh.length || seen.has(n)) continue;
+      seen.add(n);
+      const sig = fresh[n];
+      if (v.action !== "new" && v.action !== "supports" && v.action !== "noise") {
+        await env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id).run();
+        continue;
+      }
+      if (v.opportunity_id !== null && v.opportunity_id !== undefined && !Number.isInteger(Number(v.opportunity_id))) {
+        v.opportunity_id = null;
+      }
+      if (v.action === "supports" && (v.opportunity_id === null || v.opportunity_id === undefined)) {
+        v.action = "noise"; // supports without a valid id is noise, not new
+      }
       if (v.action === "new" && v.title) {
         const slug = slugify(v.title) || `agent-${sig.id}`;
         const o = { value: clamp10(v.value), effort: clamp10(v.effort),
@@ -281,7 +297,7 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
       });
       try {
         const m = String(text).match(/\{[\s\S]*\}/);
-        const b = JSON.parse(m ? m[0] : "{}");
+        const b = JSON.parse(repairJson(m ? m[0] : "{}"));
         await env.DB.prepare(
           `INSERT INTO briefs (opportunity_id, version, summary, what_works,
            numbers_json, risks, first_steps, sources_json, author)
