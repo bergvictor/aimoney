@@ -328,6 +328,37 @@ export default {
         return json({ ok: false, ms: Date.now() - t0, error: String(e && e.message || e).slice(0, 200) }, 500);
       }
     }
+    if (request.method === "GET" && url.pathname === "/debug-classify") {
+      const want = (env.ADMIN_TOKEN || "").trim();
+      const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+      if (!want || got !== want) return json({ error: "unauthorized" }, 401);
+      const fresh = await env.DB.prepare(
+        "SELECT * FROM signals WHERE processed = 0 ORDER BY id DESC LIMIT ?")
+        .bind(MAX_AI_SIGNALS).all().then((r) => r.results || []);
+      const opps = await env.DB.prepare(
+        "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
+        .all().then((r) => r.results || []);
+      const prompt = [
+        { role: "system", content: "You triage money-making-with-AI leads. Reply with one JSON object per line (NDJSON), no prose, no array, no fences. Keep every value short." },
+        { role: "user", content:
+          `PRIORITY LIST (id | title | status):\n` +
+          opps.map((o) => `${o.id} | ${o.title} | ${o.status}`).join("\n") +
+          `\n\nFRESH SIGNALS (n | source | title | url):\n` +
+          fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
+          `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:\n` +
+          `{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10}` },
+      ];
+      const t0 = Date.now();
+      try {
+        const r = await env.AI.run(AI_CLASSIFY, { messages: prompt, max_tokens: CLASSIFY_TOKENS });
+        const raw = String(r.response || "");
+        return json({ ok: true, ms: Date.now() - t0, raw_len: raw.length,
+          raw_head: raw.slice(0, 2000), parsed: parseJsonLines(raw).length });
+      } catch (e) {
+        return json({ ok: false, ms: Date.now() - t0,
+          error: String(e && e.message || e).slice(0, 300) }, 500);
+      }
+    }
     if (request.method === "POST" && url.pathname === "/run") {
       const want = (env.ADMIN_TOKEN || "").trim();
       const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
