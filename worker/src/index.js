@@ -241,18 +241,23 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
       }
       if (v.action === "new" && v.title) {
         const slug = slugify(v.title) || `agent-${sig.id}`;
-        const o = { value: clamp10(v.value), effort: clamp10(v.effort),
-          confidence: clamp10(v.confidence, 3), fit: clamp10(v.fit) };
+        // Code-enforced humility: live runs proved model calibration is
+        // fiction (confidence 10 for a random GitHub repo, outranking the
+        // human top pick). Agent proposals enter mid-list until reviewed.
+        const o = { value: Math.min(7, clamp10(v.value)), effort: clamp10(v.effort),
+          confidence: Math.min(5, clamp10(v.confidence, 3)), fit: clamp10(v.fit) };
+        const oneLiner = String(v.one_liner || "").trim()
+          || `Via ${sig.source}: ${sig.title}`.slice(0, 500);
         try {
           const r = await env.DB.prepare(
             `INSERT INTO opportunities (slug, title, one_liner, category, status,
              value, effort, confidence, fit, score, source, source_url, notes)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
-          ).bind(slug, String(v.title).slice(0, 200), String(v.one_liner || "").slice(0, 500),
+          ).bind(slug, String(v.title).slice(0, 200), oneLiner.slice(0, 500),
             String(v.category || "other").slice(0, 40), "researching",
             o.value, o.effort, o.confidence, o.fit, scoreOf(o),
             "agent", String(sig.url || "").slice(0, 500),
-            `Agent proposal from ${sig.source} signal "${sig.title}" (${sig.url})`.slice(0, 1000)).run();
+            `Agent proposal from ${sig.source} signal "${sig.title}" (${sig.url}) — UNREVIEWED, scores capped until a human vets it.`.slice(0, 1000)).run();
           state.added++;
           await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
             .bind(r.meta.last_row_id, sig.id).run();
@@ -289,8 +294,9 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
         messages: [
         { role: "system", content: "You write terse, practical research briefs. Reply with ONLY a JSON object, no prose." },
         { role: "user", content:
-          `Write a research brief for this AI money-making opportunity as JSON:
+          `Write a research brief for this AI money-making opportunity as ONE JSON object with EXACTLY these keys: summary, what_works, numbers, risks, first_steps. Example shape:
 {"summary":"2-3 sentences","what_works":"tactics as bullet lines","numbers":[{"claim":"...","source":"..."}],"risks":"...","first_steps":"numbered lines for week 1"}.
+If you lack verified facts for a section, write that explicitly instead of inventing specifics.
 Opportunity: ${bare.title} — ${bare.one_liner}
 Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") || "(none — use general knowledge, mark confidence accordingly)"}` },
         ],
@@ -298,7 +304,10 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
       try {
         const m = String(text).match(/\{[\s\S]*\}/);
         const b = JSON.parse(repairJson(m ? m[0] : "{}"));
-        await env.DB.prepare(
+        // Never store an empty brief (a parsed-but-keyless object once wrote
+        // five blank fields). Retry naturally on the next tick instead.
+        if (String(b.summary || "").trim() && String(b.first_steps || "").trim()) {
+          await env.DB.prepare(
           `INSERT INTO briefs (opportunity_id, version, summary, what_works,
            numbers_json, risks, first_steps, sources_json, author)
            VALUES (?,1,?,?,?,?,?,?,'agent')`
@@ -306,7 +315,8 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
           JSON.stringify(b.numbers || []), String(b.risks || ""),
           String(b.first_steps || ""),
           JSON.stringify(sigs.map((s) => ({ title: s.title, url: s.url })))).run();
-        state.briefs++;
+          state.briefs++;
+        }
       } catch { /* malformed brief JSON: skip, briefs stay human-seeded */ }
     }
 
