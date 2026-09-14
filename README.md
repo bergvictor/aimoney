@@ -18,7 +18,7 @@ money with AI:
 
 | Piece | What | Config |
 |---|---|---|
-| Dashboard | Cloudflare Pages, static `public/` | `wrangler.toml` |
+| Dashboard | Cloudflare Pages, static `public/` + `scripts/stamp-release.sh` build | `wrangler.toml` |
 | API | Pages Functions (`functions/api/`) + D1 | `wrangler.toml` |
 | Research agent | Worker + Cron Trigger + Workers AI + D1 | `worker/wrangler.toml` |
 | Database | D1 (`aimoney`) | `d1/schema.sql`, `d1/seed.sql` |
