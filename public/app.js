@@ -42,16 +42,22 @@ const meter = (v) => {
 
 const statusPill = (s) => `<span class="pill st-${esc(s)}">${esc(s)}</span>`;
 
-/* ---- tabs ---- */
+/* ---- tabs (deep-linkable via ?tab=priority|experiments|research) ---- */
+const TAB_NAMES = ["priority", "experiments", "research"];
+function activateTab(name, push) {
+  if (!TAB_NAMES.includes(name)) return;
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
+  for (const n of TAB_NAMES) $(`#tab-${n}`).classList.toggle("hidden", n !== name);
+  if (push) {
+    const url = new URL(location.href);
+    url.searchParams.set("tab", name);
+    history.replaceState(null, "", url);
+  }
+}
 document.querySelectorAll(".tab").forEach((tab) => {
-  tab.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-    tab.classList.add("active");
-    for (const name of ["priority", "experiments", "research"]) {
-      $(`#tab-${name}`).classList.toggle("hidden", tab.dataset.tab !== name);
-    }
-  });
+  tab.addEventListener("click", () => activateTab(tab.dataset.tab, true));
 });
+activateTab(new URLSearchParams(location.search).get("tab") || "priority", false);
 
 /* ---- priority list ---- */
 function renderLedger() {
