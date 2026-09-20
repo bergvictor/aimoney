@@ -179,6 +179,23 @@ export function agentMoneyEstimates(v) {
   };
 }
 
+// Brief-failure backoff (pure): counts dated "[YYYY-MM-DD brief failed]" lines in notes from the last 7 days. A poison row that burns one Llama call per tick is skipped once it reaches 2 recent failures, so the next bare row gets the call instead. Old failures age out after 7 days and the row becomes eligible again. No status moves. Pure for tests.
+export function countRecentBriefFailures(notes, nowMs = Date.now()) {
+  const text = String(notes || "");
+  const re = /\[(\d{4}-\d{2}-\d{2}) brief failed\]/g;
+  let count = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const t = Date.parse(m[1]);
+    if (!Number.isFinite(t)) continue;
+    const ageMs = nowMs - t;
+    if (ageMs >= -86400000 && ageMs < 7 * 86400000) count++;
+  }
+  return count;
+}
+export function shouldSkipBriefForFailures(notes, nowMs = Date.now()) {
+  return countRecentBriefFailures(notes, nowMs) >= 2;
+}
 async function runResearch(env, trigger) {
   const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0, stale: 0 };
   // Reap runs a killed worker left behind: a "running" row older than the
@@ -370,6 +387,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
     // 3. One AI pass: brief one bare row — top-scored, or oldest-unreviewed-first past 48h —
     // unless the clock is nearly spent (it lands on a later run instead).
     let briefMode = "skipped";
+    let briefFailures = 0;
     let bare = null;
     if (Date.now() - t0 < briefDeadline) {
       briefMode = "top-scored";
@@ -386,11 +404,22 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
         bare = await env.DB.prepare(
       `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
        WHERE b.id IS NULL ORDER BY o.score DESC LIMIT 1`).first().catch(() => null); } }
+    if (bare && shouldSkipBriefForFailures(bare.notes)) {
+      const skipId = bare.id;
+      let cands = [];
+      if (briefMode === "oldest-first") {
+        cands = await env.DB.prepare("SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL AND o.notes LIKE ? AND o.id != ? ORDER BY o.created_at ASC LIMIT 10").bind(String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37), skipId).all().then((r) => r.results || []).catch(() => []);
+      } else {
+        cands = await env.DB.prepare("SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL AND o.id != ? ORDER BY o.score DESC LIMIT 10").bind(skipId).all().then((r) => r.results || []).catch(() => []);
+      }
+      bare = cands.find((c) => !shouldSkipBriefForFailures(c.notes)) || null;
+    }
     if (bare) {
       const sigs = await env.DB.prepare(
         "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
         .bind(bare.id).all().then((r) => r.results || []);
       await mark("brief-ai");
+      const briefsBeforeMain = state.briefs;
       const text = await aiComplete(env, state, {
         model: AI_BRIEF, fallback: AI_CLASSIFY, maxTokens: BRIEF_TOKENS,
         timeoutMs: 90000, retries: 1,
@@ -420,7 +449,11 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
           JSON.stringify(sigs.map((s) => ({ title: s.title, url: s.url })))).run();
           state.briefs++;
         }
-      } catch { /* malformed brief JSON: skip, briefs stay human-seeded */ }
+      } catch { /* malformed brief JSON: recorded below, briefs stay human-seeded */ }
+      if (state.briefs === briefsBeforeMain && bare) {
+        briefFailures++;
+        await env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000) WHERE id=?`).bind(`\n[${new Date().toISOString().slice(0, 10)} brief failed] AI brief malformed or empty; skipped after 2 in 7d.`, bare.id).run().catch(() => null);
+      }
     }
 
     // When the review backlog is old (>48h), brief one extra oldest-unreviewed
@@ -436,7 +469,8 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
           `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
            WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' AND o.id != ? ORDER BY o.created_at ASC LIMIT 1`
         ).bind(bare.id).first().catch(() => null);
-        if (extraBare && state.ai_calls < MAX_AI_CALLS) {
+        if (extraBare && !shouldSkipBriefForFailures(extraBare.notes) && state.ai_calls < MAX_AI_CALLS) {
+          const briefsBeforeExtra = state.briefs;
           try {
             const sigs2 = await env.DB.prepare(
               "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
@@ -467,12 +501,16 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
                 JSON.stringify(sigs2.map((s) => ({ title: s.title, url: s.url })))).run();
               state.briefs++;
             }
-          } catch { /* extra brief is best-effort; lands next run */ }
+          } catch { /* extra brief is best-effort; recorded below, lands next run unless skipped */ }
+          if (typeof briefsBeforeExtra !== "undefined" && state.briefs === briefsBeforeExtra && extraBare) {
+            briefFailures++;
+            await env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000) WHERE id=?`).bind(`\n[${new Date().toISOString().slice(0, 10)} brief failed] AI brief malformed or empty; skipped after 2 in 7d.`, extraBare.id).run().catch(() => null);
+          }
         }
       }
     }
     await finish("ok");
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : "") + (briefFailures ? " brief_fail:1" : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);

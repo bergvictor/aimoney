@@ -6,7 +6,70 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker, { agentMoneyEstimates, exactUrlTarget } from "./index.js";
+import worker, { agentMoneyEstimates, exactUrlTarget, countRecentBriefFailures, shouldSkipBriefForFailures } from "./index.js";
+
+describe("countRecentBriefFailures", () => {
+  const NOW = Date.parse("2026-09-20T12:00:00Z");
+  it("counts zero when notes are empty or carry no failure lines", () => {
+    assert.equal(countRecentBriefFailures("", NOW), 0);
+    assert.equal(countRecentBriefFailures(null, NOW), 0);
+    assert.equal(countRecentBriefFailures("UNREVIEWED, scores capped", NOW), 0);
+  });
+  it("counts dated failure lines within 7 days", () => {
+    assert.equal(countRecentBriefFailures("[2026-09-19 brief failed] x", NOW), 1);
+    assert.equal(countRecentBriefFailures("[2026-09-19 brief failed] x\n[2026-09-18 brief failed] y", NOW), 2);
+  });
+  it("ignores failures older than 7 days so rows become eligible again", () => {
+    assert.equal(countRecentBriefFailures("[2026-09-10 brief failed] old", NOW), 0);
+    assert.equal(countRecentBriefFailures("[2026-09-19 brief failed] new\n[2026-09-10 brief failed] old", NOW), 1);
+  });
+  it("ignores malformed failure lines", () => {
+    assert.equal(countRecentBriefFailures("[brief failed] no date", NOW), 0);
+    assert.equal(countRecentBriefFailures("[2026-13-99 brief failed] bad date", NOW), 0);
+  });
+});
+
+describe("shouldSkipBriefForFailures", () => {
+  const NOW = Date.parse("2026-09-20T12:00:00Z");
+  it("skips only once recent failures reach 2", () => {
+    assert.equal(shouldSkipBriefForFailures("", NOW), false);
+    assert.equal(shouldSkipBriefForFailures("[2026-09-19 brief failed] x", NOW), false);
+    assert.equal(shouldSkipBriefForFailures("[2026-09-19 brief failed] x\n[2026-09-18 brief failed] y", NOW), true);
+  });
+  it("does not skip when failures have aged out past 7 days", () => {
+    assert.equal(shouldSkipBriefForFailures("[2026-09-10 brief failed] a\n[2026-09-09 brief failed] b", NOW), false);
+  });
+});
+
+describe("brief-failure backoff (AUDIT-2026-09-20-round1 Task 1)", () => {
+  it("records empty and malformed briefs as dated notes instead of vanishing", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("brief failed]"), "worker lost the dated brief-failure marker");
+    assert.ok(src.includes("briefsBeforeMain"), "main brief lost its empty-vs-success tracking");
+    assert.ok(src.includes("briefsBeforeExtra"), "extra brief lost its empty-vs-success tracking");
+    assert.ok(src.includes("UPDATE opportunities SET notes = substr(notes || ?, -8000) WHERE id=?"), "failure must append newest-kept without touching updated_at");
+  });
+  it("skips rows with 2 recent failures and tries the next bare row", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("shouldSkipBriefForFailures(bare.notes)"), "main pick lost its poison-row skip");
+    assert.ok(src.includes("shouldSkipBriefForFailures(extraBare.notes)"), "extra pick lost its poison-row skip");
+    assert.ok(src.includes("shouldSkipBriefForFailures(c.notes)"), "retry pick lost its poison-row filter");
+  });
+  it("carries a brief_fail bit in the run log", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("briefFailures"), "worker lost the brief-failure counter");
+    assert.ok(src.includes("brief_fail:1"), "run log lost the brief_fail bit");
+    assert.ok(src.includes("brief:"), "run log lost the brief mode disclosure");
+  });
+  it("same AI budget, no status moves, manual skip intact", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+    assert.ok(src.includes('trigger === "cron" ? 300000 : -1'), "manual path lost its brief-skipping deadline");
+  });
+});
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {

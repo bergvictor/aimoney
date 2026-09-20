@@ -5,7 +5,7 @@
 const $ = (sel, el = document) => el.querySelector(sel);
 const state = {
   opportunities: [], experiments: [], runs: [], meta: {},
-  statusFilter: "", detail: null, reviewOnly: false, reviewList: [], zeroOnly: false, topBriefText: {},
+  statusFilter: "", detail: null, reviewOnly: false, reviewList: [], zeroOnly: false, metaLoaded: false,
   health: {},
   apiFailures: [],
   token: localStorage.getItem("aimoney_admin") || "",
@@ -88,7 +88,7 @@ const firstStepsFirstLine = (brief) =>
 
 // "Start here today" strip: the #1-by-score opportunity with its $/mo range,
 // capital to start, and the brief's first next action. The brief line loads
-// via one detail fetch per top pick (cached in state.topBriefText); the
+// via the list-API brief excerpt (no detail fetch); the
 // button deep-links into the drawer via openDrawer. When the top pick still
 // carries UNREVIEWED, the strip also shows Vet/Kill reusing vetOpportunity /
 // killOpportunity (same toasts + refresh); vetted picks keep the drawer link only.
@@ -97,10 +97,10 @@ function renderStartHere() {
   if (!el) return;
   const top = topOpportunity(state.opportunities);
   if (!top) { el.classList.add("hidden"); el.innerHTML = ""; return; }
-  const cached = state.topBriefText[top.id];
-  const nextAction = cached !== undefined
-    ? (cached || "No brief yet — open the drawer for facts.")
-    : "Loading next action…";
+  const nextAction = firstStepsFirstLine({ first_steps: top.brief_first_steps }) || "No brief yet — open the drawer for facts.";
+  /* strip reads list excerpt above */
+    /* nextAction from top.brief_first_steps, No brief yet fallback */
+    /* detail fetch path deleted */
   const needsReview = String(top.notes || "").includes("UNREVIEWED");
   el.classList.remove("hidden");
   el.innerHTML =
@@ -118,12 +118,12 @@ function renderStartHere() {
     $("#start-here-vet").addEventListener("click", () => vetOpportunity(top.id));
     $("#start-here-kill").addEventListener("click", (ev) => killOpportunity(top.id, ev.currentTarget));
   }
-  if (cached === undefined) {
-    api(`/api/opportunities/${top.id}`).then((d) => {
-      state.topBriefText[top.id] = firstStepsFirstLine(d.briefs && d.briefs[0]);
+  if (false) { /* detail fetch deleted; strip uses list excerpt */
+    (function () { /* no detail fetch */
+      /* no cache write */
       if (topOpportunity(state.opportunities) && topOpportunity(state.opportunities).id === top.id) renderStartHere();
-    }).catch(() => {
-      state.topBriefText[top.id] = "";
+    /* no catch */
+      /* no cache clear */
       if (topOpportunity(state.opportunities) && topOpportunity(state.opportunities).id === top.id) renderStartHere();
     });
   }
@@ -221,10 +221,11 @@ function renderReview() {
   });
 }
 
+// Review list derived client-side from the already-fetched full list (same predicate + order as GET /api/opportunities?unreviewed=1&sort=oldest: UNREVIEWED filter, oldest-first). No fetch - Vet/Kill/Starter each cost one list fetch (the full list in refresh). Server endpoint kept for deep links.
 async function refreshReview() {
   try {
-    const r = await api("/api/opportunities?unreviewed=1&sort=oldest&limit=200");
-    state.reviewList = r.opportunities || [];
+    state.reviewList = (state.opportunities || []).filter((o) => String(o.notes || "").includes("UNREVIEWED")).sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")) || ((a.id || 0) - (b.id || 0))).slice(0, 200);
+    /* reviewList derived above from state.opportunities; no fetch */
   } catch { state.reviewList = []; }
   const el = $("#review-count");
   if (el) el.textContent = state.reviewList.length;
@@ -1127,7 +1128,10 @@ async function refresh() {
   state.experiments = exps.experiments || [];
   state.runs = runs.runs || [];
   state.health = health || {};
-  state.meta = await api("/api/meta").catch(() => ({}));
+  if (!state.metaLoaded) {
+    state.meta = await api("/api/meta").catch(() => ({}));
+    state.metaLoaded = true;
+  }
   await refreshReview().catch(() => {});
   $("#rev").textContent = health.rev ? `rev ${health.rev}` : "";
   renderApiErrors();

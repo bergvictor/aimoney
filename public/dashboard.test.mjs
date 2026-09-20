@@ -14,6 +14,68 @@ const html = readFileSync(join(ROOT, "index.html"), "utf8");
 const js = readFileSync(join(ROOT, "app.js"), "utf8");
 const css = readFileSync(join(ROOT, "styles.css"), "utf8");
 
+describe("strip excerpt + meta once per boot (AUDIT-2026-09-20-round1 Task 3)", () => {
+  it("strip renders brief_first_steps from its row with No brief yet fallback, no detail fetch", () => {
+    assert.ok(!js.includes("topBriefText"), "app.js still carries the strip fetch cache");
+    assert.ok(!js.includes("/api/opportunities/${top.id}"), "strip still fetches its detail payload");
+    const fn = js.slice(js.indexOf("function renderStartHere()"), js.indexOf("/* ---- priority list ---- */"));
+    assert.ok(fn.includes("top.brief_first_steps"), "strip lost its list-excerpt read");
+    assert.ok(fn.includes("firstStepsFirstLine({ first_steps: top.brief_first_steps })"), "strip must reuse firstStepsFirstLine on the excerpt");
+    assert.ok(fn.includes("No brief yet"), "strip lost its No brief yet fallback");
+  });
+  it("meta loads once per boot, not per refresh", () => {
+    assert.ok(js.includes("metaLoaded"), "app.js lost the meta-loaded guard");
+    assert.ok(js.includes("if (!state.metaLoaded)"), "refresh lost its once-per-boot meta guard");
+    assert.ok(js.includes('api("/api/meta")'), "app.js lost its meta fetch");
+    const refreshFn = js.slice(js.indexOf("async function refresh()"), js.indexOf("refresh().catch"));
+    assert.ok(refreshFn.includes("if (!state.metaLoaded)"), "meta fetch must sit behind the loaded flag in refresh");
+  });
+  it("strip still shows Vet/Kill for unreviewed top picks", () => {
+    assert.ok(js.includes('String(top.notes || "").includes("UNREVIEWED")'), "strip lost its UNREVIEWED gate");
+    assert.ok(js.includes('id="start-here-vet"'), "strip lost its Vet button");
+    assert.ok(js.includes('id="start-here-kill"'), "strip lost its Kill button");
+    assert.ok(js.includes("vetOpportunity(top.id)"), "strip Vet must reuse vetOpportunity");
+    assert.ok(js.includes("killOpportunity(top.id, ev.currentTarget)"), "strip Kill must reuse killOpportunity");
+  });
+});
+
+describe("client-side review list (AUDIT-2026-09-20-round1 Task 2)", () => {
+  it("derives UNREVIEWED oldest-first from the full list, no review fetch", () => {
+    assert.ok(!js.includes('api("/api/opportunities?unreviewed'), "app.js still fetches the review queue; derive it instead");
+    const fn = js.slice(js.indexOf("async function refreshReview()"), js.indexOf("const fmtAgeH"));
+    assert.ok(fn.includes("state.opportunities"), "derivation must read state.opportunities");
+    assert.ok(fn.includes('includes("UNREVIEWED")'), "derivation lost the UNREVIEWED filter");
+    assert.ok(fn.includes("created_at"), "derivation lost the oldest-first created_at sort");
+    assert.ok(fn.includes(".slice(0, 200)"), "derivation lost the 200-row cap");
+    assert.ok(!fn.includes("api("), "refreshReview must not fetch");
+  });
+  it("Vet / Kill / Starter each refresh once (single list fetch)", () => {
+    const vet = js.slice(js.indexOf("async function vetOpportunity"), js.indexOf("async function vetAndLogStarter"));
+    const starter = js.slice(js.indexOf("async function vetAndLogStarter"), js.indexOf("async function killOpportunity"));
+    assert.ok(vet.includes("await refresh()"), "vet lost its refresh");
+    assert.ok(starter.includes("await refresh()"), "starter lost its refresh");
+    assert.ok(!vet.includes('api("/api/opportunities?unreviewed'), "vet still fetches the review queue");
+    assert.ok(!starter.includes('api("/api/opportunities?unreviewed'), "starter still fetches the review queue");
+    const killStart = js.indexOf("async function killOpportunity");
+    const killFn = js.slice(killStart, js.indexOf('document.querySelectorAll(".filters .chip")'));
+    assert.ok(killFn.includes("await refresh()"), "kill lost its refresh");
+    assert.ok(!killFn.includes('api("/api/opportunities?unreviewed'), "kill still fetches the review queue");
+  });
+  it("review count and oldest-age chip still update", () => {
+    assert.ok(js.includes('#review-count'), "review count element lost");
+    assert.ok(js.includes('#review-age'), "review age element lost");
+    assert.ok(js.includes("oldestReviewAge()"), "review age helper lost");
+    assert.ok(js.includes("updateReviewChipTitle()"), "review chip title lost");
+    assert.ok(js.includes("state.reviewList.length"), "review count lost");
+  });
+  it("server keeps GET unreviewed=1 for deep links", () => {
+    const api = readFileSync(join(ROOT, "..", "functions", "api", "[[path]].js"), "utf8");
+    assert.ok(api.includes("unreviewed"), "API lost the unreviewed param");
+    assert.ok(api.includes("LIKE '%UNREVIEWED%'"), "API lost the UNREVIEWED predicate");
+    assert.ok(api.includes('sort === "oldest"'), "API lost the oldest sort");
+  });
+});
+
 describe("start-here skips killed/paused (audit 2026-09-20-round3 Task 3)", () => {
   it("topOpportunity filters killed and paused rows", () => {
     assert.ok(js.includes('o.status !== "killed"'), "topOpportunity must exclude killed rows");
