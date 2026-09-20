@@ -37,6 +37,7 @@
 </header>
 
 <main>
+  <div id="api-banner" class="api-banner hidden" role="alert"></div>
   <section id="tab-priority" class="tabpanel">
     <div class="toolbar">
       <div class="filters" role="group" aria-label="Status filter">
@@ -75,7 +76,10 @@
 
   <section id="tab-experiments" class="tabpanel hidden">
     <div class="toolbar">
-      <p class="muted" id="exp-summary">No experiments yet.</p>
+      <div class="exp-summary-wrap">
+        <p class="muted" id="exp-summary">No experiments yet.</p>
+        <span class="pill st-scaling hidden" id="decisions-chip" title="Experiments closed as won/lost in the last 7 days"></span>
+      </div>
       <button id="btn-add-exp" class="btn small" type="button">+ Log experiment</button>
     </div>
     <div class="board" id="board"></div>

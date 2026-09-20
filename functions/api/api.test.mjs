@@ -100,6 +100,10 @@ function makeDB(seed = {}) {
     if (sql.includes("COUNT(*)") && sql.includes("FROM opportunities") && !sql.includes("WHERE")) {
       return { n: data.opportunities.length };
     }
+    if (sql.includes("FROM experiments") && sql.includes("ended_at")) {
+      const cutoff = Date.now() - 7 * 86400000;
+      return { n: data.experiments.filter((e) => (e.status === "won" || e.status === "lost") && Number.isFinite(Date.parse(e.ended_at || "")) && Date.parse(e.ended_at) >= cutoff).length };
+    }
     if (sql.includes("FROM experiments WHERE id = ?")) {
       return data.experiments.find((e) => String(e.id) === String(args[0])) || null;
     }
@@ -121,6 +125,12 @@ function makeDB(seed = {}) {
         Object.assign(row, { name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem });
       }
       return { success: true };
+    }
+    if (sql.includes("INSERT INTO experiments")) {
+      const [opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem] = args;
+      const id = data.experiments.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0) + 1;
+      data.experiments.push({ id, opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem });
+      return { success: true, meta: { last_row_id: id } };
     }
     if (sql.includes("UPDATE opportunities SET")) {
       return { success: true };
@@ -311,6 +321,74 @@ describe("orphaned experiments (round1 Task 3)", () => {
     assert.equal(byId[9].opportunity_title, null);
     assert.equal(byId[10].orphaned, false);
     assert.equal(byId[10].opportunity_title, "Seed one");
+  });
+});
+
+describe("decisions this week (round2 Task 1)", () => {
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+
+  it("reports decisions_7d from won/lost rows closed in the last 7 days", async () => {
+    const db = makeDB({
+      experiments: [
+        { id: 1, opportunity_id: 1, name: "recent win", status: "won", result: "r", post_mortem: "pm", ended_at: daysAgo(2) },
+        { id: 2, opportunity_id: 1, name: "recent loss", status: "lost", result: "r", post_mortem: "pm", ended_at: daysAgo(6) },
+        { id: 3, opportunity_id: 1, name: "old win", status: "won", result: "r", post_mortem: "pm", ended_at: daysAgo(8) },
+        { id: 4, opportunity_id: 1, name: "running", status: "running", started_at: daysAgo(1), ended_at: "" },
+        { id: 5, opportunity_id: 1, name: "won without stamp", status: "won", result: "r", post_mortem: "pm", ended_at: "" },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.decisions_7d, 2);
+  });
+
+  it("reports decisions_7d: 0 when nothing closed, keeping existing keys", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.decisions_7d, 0);
+    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "time"]) {
+      assert.ok(k in r.body, `health lost existing key: ${k}`);
+    }
+  });
+});
+
+describe("experiment create guards (round2 Task 2)", () => {
+  it("400s when creating as won without result + post_mortem", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "X", status: "won" } }, db);
+    assert.equal(r.status, 400);
+    assert.ok(r.body.fields && r.body.fields.result);
+    assert.ok(r.body.fields && r.body.fields.post_mortem);
+  });
+
+  it("404s when opportunity_id matches no opportunity", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 999, name: "X" } }, db);
+    assert.equal(r.status, 404);
+  });
+
+  it("400s on invalid status with a field-level reason", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "X", status: "bogus" } }, db);
+    assert.equal(r.status, 400);
+    assert.equal(r.body.field, "status");
+  });
+
+  it("201s on valid create and stamps ended_at when closing", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r1 = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "planned one" } }, db);
+    assert.equal(r1.status, 201);
+    assert.equal(typeof r1.body.id, "number");
+    const r2 = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "fast win", status: "won", result: "made $", post_mortem: "worked" } }, db);
+    assert.equal(r2.status, 201);
+    const row = db.data.experiments.find((e) => e.id === r2.body.id);
+    assert.ok(row && row.ended_at, "create-as-won must stamp ended_at");
   });
 });
 

@@ -217,22 +217,45 @@ async function listExperiments(env, url) {
   return json({ experiments: withAge });
 }
 
+// Shared close validation for experiment create + update: closing as
+// won/lost requires result + post_mortem. Returns a 400 Response or null.
+// Humans still own every close; this only keeps learning-free rows out.
+function closeValidationError(next) {
+  if (next.status !== "won" && next.status !== "lost") return null;
+  const fields = {};
+  if (!String(next.result || "").trim()) fields.result = "result is required to close as won/lost";
+  if (!String(next.post_mortem || "").trim()) fields.post_mortem = "post_mortem is required to close as won/lost";
+  if (Object.keys(fields).length) return json({ error: "result and post_mortem are required to close as won/lost", fields }, 400);
+  return null;
+}
+
 async function createExperiment(request, env) {
   const a = authed(request, env);
   if (!a.ok) return json({ error: a.reason }, a.reason.startsWith("writes") ? 503 : 401);
   const b = await request.json().catch(() => ({}));
   if (!b.opportunity_id || !b.name) return json({ error: "opportunity_id and name required" }, 400);
+  if (b.status !== undefined && !EXP_STATUSES.has(b.status)) {
+    return json({ error: `invalid status: ${String(b.status).slice(0, 40)}`, field: "status" }, 400);
+  }
+  const oppRow = await env.DB.prepare("SELECT id FROM opportunities WHERE id = ?").bind(b.opportunity_id).first();
+  if (!oppRow) return json({ error: "opportunity not found" }, 404);
+  const newStatus = EXP_STATUSES.has(b.status) ? b.status : "planned";
+  const closeErr = closeValidationError({ status: newStatus, result: b.result, post_mortem: b.post_mortem });
+  if (closeErr) return closeErr;
+  const stampIso = new Date().toISOString();
+  const startedAt = (newStatus === "running" && !String(b.started_at || "").trim()) ? stampIso : String(b.started_at || "").slice(0, 30);
+  const endedAt = ((newStatus === "won" || newStatus === "lost") && !String(b.ended_at || "").trim()) ? stampIso : String(b.ended_at || "").slice(0, 30);
   const str = (v) => String(v || "");
   const r = await env.DB.prepare(
     `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
      spent, metric, target, result, started_at, ended_at, post_mortem)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(b.opportunity_id, str(b.name).slice(0, 200), str(b.hypothesis).slice(0, 8000),
-    EXP_STATUSES.has(b.status) ? b.status : "planned",
+    newStatus,
     str(b.budget_cap).slice(0, 120), str(b.spent).slice(0, 120),
     str(b.metric).slice(0, 300), str(b.target).slice(0, 300),
-    str(b.result).slice(0, 8000), str(b.started_at).slice(0, 30),
-    str(b.ended_at).slice(0, 30), str(b.post_mortem).slice(0, 8000)).run();
+    str(b.result).slice(0, 8000), startedAt,
+    endedAt, str(b.post_mortem).slice(0, 8000)).run();
   return json({ id: r.meta.last_row_id }, 201);
 }
 
@@ -254,10 +277,11 @@ async function updateExperiment(request, env, id) {
   const nowIso = new Date().toISOString();
   if (next.status === "running" && !String(next.started_at || "").trim()) next.started_at = nowIso;
   if (next.status === "won" || next.status === "lost") {
-    const fields = {};
-    if (!String(next.result || "").trim()) fields.result = "result is required to close as won/lost";
-    if (!String(next.post_mortem || "").trim()) fields.post_mortem = "post_mortem is required to close as won/lost";
-    if (Object.keys(fields).length) return json({ error: "result and post_mortem are required to close as won/lost", fields }, 400);
+    // Close rules shared with createExperiment (single implementation).
+    const updateCloseErr = closeValidationError(next);
+    if (updateCloseErr) return updateCloseErr;
+
+
     if (!String(next.ended_at || "").trim()) next.ended_at = nowIso;
   }
   await env.DB.prepare(
@@ -290,6 +314,7 @@ export async function onRequest(context) {
       const expRows = env.DB ? await env.DB.prepare("SELECT status, COUNT(*) AS n FROM experiments GROUP BY status").all().catch(() => ({ results: [] })) : { results: [] };
       const lastOk = env.DB ? await env.DB.prepare("SELECT finished_at, started_at FROM agent_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first().catch(() => null) : null;
       const oldestUnreviewed = env.DB ? await env.DB.prepare("SELECT created_at FROM opportunities WHERE notes LIKE '%UNREVIEWED%' ORDER BY created_at ASC, id ASC LIMIT 1").first().catch(() => null) : null;
+      const decisionsRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('won','lost') AND datetime(ended_at) >= datetime('now','-7 days')").first().catch(() => null) : null;
       let oldest_unreviewed_age_h = null;
       let hours_since_last_ok_run = null;
       if (lastOk) {
@@ -308,7 +333,7 @@ export async function onRequest(context) {
         const r = await fetch(new URL("/release.json", url.origin));
         if (r.ok) rev = (await r.json()).revision || rev;
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, time: new Date().toISOString() });
+      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_7d: decisionsRow ? decisionsRow.n : 0, time: new Date().toISOString() });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

@@ -121,11 +121,12 @@ async function refreshReview() {
   try {
     const r = await api("/api/opportunities?unreviewed=1&sort=oldest&limit=200");
     state.reviewList = r.opportunities || [];
-  } catch { state.reviewList = []; }
+  } catch { state.reviewList = []; return false; }
   const el = $("#review-count");
   if (el) el.textContent = state.reviewList.length;
   const ageEl = $("#review-age");
   if (ageEl) ageEl.textContent = oldestReviewAge();
+  return true;
 }
 
 const fmtAgeH = (h) =>
@@ -216,6 +217,17 @@ function renderExperiments() {
   $("#exp-summary").textContent = exps.length
     ? `${exps.length} experiments · ${running} running · ${won} won`
     : "No experiments yet.";
+  const decisions = state.health && state.health.decisions_7d;
+  const chip = $("#decisions-chip");
+  if (chip) {
+    if (typeof decisions === "number" && Number.isFinite(decisions)) {
+      chip.classList.remove("hidden");
+      chip.textContent = `${decisions} decision${decisions === 1 ? "" : "s"} this week`;
+    } else {
+      chip.classList.add("hidden");
+      chip.textContent = "";
+    }
+  }
   $("#board").innerHTML = EXP_COLS.map(([st, label]) => {
     const list = exps.filter((e) => e.status === st)
       .sort((a, b) => (b.days_in_status ?? -1) - (a.days_in_status ?? -1));
@@ -518,23 +530,40 @@ $("#btn-run").addEventListener("click", async () => {
 
 /* ---- boot ---- */
 async function refresh() {
+  const failed = [];
   const [opps, exps, runs, health] = await Promise.all([
-    api("/api/opportunities?limit=200").catch(() => ({ opportunities: [] })),
-    api("/api/experiments").catch(() => ({ experiments: [] })),
-    api("/api/runs?limit=20").catch(() => ({ runs: [] })),
-    api("/api/health").catch(() => ({})),
+    api("/api/opportunities?limit=200").catch(() => { failed.push("opportunities"); return { opportunities: [] }; }),
+    api("/api/experiments").catch(() => { failed.push("experiments"); return { experiments: [] }; }),
+    api("/api/runs?limit=20").catch(() => { failed.push("runs"); return { runs: [] }; }),
+    api("/api/health").catch(() => { failed.push("health"); return {}; }),
   ]);
   state.opportunities = opps.opportunities || [];
   state.experiments = exps.experiments || [];
   state.runs = runs.runs || [];
   state.health = health || {};
-  state.meta = await api("/api/meta").catch(() => ({}));
-  await refreshReview().catch(() => {});
+  state.meta = await api("/api/meta").catch(() => { failed.push("meta"); return {}; });
+  const reviewOk = await refreshReview().catch(() => false);
+  if (!reviewOk) failed.push("review queue");
   $("#rev").textContent = health.rev ? `rev ${health.rev}` : "";
+  renderApiBanner(failed);
   renderLedger();
   renderExperiments();
   renderRuns();
 }
+/* API-failure banner (round2 Task 3): one honest line naming the sections
+   that failed to load, instead of calm empty states. Fetches unchanged. */
+function renderApiBanner(failed) {
+  const banner = $("#api-banner");
+  if (!banner) return;
+  if (!failed.length) {
+    banner.classList.add("hidden");
+    banner.textContent = "";
+    return;
+  }
+  banner.classList.remove("hidden");
+  banner.textContent = `API unreachable: ${failed.join(", ")} — showing empty, not stale`;
+}
+
 refresh().catch((e) => {
   $("#ledger-body").innerHTML = `<tr><td colspan="10">API unreachable: ${esc(e.message)} — is the D1 binding attached?</td></tr>`;
 });

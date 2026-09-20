@@ -71,6 +71,9 @@ Agent proposals enter as `researching` with an `UNREVIEWED` marker in notes and 
 - `researching → testing` is a human decision: flip to `testing` when you start a real experiment (log it on the Experiments tab, move it `planned → running`). The agent never moves status.
 - The Experiments tab sorts each column stale-first with `Nd` age chips on `planned`/`running` cards (`days_in_status` from `/api/experiments`); an experiment whose opportunity was deleted keeps its card with an `orphaned` pill instead of vanishing.
 - Closing an experiment as `won`/`lost` requires `result` + `post_mortem`; `ended_at` stamps automatically. `running` stamps `started_at` when empty.
+- The same close guard applies at create time: `POST /api/experiments` as `won`/`lost` needs `result` + `post_mortem`, and `opportunity_id` must match a live row (404 otherwise) — no learning-free decisions, no instant orphans.
+- The Experiments toolbar shows an "N decisions this week" chip (`decisions_7d` from `/api/health`: rows closed `won`/`lost` with `ended_at` in the last 7 days).
+- If any API section fails to load, the board shows one "API unreachable" banner naming the failed sections instead of silent empty states.
 
 ## Seed vs live counts
 
