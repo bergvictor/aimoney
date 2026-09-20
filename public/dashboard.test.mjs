@@ -596,3 +596,65 @@ describe("tolerant zero-spend match (audit 2026-09-20-round2 Task 3)", () => {
     }
   });
 });
+
+describe("client-side review list (audit 2026-09-20-round1 Task 1)", () => {
+  // The derivation is extracted from the shipped source (not copied) so these
+  // cases fail if app.js regresses to a second list fetch or drops the sort.
+  const deriveStart = js.indexOf("const deriveReviewList");
+  assert.ok(deriveStart !== -1, "app.js lost the deriveReviewList helper");
+  const deriveReviewList = new Function(
+    `${js.slice(deriveStart, js.indexOf(";", deriveStart) + 1)} return deriveReviewList;`)();
+
+  it("keeps UNREVIEWED rows only", () => {
+    const rows = [
+      { id: 1, notes: "Agent proposal — UNREVIEWED, capped", created_at: "2026-09-18T00:00:00Z" },
+      { id: 2, notes: "[2026-09-19 vetted] Human vetted; cap lifted.", created_at: "2026-09-10T00:00:00Z" },
+      { id: 3, notes: null, created_at: "2026-09-11T00:00:00Z" },
+    ];
+    assert.deepEqual(deriveReviewList(rows).map((o) => o.id), [1]);
+  });
+
+  it("sorts oldest-first; rows without a date sort first like the server ASC", () => {
+    const rows = [
+      { id: 1, notes: "UNREVIEWED", created_at: "2026-09-18T00:00:00Z" },
+      { id: 2, notes: "UNREVIEWED", created_at: "2026-09-10T00:00:00Z" },
+      { id: 3, notes: "UNREVIEWED", created_at: "" },
+    ];
+    assert.deepEqual(deriveReviewList(rows).map((o) => o.id), [3, 2, 1]);
+  });
+
+  it("is null-safe on missing notes and empty input", () => {
+    assert.deepEqual(deriveReviewList(null), []);
+    assert.deepEqual(deriveReviewList([]), []);
+    assert.deepEqual(deriveReviewList([{ id: 9 }]).map((o) => o.id), []);
+  });
+
+  it("refreshReview derives first and keeps the endpoint only as a truncation fallback", () => {
+    const fn = js.slice(js.indexOf("async function refreshReview"), js.indexOf("const fmtAgeH"));
+    assert.ok(fn.includes("deriveReviewList(state.opportunities)"), "refreshReview must derive from the already-fetched main list");
+    assert.ok(fn.includes("unreviewed=1&sort=oldest&limit=200"), "refreshReview lost the truncation fallback endpoint");
+    assert.ok(fn.indexOf("deriveReviewList") < fn.indexOf("unreviewed=1"), "derivation must run before any fallback fetch");
+    assert.ok(fn.includes("state.opportunities.length"), "fallback must trigger only when the main list hit its limit");
+    assert.ok(fn.includes("r.opportunities || rows"), "a failed fallback must keep the client-side rows");
+  });
+
+  it("refresh fetches the opportunity list exactly once (no second list fetch)", () => {
+    const fn = js.slice(js.indexOf("async function refresh()"));
+    assert.equal(fn.split('api("/api/opportunities').length - 1, 1, "refresh must fetch the opportunity list exactly once");
+  });
+});
+
+describe("meta once + delayed-only triage refresh (audit 2026-09-20-round1 Task 2)", () => {
+  it("fetches /api/meta from one guarded site (once per boot, retry on failure)", () => {
+    assert.equal(js.split('api("/api/meta")').length - 1, 1, "/api/meta must be fetched from exactly one site");
+    const fn = js.slice(js.indexOf("async function refresh()"));
+    assert.ok(fn.includes("if (!metaLoaded)"), "refresh must guard the meta fetch with the once-per-boot flag");
+    assert.equal(js.split("metaLoaded = true").length - 1, 1, "metaLoaded must set only on success, so a failed boot retries");
+  });
+
+  it("manual triage paints once via the delayed refresh only", () => {
+    const fn = js.slice(js.indexOf('$("#btn-run")'), js.indexOf("/* ---- read-only warnings"));
+    assert.ok(fn.includes("setTimeout(refresh, 45000)"), "manual run lost its delayed refresh");
+    assert.ok(!fn.includes("await refresh()"), "manual run still paints an immediate no-op refresh");
+  });
+});

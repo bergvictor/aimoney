@@ -1,126 +1,119 @@
-# AUDIT 2026-09-20 — aimoney (round 1, overnight lane)
+# AUDIT-2026-09-20-round1 — aimoney (angle: WASTE, read-only)
 
-Clone HEAD: `e1c0018` (round 3: experiment money, inline post-mortems, slug-collision supports). Live rev (`_night/live/aimoney_pages_dev_api_health.html`): `e1c0018` — live is current with HEAD this round; the round-3 deploy gap is closed. No repo-local `AGENTS.md`/`CLAUDE.md`/`CONTRIBUTING.md`; governed by `README.md` plus standing rules. Working tree arrived CRLF-dirty on all 31 tracked files (pre-existing checkout artifact: `git diff --stat` shows 6715+/6715−, i.e. line endings only; content untouched, left alone).
-Lane metric right now (live payload, measured): **0 decisions/week, 0 vetted/week, $0.00 revenue/week, 11 unreviewed (oldest 163.3h ≈ 6.8d), 19/27 rows without a brief, 2 planned / 0 running experiments, 0 vetted-without-experiment, last ok run 1.6h ago**.
-Surfaces judgment: live HTML is text-identical to `public/index.html` (5514 served bytes vs 5635 here = exactly 121 CRLF bytes over 121 lines). Light palette only (`public/styles.css:4` `color-scheme: light`; regex search for `prefers-color-scheme|data-theme|toggleTheme|setTheme` across served files returns nothing), favicon + `theme-color` (`public/index.html:9-10`, `public/favicon.svg` 285 bytes), inline brand mark (`public/index.html:16`), guard tests green. **Zero surface-rule findings this round.**
+Lane metric (aimoney): experiments decided (won/lost + post-mortem) per week, vetted proposals that become experiments, unreviewed backlog drained. Live values from the repo's own health endpoint today (`_night/live/aimoney_pages_dev_api_health.html`, rev d1aa266): `decisions_last_7d: 0`, `vetted_last_7d: 0`, `unreviewed: 11`, `oldest_unreviewed_age_h: 165.1` (~6.9d), `bare_without_brief: 19/27`, `experiments_by_status: {planned: 2}` (zero running/won/lost), `revenue_total: 0`. Every finding below is ranked by how it serves a sub-minute phone clear or stops feeding the backlog.
 
 ## 1. What this project is and how it runs
 
-- Purpose: AIMoney Lab — a ranked board of AI-money opportunities with evidence briefs and experiments (`README.md:1-15`).
-- Entry points: dashboard `public/app.js` + `public/index.html`; API `functions/api/[[path]].js`; agent `worker/src/index.js` + `worker/src/lib.js`.
-- Live surfaces: `https://aimoney.pages.dev`, `/api/health`, research worker (`README.md:27-31`).
-- Scheduled jobs: worker cron every 6h (`worker/wrangler.toml:8-9`); manual triage-only `POST /run` 202 with `briefs_skipped:true` (`worker/src/index.js:497-506`).
-- Deploys: `./deploy/deploy.sh` (D1 schema+migrations+seed-if-empty, stamp `release.json`, Pages, worker), `./deploy/verify.sh` gates rollout (≤12h freshness).
+- Purpose: AIMoney Lab — a ranked ledger of AI-money opportunities with research briefs, experiments, and a cron research agent that proposes new rows; the human vets, tests, kills/scales.
+- Entry points: dashboard `public/index.html` + `public/app.js`; API `functions/api/[[path]].js` (D1); agent `worker/src/index.js` (`scheduled` + `fetch` for `/`, `/run`, `/ping-ai`, `/debug-classify`).
+- Live surfaces: `https://aimoney.pages.dev`, `/api/health`, worker `https://aimoney-research.<account>.workers.dev/` (`deploy/public-surfaces.json`).
+- Scheduled jobs: one cron `0 */6 * * *` (`worker/wrangler.toml:9`); `.github/workflows/deploy-worker.yml` redeploys the worker (+schema) on push to `worker/**` or `d1/**`.
+- Deploys: Pages is git-connected (`public/`, build `scripts/stamp-release.sh` stamps `release.json`); `./deploy/deploy.sh` runs D1 schema+migrations, stamps, Pages deploy, worker deploy; `./deploy/verify.sh` checks markers, non-empty list, agent freshness ≤12h.
 
 ## 2. End-to-end walk-through
 
-1. Collect: cron tick → `runResearch(env,"cron")` (`worker/src/index.js:165` via `scheduled` at `:440-443`) fans out HN/Reddit/GitHub (`:200`, `:47`, `:71`, `:95`), batch-inserts signals with `INSERT OR IGNORE` (`:205-210`).
-2. Sweep + take: 30d-stale signals → noise with count (`:218-224`); oldest 6 unprocessed taken (`:225-227`). Quiet ticks continue to the brief pass (`:228-231`) instead of early-returning.
-3. Triage: one Mistral NDJSON pass over top-60 list + fresh signals (`:237-254`); `new` inserts capped `UNREVIEWED` rows (`:275-299`, humility clamp `:280-281`, cap via `effectiveScore` in `worker/src/lib.js:29-32`), slug collisions link as supports (`:300-312`), `supports` appends evidence newest-kept (`:313-321`), else noise (`:322-324`); bad actions still mark processed (`:265-267`).
-4. Brief: one bare row (top-scored, or oldest-unreviewed past 48h, `:331-345`) + one extra oldest bare row past 48h on cron (`:386-430`); empty/malformed brief JSON skipped silently (`:369`, `:380`, `:416`, `:427`). Manual runs always skip (`:198` `briefDeadline=-1`).
-5. Serve: `GET /api/opportunities` returns `effectiveScore`-capped rows with `brief_first_steps` excerpts (`functions/api/[[path]].js:56-69`); review queue oldest-first (`:42-55`); health carries queue + money counters (`:349-383`).
-6. Decide: review rows show capital/next/source with inline Vet/Kill (`public/app.js:164-206`); Start-here strip shows #1 actionable pick with Vet/Kill when unreviewed (`:95-130`); drawer holds facts/brief/experiments with money + ended date (`:543-591`, `:571`).
-7. Test: `researching → testing` by hand; experiment `planned → running` one click (`:385-397`), `→ won/lost` one click + one inline line (`:404-421`); closure rules + cents + outcome ledger (`functions/api/[[path]].js:235-334`); drawer suggests a ±1 rescore, never auto-applied (`public/app.js:603-613`).
-8. Where it breaks/goes silent, in order: **(a)** the human vet bottleneck — 11 unreviewed, oldest 163.3h, zero vetted this week, and the review row still hides the brief summary behind the drawer (F1); **(b)** 19/27 bare while proposals (≤6/run) structurally outrun briefs (≤2/run) (F3); **(c)** cross-source duplicate signals consume take slots and AI with no deterministic dedupe (F2); **(d)** orphaned experiment cards dead-end in a toast with no DELETE anywhere (`public/app.js:472`) (F7).
+Signal → proposal → brief → vet → experiment → decision. Hops (file:line):
+
+1. Cron fires `scheduled()` → `runResearch(env, "cron")` (`worker/src/index.js:484`, `:182`); manual path `POST /run` returns 202 and runs the same pass in `waitUntil` (`worker/src/index.js:540-548`).
+2. Collect: `hnSignals()` ×4 queries, `redditSignals()` ×3, `githubSignals()` ×2 (`worker/src/index.js:48`, `:72`, `:96`, `:217`) → one batched `INSERT OR IGNORE` (`worker/src/index.js:222-227`).
+3. Stale sweep (>30d → noise, `worker/src/index.js:236-240`) → take oldest 6 unprocessed (`worker/src/index.js:242-244`) → exact-URL supports pre-pass, no AI (`worker/src/index.js:250-267`, pure `exactUrlTarget` `:153`).
+4. Classify: one Mistral NDJSON call over ≤6 signals vs top-60 list (`worker/src/index.js:277-294`, `aiComplete` `:121-138`) → verdict loop inserts ≤2 `researching` rows capped ≤6000 with `UNREVIEWED` (`worker/src/index.js:300-355`, cap `worker/src/lib.js:21-32`, estimates `worker/src/index.js:165-180`).
+5. Brief: 1 bare row (top-scored, or oldest-unreviewed past 48h) + optionally 1 extra oldest bare row past 48h (`worker/src/index.js:370-473`); manual runs skip via `briefDeadline = -1` (`worker/src/index.js:215`).
+6. Human vets in dashboard: `refresh()` boot (`public/app.js:1118`) → review chip + oldest-first list (`public/app.js:224-248`) → Vet / Vet-&-log-starter / Kill (`public/app.js:377`, `:403`, `:435`) → `PATCH /api/opportunities/:id` clears marker, lifts cap, tags `[date vetted]` (`functions/api/[[path]].js:123-160`).
+7. Experiment: log/start/lose/win from board or drawer (`public/app.js:1032-1055`, `:584-643`) → `POST/PATCH /api/experiments` with closure gate (won/lost require `result` + `post_mortem`, stamps `started_at`/`ended_at`, cents + `revenue_source`, outcome ledger line into parent notes) (`functions/api/[[path]].js:236-340`); header counts decisions/vetted/revenue from `/api/health` (`functions/api/[[path]].js:355-391`).
+8. Scores recompute on every write via shared `effectiveScore` (`functions/api/[[path]].js:10,66,108,148`; API imports it from `worker/src/lib.js`).
+
+Where it most often breaks or goes silent: the human bottleneck — 11 unreviewed, oldest 6.9d, `vetted_last_7d = 0`, 19/27 rows brief-less, 2 planned experiments with zero running. Silent machine drops compound it: malformed brief JSON is swallowed (`worker/src/index.js:423` `catch {}`), invalid verdicts are dropped or marked noise without surfacing (`worker/src/index.js:300-308`), the brief pass self-skips past deadline (`worker/src/index.js:374`), and the whole pass must fit `waitUntil`'s ~30s cap on the manual path (`worker/src/index.js:7-11`).
 
 ## 3. Health signals measured here
 
-- `npm test` (this checkout, exit 0): **148 pass / 0 fail, 54 suites, duration_ms 771.207052**. Only warnings are the known `MODULE_TYPELESS_PACKAGE_JSON` reparsing notes (x3: `[[path]].js`, `index.test.js`, `lib.test.js`) and sandbox proxy notes. (Round-3 baseline was 137/50; the +11 are the shipped round-3 suites.)
-- `python3 -m compileall`: N/A — repo contains zero `*.py` files (glob `**/*.py` search returns nothing; JS-only: Pages + Functions + Worker, `node --test` suites).
-- Dead code (all still present): `BRIEF_DEADLINE_MS` defined but never referenced (`worker/src/index.js:20` vs live `briefDeadline` at `:198`); unused `scoreOf` import (`:139`, no other use in file); redundant double `await finish("ok")` (`:431-432`); `GITHUB_QUERIES.slice(0, 2)` silently drops `ai-side-project` (`:115` vs `:27`); `appendKeepNewest` has zero production callers (`worker/src/lib.js:36-39`, tests only).
-- Duplicated logic: classify prompt text duplicated between the pass (`worker/src/index.js:237-247`) and `/debug-classify` (`:477-485`); brief-prompt + brief-insert duplicated for main (`:351-380`) and extra (`:402-426`) briefs; create-vs-update string bounds differ (create slices, update stores raw); worker token compare repeated 3x (`:454`, `:469`, `:500`).
-- TODO density: **0** — regex search for `TODO|FIXME|HACK|XXX` across `public/`, `functions/`, `worker/`, `scripts/`, `deploy/` returns nothing.
+- Test suite (`npm test` = `node --test worker/src/lib.test.js worker/src/index.test.js functions/api/api.test.mjs public/tab-icon.test.mjs public/dashboard.test.mjs`): exit 0 — `# tests 190, # suites 67, # pass 190, # fail 0, # cancelled 0, # skipped 0, # duration_ms 1379.76`. Baseline log (`_night/tests-baseline.log`): 190/190, `duration_ms 283.6074` on Windows. Same green, slower here (sandbox overhead). Warnings only: `MODULE_TYPELESS_PACKAGE_JSON` (add `"type": "module"`) and an experimental-proxy notice.
+- `python3 -m compileall`: N/A — zero `*.py` files in the repo (glob search, no matches). Python appears only as JSON one-liners inside `deploy/deploy.sh:41` and `deploy/verify.sh:39,43,51`. JS syntax is covered by the passing suite, which imports every source file.
+- Live surfaces: `_night/live/aimoney_pages_dev.html` byte-matches `public/index.html` (light palette, `color-scheme: light`, no dark branch in `public/styles.css`; `<link rel="icon" href="/favicon.svg">` + `<meta name="theme-color" content="#0d6b3f">`; inline `$` brand mark matching `public/favicon.svg`, 1 line / ~300 bytes). Guard suite `public/tab-icon.test.mjs` passes 5/5. All 5 standing surface rules hold — no surface-rule findings this round. No placeholder text; `Loading …` rows are JS-boot states only.
+- Dead code: `scoreOf` imported but never used in `worker/src/index.js:140` (only `effectiveScore` is used, `:335`); unreachable toast gates after `return openAdminModal(...)` in `public/app.js:380` and `:438` (each preceded by an identical `if (!state.token) return ...` at `:378`/`:436`); `GET /api/briefs` (`functions/api/[[path]].js:162-169`) has no first-party caller — the dashboard renders briefs from the detail payload (`public/app.js:711,730`) and list excerpts.
+- Duplicated logic: `clamp10` in `functions/api/[[path]].js:12-16` vs `worker/src/lib.js:4-7` (API already imports `effectiveScore` from lib but not `clamp10`); classify prompt built twice (`worker/src/index.js:277-287` vs `/debug-classify` `:519-528`); brief prompt+parse+insert twice (`worker/src/index.js:394-424` vs extra-brief `:439-470`); `inlineWinClose` (~65 lines, `public/app.js:304-371`) mirrors `inlinePostMortem` (`:265-303`); oldest-UNREVIEWED `SELECT` twice per cron tick (`worker/src/index.js:377` and `:430-432`); three separate `#board` click listeners (`public/app.js:1032,1041,1050`); `centsDollars` (API `:20`) vs `moneyCents` (`public/app.js:51`) — documented-deliberate mirror.
+- TODO density: **0** in source — regex `TODO|FIXME|HACK\(|XXX` matches only the three prior audit docs in `docs/audits/` quoting the pattern.
+- Repo docs: `README.md` only; no `AGENTS.md`/`CLAUDE.md`/`CONTRIBUTING` at root or in subdirs. `.env`/secrets never opened.
 
 ## 4. Ranked findings (max 8)
 
-### F1 — The 60-second vet still needs the drawer: review rows hide the brief summary
+### F1. Every refresh re-fetches the review list it already holds
 
-- Evidence: the list SELECT returns only `brief_first_steps` (`functions/api/[[path]].js:59` `(SELECT b.first_steps ... LIMIT 1) AS brief_first_steps`), and the decision line renders just that first line plus capital and source: `` const parts = [`Capital: ${esc(o.capital_needed || "—")}`]; if (next) parts.push(`Next: ${esc(next)}`); `` (`public/app.js:164-173`). The brief `summary`/`risks`/`numbers` load only via a second round-trip: `const d = await api(`/api/opportunities/${id}`);` (`public/app.js:545`).
-- Why it costs money: vetting the 11 unreviewed rows (oldest 6.8d) is the entire lane metric, and the one thing a vet decision depends on — what the evidence actually says — is behind a drawer tap plus a fetch on a phone. The `Next:` action tells the owner what to do, not whether the idea is real.
-- Fix: add the latest brief `summary` (first ~200 chars, null-safe like `brief_first_steps`) to the list SELECT, and render it as one muted line under the decision line; rows without a brief keep an explicit "No brief yet" so bare rows read as unproven, not empty. Touch `functions/api/[[path]].js`, `functions/api/api.test.mjs`, `public/app.js`, `public/dashboard.test.mjs`.
-- Size S. Risk: low (read-only display + one SELECT column; scoring, writes, and brief versioning untouched).
+Evidence — `public/app.js:1120-1131`: `refresh()` fetches `/api/opportunities?limit=200` AND (via `refreshReview`, `public/app.js:226`) `/api/opportunities?unreviewed=1&sort=oldest&limit=200`. The second call is a subset of the first: `unreviewed=1` only adds `o.notes LIKE '%UNREVIEWED%'` (`functions/api/[[path]].js:52`) and `oldest` only changes `ORDER BY` to `o.created_at ASC` (`:53-54`) — and every field needed (`notes`, `created_at`) is already in the main payload. Each list call also runs 4 correlated subqueries per row (`brief_count`, `brief_first_steps`, `brief_summary`, `experiment_count`, `functions/api/[[path]].js:57-61`).
 
-### F2 — Cross-source duplicate signals eat take slots and AI; exact-URL matches need no model
+Why it costs: `refresh()` runs after every vet, kill, start, lose, win, save, and add — so every single phone decision pays a full redundant API round-trip plus ~11×4 server subqueries, slowing the sub-minute clear and doubling D1 read load for zero new information.
 
-- Evidence: dedupe is only `UNIQUE(source, external_id)` (`d1/schema.sql:82`) enforced by `INSERT OR IGNORE` (`worker/src/index.js:206-209`) — but each source mints its own id namespace (`hnSignals` uses `h.objectID` at `:58`, `redditSignals` uses `d.id` at `:82`), so the same story URL arriving via HN and Reddit inserts twice, takes two of the 6 oldest-first slots (`:225-227`), and burns classify attention (`:250-254`) that a string compare could have resolved.
-- Why it costs money: every duplicate that reaches the model is a take slot stolen from a genuinely fresh signal and pressure toward a duplicate `new` row the owner must later vet or kill; the queue stops draining at the top.
-- Fix: write the rule down (`README.md`: "a fresh signal whose URL exactly matches an existing opportunity `source_url` or an already-linked signal URL is linked as supports before triage — reversible, notes newest-kept, no status move, no AI call") and implement it as a pre-pass over the 6 taken signals reusing the existing supports SQL (`:313-321`). Worker test pins link-not-triage. Touch `worker/src/index.js`, `worker/src/index.test.js`, `README.md`.
-- Size S. Risk: low (exact-URL match only, no fuzzy matching; AI budget and manual skip untouched).
+Fix: derive `state.reviewList` client-side in `refreshReview` by filtering `state.opportunities` on `UNREVIEWED` and sorting oldest-first; keep the API call only as a fallback when the main list is truncated (`length === limit`). Touch `public/app.js` and `public/dashboard.test.mjs` (assert chip count/age identical with the fetch stubbed to fail). Size S. Risk low — same row shape, truncation-guarded.
 
-### F3 — Proposal throughput (≤6 new/run) still structurally exceeds brief throughput (≤2/run)
+### F2. Start-here strip spends a detail fetch on data the list already carries
 
-- Evidence: `const MAX_AI_SIGNALS = 6;` (`worker/src/index.js:15`), take `ORDER BY id ASC LIMIT ?` (`:225-227`), one insert per `new` verdict with no per-run counter (`:275-299`) — up to 6 new bare rows per 6h tick. Briefs cap at 2 per cron tick (main `:346-381` + extra `:386-430`, extra gated on >48h backlog), and manual runs brief nothing (`:198`, `:505` `briefs_skipped:true`). Live: `bare_without_brief: 19` of 27 with `oldest_unreviewed_age_h: 163.3`. (Carried from round 3; that round shipped money/drawer/collision instead.)
-- Why it costs money: every unbriefed row renders a `no brief` pill (`public/app.js:910-913`) and the review decision line loses its `Next:` action (`:164-173`), so the rows most needing a fast decision carry the least evidence. Whenever triage adds more than 2 per tick, the backlog grows no matter how healthy the agent looks.
-- Fix: cap `new` inserts at 2 per run (matching brief capacity); when the cap binds, leave the remaining `new`-verdict signals unprocessed (`processed=0`) so a later tick retries them via the oldest-first retake — the 30d sweep (`:218-224`) still bounds the backlog. Document the rule in `README.md`; worker test pins cap + retake. Touch `worker/src/index.js`, `worker/src/index.test.js`, `README.md`.
-- Size M. Risk: medium (touches the insert loop; keep noise/supports paths, AI budget, and manual skip untouched; retries cost one classify call per tick until drained).
+Evidence — `public/app.js:121-129`: when the top pick has no cached brief text, the strip fires `api(\`/api/opportunities/${top.id}\`)` just to compute `firstStepsFirstLine(d.briefs[0])`. But the list payload already includes `(SELECT b.first_steps ... ORDER BY b.version DESC LIMIT 1) AS brief_first_steps` (`functions/api/[[path]].js:59`) — the same latest-brief row the detail call reads. Server-side the detail call costs 3 sequential selects (row + briefs + experiments, `functions/api/[[path]].js:73-83`).
 
-### F4 — Agent evidence appends bump `updated_at`, inflating the vetted-this-week count
+Why it costs: every top-pick change (i.e. after every vet/kill that re-ranks #1) burns a needless round-trip before the owner sees his next action — the exact "decision needs everything in front of it" path.
 
-- Evidence: both agent appends set `updated_at` to now: the slug-collision path (`` `UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?` ``, `worker/src/index.js:308`) and the supports path (`:317-321`, same SET clause). But `vetted_last_7d` counts `notes LIKE '%vetted]%' AND updated_at >= ... '-7 days'` (`functions/api/[[path]].js:361`) — so a row vetted a month ago that receives one supporting signal today counts as "vetted this week" with no human involved.
-- Why it costs money: `vetted_last_7d` is half the lane metric ("vetted proposals that become experiments"), and today agent activity can move it. The count is documented as "touched in 7d" (`README.md:75`), yet the header presents it as `N vetted this week` (`public/app.js:438`) — the presentation promises a human decision the query cannot guarantee.
-- Fix: drop the `updated_at` bump from the two worker append statements (notes still appended newest-kept), so `updated_at` again means "last human or insert touch" and the vetted window regains integrity; alternatively count from the `[YYYY-MM-DD vetted]` tag date. Worker/API test pins a supports-append to a vetted row leaving `vetted_last_7d` unchanged. Touch `worker/src/index.js`, `worker/src/index.test.js`, `functions/api/api.test.mjs`, `README.md` (one line).
-- Size S. Risk: low-medium (changes `sort=updated` ordering for agent-touched rows; no status, scoring, or closure change).
+Fix: use `firstStepsFirstLine({ first_steps: top.brief_first_steps })` directly in `renderStartHere` and delete the `topBriefText` fetch/cache (`public/app.js:100-103,121-129` plus the `topBriefText: {}` init at `:8`). Touch `public/app.js` and `public/dashboard.test.mjs`. Size S. Risk low — identical excerpt source, null-safe like the review decision line.
 
-### F5 — Closed-experiment money vanishes after 7 days: no lifetime totals anywhere
+### F3. `/api/meta` is refetched on every refresh although it never changes per deploy
 
-- Evidence: the only money aggregate is the 7d window: `SELECT COALESCE(SUM(revenue_cents),0) ... WHERE status IN ('won','lost') AND ended_at >= ... '-7 days'` (`functions/api/[[path]].js:360`), shown as `$X revenue this week` (`public/app.js:439`). A search for `revenue|SUM(` in the API confirms no lifetime total. A $500 pilot won 8 days ago survives only as one notes-ledger line (`:272-279`, `:315-322`) — the header, health, and board all read $0 again.
-- Why it costs money: criterion (4) is money made real — an amount, a date, a source. The round-3 ledger work put all three on each close; without lifetime totals the lane's money number still resets to zero every week by construction, and "as much money as possible" has no running scoreboard.
-- Fix: add `revenue_total` + `spent_total` (cents, all `won`/`lost`, no date bound) to `/api/health` from the existing columns — no migration — and append `· $X lifetime` to the experiments header next to the weekly figure, hidden when the keys are absent (same old-backend guard as `:431`). Touch `functions/api/[[path]].js`, `functions/api/api.test.mjs`, `public/app.js`, `public/dashboard.test.mjs`.
-- Size S. Risk: low (additive read-only counters; closure gates and cents math untouched).
+Evidence — `public/app.js:1130`: `state.meta = await api("/api/meta")` sits inside `refresh()`, after the parallel four. The handler returns only deploy-static values: `worker_url`, `writes_enabled`, `scoring` (`functions/api/[[path]].js:393-399`).
 
-### F6 — The concrete zero-spend experiment exists and was never started: the spec-ad sprint
+Why it costs: one more serial round-trip (it awaits after the parallel batch) on every boot and every post-action refresh — pure repeat work with no new information, adding latency to each decision cycle.
 
-- Evidence: seed holds one planned experiment — `'Spec-ad sprint: 10 brands, 10 free ads'`, hypothesis `If we send 10 DTC supplement brands a finished spec ad each, at least 1 replies and 1 converts to a paid pilot within 14 days.`, `'planned', '$0 + 10 hours', '', 'replies; pilots closed', '>=3 replies; >=1 pilot at >=$500'` (`d1/seed.sql:67-71`). Live: `"experiments_by_status":{"planned":2}`, no `running`, `decisions_last_7d:0`. One-click Start exists (`public/app.js:385-397`). The second planned experiment's identity is not in repo data (added live by agent or human).
-- Why it costs money: this is the lane's cheapest decision — $0, 10 hours, a count (replies) within 7 days and a paid pilot (>= $500) within 14 — and it has sat in `planned` while decisions stayed zero across five snapshots. No code stands in the way; only a press.
-- Fix: human action, no code — press Start on the spec-ad sprint, ship 10 free spec ads to DTC supplement brands by day 2, count replies on day 7, close `won` (set `revenue_cents` from any pilot deposit, never invented) or `lost` with the one-line post-mortem. If the second live `planned` experiment duplicates it, Lose the weaker one first with one line.
-- Size S. Risk: low (10 hours + $0; reversible — a `lost` close appends learning to the parent notes).
+Fix: fetch `/api/meta` once at boot (module init or first `refresh()` only) and reuse `state.meta` thereafter; re-fetch only on explicit retry-after-failure. Touch `public/app.js` and `public/dashboard.test.mjs`. Size S. Risk low — values are env-derived and static until redeploy.
 
-### F7 — Orphaned experiments still have no remediation path; no DELETE anywhere (carried)
+### F4. `/api/health` runs 12 sequential D1 queries plus a release.json subrequest per call
 
-- Evidence: `LEFT JOIN` keeps dangling rows with `orphaned:true` (`functions/api/[[path]].js:220-232`); the board renders an `orphaned` pill (`public/app.js:461`) but the click dead-ends: `if (c.dataset.orphan === "1") return toast("Orphaned experiment — its opportunity was deleted.");` (`:472`); search for `DELETE` in `functions/api/[[path]].js` returns zero lines, and schema FKs are advisory without `PRAGMA foreign_keys` (`d1/schema.sql:48`).
-- Why it costs users/trust: orphans accumulate with no admin action — no delete, no relink, not even a drawer — slowly filling the board with unactionable cards that pollute the experiment counts the lane metric reads.
-- Fix: admin-only `DELETE /api/experiments/:id` (same `authed` + 404 shape as update) with a `Delete` button on orphaned cards only, behind the token check with a confirm; keep the toast for non-admins. API tests for 401/404/happy-path. Touch `functions/api/[[path]].js`, `public/app.js`, `functions/api/api.test.mjs`.
-- Size M. Risk: medium (first DELETE endpoint; restrict to experiments, never cascade to opportunities).
+Evidence — `functions/api/[[path]].js:356-372`: the health branch awaits ~12 separate selects in sequence (count, unreviewed, bare, exp-by-status, lastOk, oldestUnreviewed, decisions, revenue_7d, revenue_total, spent_total, vetted, vettedNoExp, noise), then `fetch(new URL("/release.json", url.origin))` at `:386-390` on every call. Health is fetched by every dashboard `refresh()` (every action) and twice by `deploy/verify.sh` (`:32` check + `:51` freshness).
 
-### F8 — Unbounded update strings + worker auth/dead-code drift (carried, polish last)
+Why it costs: health is the hottest endpoint and each hit pays a dozen D1 round-trips where independent pairs scan the same rows — `decisionsRow`+`revenueRow` both scan won/lost-closed-in-7d (`:365-366`), `revenueTotalRow`+`spentTotalRow` both scan all won/lost (`:367-368`) — plus a same-origin subrequest for a static file.
 
-- Evidence: `createOpportunity` slices every string (`functions/api/[[path]].js:91-106`) but `updateOpportunity` stores raw (`:129-132`, `next[f] = String(b[f])`, no slice on any of eight fields); same split on experiments (create `:266-271` vs update `:291-294`). Worker still `!==`-compares tokens in three places (`worker/src/index.js:454`, `:469`, `:500`, collapsing unset-token 503 into 401) vs the API constant-time compare (`functions/api/[[path]].js:24-32`); dead items from §3 all survive.
-- Why it costs trust/maintainability: a single `PATCH` with a megabyte `title` passes every guard `POST` enforces (ledger rendering, notes-idiom bloat); the next editor tunes the wrong deadline constant or "fixes" the dropped GitHub query. No direct money movement — ranked last.
-- Fix: mirror create-path `slice()` bounds into both update handlers with two truncation tests; extract the constant-time compare into `worker/src/lib.js`, align worker 503/401, delete the redundant first `finish("ok")`, delete-or-wire `BRIEF_DEADLINE_MS`, drop `scoreOf` from the worker import, document `appendKeepNewest` as a test oracle, comment `slice(0,2)`. Touch `functions/api/[[path]].js`, `functions/api/api.test.mjs`, `worker/src/lib.js`, `worker/src/index.js`.
-- Size S. Risk: low (`npm test` must stay green; keep tokens out of logs).
+Fix: merge the paired scans (`COUNT(*)`+`SUM()` in one statement each; `COUNT(*)`+`MIN(created_at)` for the unreviewed count/oldest pair) and issue the remaining independent selects via one `env.DB.batch(...)` as the worker already does for inserts (`worker/src/index.js:223`). Keep every response key byte-identical. Touch `functions/api/[[path]].js` and `functions/api/api.test.mjs`. Size M. Risk low-medium — SQL-only change, existing health-key tests pin the contract.
+
+### F5. Each run fetches and stores ~72 signals but triages 6; the rest queue, then sweep to noise
+
+Evidence — `MAX_SIGNALS_PER_SOURCE = 8` (`worker/src/index.js:14`) × 4 HN + 3 Reddit + 2 GitHub queries (`:25-28`, `:116` slices to 2) = up to 72 collected and batch-inserted per run (`:217-227`), while triage takes `MAX_AI_SIGNALS = 6` (`:15`, `:242-244`) and inserts at most 2 (`:16`, `:317`). At 4 runs/day that's ~288 stored vs 24 triaged; the overflow ages out via the 30d sweep (`:236-240`) having consumed fetch time, insert batch, and D1 rows for nothing — and whatever does get inserted (≤8/day) feeds the 11-deep unreviewed backlog nobody is clearing.
+
+Why it costs: external fetch volume, D1 growth, and — worst for the lane metric — proposal inflow into a queue whose drain rate is zero (`vetted_last_7d: 0`). Collection is tuned for a reviewer that doesn't exist.
+
+Fix: gate collection on queue depth — `SELECT COUNT(*) FROM signals WHERE processed = 0` first and skip the source fetches when unprocessed depth exceeds ~2 runs' worth (12), letting the take in `:242` drain the queue; alternatively cut `MAX_SIGNALS_PER_SOURCE` to 2–3 to match consumption. Touch `worker/src/index.js` and `worker/src/index.test.js` (static guards already cover the take/sweep). Size M. Risk low — collection is idempotent (`INSERT OR IGNORE`) and triage order is unchanged.
+
+### F6. Exact-URL pre-pass loads two full tables to match ≤6 signals
+
+Evidence — `worker/src/index.js:251-256`: every run with fresh signals runs `SELECT id, source_url FROM opportunities WHERE source_url != ''` and `SELECT url, opportunity_id FROM signals WHERE opportunity_id IS NOT NULL AND url != ''`, then loops `exactUrlTarget` (`:153-163`) per signal. Cost grows with both tables on every tick, yet at most 6 URLs are ever matched — and neither `opportunities.source_url` nor `signals.url` has an index (`d1/schema.sql:28-29,85` cover status/score, category, processed/created_at only).
+
+Why it costs: two unbounded full-table scans per run (4×/day forever) for a lookup that should be O(1) per signal; as signals accumulate toward the 30d sweep horizon this is the fastest-growing per-run cost.
+
+Fix: replace the bulk loads with per-signal indexed lookups (`SELECT id FROM opportunities WHERE source_url = ? LIMIT 1`, same for signals) and add `CREATE INDEX IF NOT EXISTS` on both columns via `d1/schema.sql` plus a `d1/migrate-*.sql` (deploy applies idempotently, `deploy/deploy.sh:34-38`). Touch `worker/src/index.js`, `d1/schema.sql`, new migration, `worker/src/index.test.js`. Size M. Risk low-medium — same match semantics (`exactUrlTarget` unit tests pin them); migration is additive and idempotent.
+
+### F7. Every run finishes the run log twice; the first write is immediately overwritten
+
+Evidence — `worker/src/index.js:474-475`: `await finish("ok");` then `await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + ...)`. Both issue the same `UPDATE agent_runs SET ... WHERE id=?` (`:202-208`); the second overwrites every column the first just wrote.
+
+Why it costs: one wasted D1 write and its latency on 100% of successful runs — republished output that did not change, on the path already fighting the `waitUntil` wall clock (`worker/src/index.js:7-11`).
+
+Fix: delete the first call and keep only the message-carrying `finish("ok", ...)` at `:475`. Touch `worker/src/index.js` only (no test change needed; run-log assertions still see one final row). Size S. Risk low — the surviving write carries strictly more information.
+
+### F8. Manual triage triggers an immediate refresh that cannot show anything new
+
+Evidence — `public/app.js:1066-1073`: after `POST {worker}/run` returns, the handler calls `setTimeout(refresh, 45000)` AND `await refresh()` immediately. But `/run` returns 202 while the pass runs asynchronously in `waitUntil` (`worker/src/index.js:540-548`, `runResearch` takes tens of seconds) — the immediate refresh re-reads pre-run state (6 API calls, F1–F4) and always renders unchanged data.
+
+Why it costs: six API calls' worth of load and a misleading "nothing happened" paint on every manual trigger — republished output that did not change, on a button whose whole point is impatience.
+
+Fix: drop the immediate `await refresh()` and keep only the delayed refresh; better, poll `/api/runs?limit=1` until a new run id appears (bounded ~90s) then refresh once. Touch `public/app.js` and `public/dashboard.test.mjs`. Size S. Risk low — read-only timing change; the 45s refresh already proves delayed consistency.
 
 ## 5. What NOT to change
 
-- Scoring formula: `score = 100 * (value * confidence * fit) / (effort + 1)`, each input 1–10 (`README.md:56`; `worker/src/lib.js:15-16`). F1–F8 never touch the math.
-- Human-owns-status: "The agent never moves status." (`README.md:72`); "The agent PROPOSES; the human owns the testing workflow (it never moves status to testing/scaling/killed)." (`worker/src/index.js:4-5`). F2/F3 add linking and throttling, not decisions — no auto-vet, auto-kill, auto-start, or auto-scale.
-- Manual-triage-only + briefs-on-cron: "Manual `Run triage now (briefs on cron)` collects and triages only (`POST /run` 202 carries `briefs_skipped:true`); briefs land on cron ticks" (`README.md:77`; `worker/src/index.js:505`). F3 must preserve the manual skip.
-- Killed-with-learning: "Killed strategies stay on the board with their post-mortem — that is the point." (`README.md:64`); "Closing an experiment as `won`/`lost` requires `result` + `post_mortem`" (`README.md:74`). F7 deletes orphaned *experiments*, never killed opportunities.
-- Capped humility + honest display: proposals "enter as `researching` with an `UNREVIEWED` marker in notes and an effective score capped to ≤6000 until a human vets them" (`README.md:65`); "rows without a brief carry a 'no brief' pill" (`README.md:78`). Vet/kill stay human.
-- Never-auto-applied rescore: "offers a suggested ±1 value/confidence rescore the human applies with one click — never auto-applied" (`README.md:74`; `public/app.js:603-613`).
-- Read-only warnings: badges "flag status mismatches read-only — the human still owns every status move" (`README.md:79`).
-- Seed-vs-live accounting: "Seed runs once on an empty table; live count = 12 seeds + agent proposals + manual adds." (`README.md:83`); deploy's seed-if-empty stays (`deploy/deploy.sh:30-47`).
-- Auth split and secrets: "Reads are public. Writes require `Authorization: Bearer <ADMIN_TOKEN>`." (`functions/api/[[path]].js:1-2`); "No expiry; rotate manually when shared or leaked." (`README.md:88`). Never invent a revenue figure; never mark an experiment decided without evidence.
-- Anything needing a login, payment, or human judgment: vetting the 11 `UNREVIEWED` rows, `researching → testing → scaling` moves, starting the 2 `planned` experiments (F6), post-mortems, niches/pricing/outreach, token rotation. The most valuable moves on the lane metric remain non-code: press Start on the spec-ad sprint (F6), then vet the 11 (helped by Task 1).
-- Live surfaces already compliant (light palette, favicon + theme-color, brand mark, guard test green) — do not restyle, re-palette, or re-icon.
+- Agent never moves status: "The agent never moves status." (`README.md:72`; `worker/src/index.js:4-5` "The agent PROPOSES; the human owns the testing workflow"). Any auto-vet/auto-test/auto-kill needs an explicit owner decision and reversibility rule — out of scope for waste cuts.
+- UNREVIEWED score cap: "its EFFECTIVE score is clamped below the human seeds" (`worker/src/lib.js:18-20`, `UNREVIEWED_SCORE_CAP = 6000`, `:22`). Do not lift or retune while the backlog is unreviewed.
+- New-proposal inflow cap: "Each run inserts at most 2 new proposals (inflow ≤ brief capacity)" (`README.md:76`; `MAX_NEW_PER_RUN = 2`, `worker/src/index.js:16`). F5 trims collection ahead of it; the cap itself stays.
+- Closure gate: won/lost require `result` + `post_mortem` (`functions/api/[[path]].js:247-252,310-314`); never invent revenue (`revenue_cents`/`spent_cents` default 0, `:258-260`) and never auto-apply the suggested rescore ("never auto-applied", `README.md:74`).
+- Manual runs skip briefs by design: "Manual `Run triage now (briefs on cron)` collects and triages only" (`README.md:77`; `briefDeadline = -1`, `worker/src/index.js:215`; 202 carries `briefs_skipped:true`, `:548`). Do not "fix" by briefing on manual.
+- Token-gated writes: admin `Bearer` checks (`functions/api/[[path]].js:24-32`, worker `/run` `:541-543`, dashboard modal gates e.g. `public/app.js:378`); token rotation and `ADMIN_TOKEN` values need the owner — never touch credentials, `.env`, or deploy/CI config for these cuts.
+- Human-owned decisions: vet/kill/testing/scaling moves, post-mortem text, revenue amounts and sources — all require the owner; the 30d signal sweep (`worker/src/index.js:232-240`) and `GET /api/briefs` public shape stay as-is.
 
 ## 6. Proposed next tasks (2–4)
 
-### Task 1: Show brief summary in review rows so vet needs no drawer
-
-- Owned files: `functions/api/[[path]].js`, `functions/api/api.test.mjs`, `public/app.js`, `public/dashboard.test.mjs`.
-- Acceptance: (a) list SELECT returns a null-safe brief-summary excerpt per row; (b) review rows render it as one muted line under the decision line, "No brief yet" when bare; (c) ledger order, scoring, and writes untouched; (d) API + dashboard tests lock excerpt + rendering; (e) `npm test` green.
-
-### Task 2: Link exact-URL duplicate signals as supports before AI triage
-
-- Owned files: `worker/src/index.js`, `worker/src/index.test.js`, `README.md`.
-- Acceptance: (a) pre-pass over taken signals links exact-URL matches as supports with no AI call; (b) rule written in README (reversible, newest-kept, no status move); (c) non-matching signals triage unchanged; (d) worker test pins link-not-triage; (e) `npm test` green; (f) AI budget, manual skip, and status rules intact.
-
-### Task 3: Add lifetime revenue/spend totals to health and header
-
-- Owned files: `functions/api/[[path]].js`, `functions/api/api.test.mjs`, `public/app.js`, `public/dashboard.test.mjs`.
-- Acceptance: (a) `/api/health` carries `revenue_total` + `spent_total` cents over all `won`/`lost` (no migration); (b) experiments header appends lifetime figure, hidden on old backends; (c) weekly figure unchanged; (d) API + dashboard tests lock totals; (e) `npm test` green; (f) no closure-gate or cents-math change.
-
-### Task 4: Cap new proposals per run to brief capacity with retake
-
-- Owned files: `worker/src/index.js`, `worker/src/index.test.js`, `README.md`.
-- Acceptance: (a) at most 2 `new` inserts per run; overflow signals stay `processed=0` for oldest-first retake; (b) noise/supports paths, AI budget, and manual skip untouched; (c) rule written in README; (d) worker test pins cap + retake; (e) `npm test` green.
+1. `Derive review list client-side; drop second list fetch` — files: `public/app.js`, `public/dashboard.test.mjs`. Acceptance: one `refresh()` issues 5 API calls, review count/age/chip identical with the unreviewed fetch stubbed to fail, truncation fallback covered, `npm test` green.
+2. `Fetch /api/meta once; drop immediate post-triage refresh` — files: `public/app.js`, `public/dashboard.test.mjs`. Acceptance: meta fetched once per boot; manual run paints once via the delayed refresh only; `npm test` green.
+3. `Single run-finish write; reuse oldest-unreviewed row` — files: `worker/src/index.js`, `worker/src/index.test.js`. Acceptance: one `agent_runs` finish UPDATE per run; brief-mode and extra-brief share a single oldest query; `npm test` green.
+4. `Merge health D1 queries; keep every key` — files: `functions/api/[[path]].js`, `functions/api/api.test.mjs`. Acceptance: identical health JSON incl. all keys `verify.sh` needs; paired scans merged and independents batched; `npm test` green.

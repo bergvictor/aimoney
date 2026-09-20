@@ -11,6 +11,8 @@ const state = {
   token: localStorage.getItem("aimoney_admin") || "",
 };
 
+let metaLoaded = false; // /api/meta is deploy-static: fetch once per boot, reuse state.meta
+
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -221,11 +223,25 @@ function renderReview() {
   });
 }
 
+// Review queue derivation (pure): the main list payload already carries every
+// field the chip needs (notes, created_at), so the oldest-first queue is
+// filtered + sorted client-side with no second fetch. Rows without a parseable
+// date sort first, matching the server's oldest ASC on empty strings.
+const deriveReviewList = (opps) =>
+  (opps || []).filter((o) => String(o.notes || "").includes("UNREVIEWED")).sort((a, b) => (Date.parse(a.created_at || "") || 0) - (Date.parse(b.created_at || "") || 0));
+
 async function refreshReview() {
+  // Client-side first: identical rows with no round-trip. The unreviewed
+  // endpoint stays only as a fallback when the main list hit its limit=200
+  // and may hide unreviewed rows past the truncation point.
+  let rows = deriveReviewList(state.opportunities);
   try {
-    const r = await api("/api/opportunities?unreviewed=1&sort=oldest&limit=200");
-    state.reviewList = r.opportunities || [];
-  } catch { state.reviewList = []; }
+    if (state.opportunities.length >= 200) {
+      const r = await api("/api/opportunities?unreviewed=1&sort=oldest&limit=200");
+      rows = r.opportunities || rows;
+    }
+  } catch { /* keep the client-side rows */ }
+  state.reviewList = rows;
   const el = $("#review-count");
   if (el) el.textContent = state.reviewList.length;
   const ageEl = $("#review-age");
@@ -1069,8 +1085,9 @@ $("#btn-run").addEventListener("click", async () => {
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
     toast("Triage started — proposals land in Priority; briefs land on the next cron tick. Watch the Research log.");
+    // Delayed refresh only: /run returns 202 while the pass runs in waitUntil,
+    // so an immediate refresh would re-paint pre-run state.
     setTimeout(refresh, 45000);
-    await refresh();
   } catch (e) { toast(`Research failed: ${e.message}`); }
   btn.disabled = false;
   btn.textContent = "Run triage now (briefs on cron)";
@@ -1127,7 +1144,10 @@ async function refresh() {
   state.experiments = exps.experiments || [];
   state.runs = runs.runs || [];
   state.health = health || {};
-  state.meta = await api("/api/meta").catch(() => ({}));
+  if (!metaLoaded) {
+    try { state.meta = await api("/api/meta"); metaLoaded = true; }
+    catch { state.meta = {}; }
+  }
   await refreshReview().catch(() => {});
   $("#rev").textContent = health.rev ? `rev ${health.rev}` : "";
   renderApiErrors();

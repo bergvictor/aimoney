@@ -67,7 +67,7 @@ describe("brief on quiet ticks (audit 2026-09-20-round3 Task 2)", () => {
     assert.ok(src.includes("!fresh.length ? [] : parseJsonLines(await aiComplete"), "classify AI call lost its empty-fresh guard");
     const briefAt = src.indexOf('mark("brief-ai")');
     assert.ok(briefAt !== -1, "worker lost the brief-ai pass");
-    const firstFinish = src.indexOf('await finish("ok")');
+    const firstFinish = src.indexOf('await finish("ok",');
     assert.ok(firstFinish !== -1 && firstFinish > briefAt, "quiet tick still finishes before the brief pass");
     const noteAt = src.indexOf('note: "no fresh signals"');
     assert.ok(noteAt !== -1 && noteAt > briefAt, "quiet-tick note must only appear at the final return, after the brief pass");
@@ -76,6 +76,22 @@ describe("brief on quiet ticks (audit 2026-09-20-round3 Task 2)", () => {
   it("manual runs still skip the brief pass by deadline", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
     assert.ok(src.includes('trigger === "cron" ? 300000 : -1'), "manual path lost its brief-skipping deadline");
+  });
+});
+
+describe("single run-finish write (audit 2026-09-20-round1 Task 3)", () => {
+  it("finishes the run log exactly once, carrying the brief mode", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split('await finish("ok"').length - 1, 1, "run must finish the run log exactly once");
+    assert.ok(src.includes('await finish("ok", (briefMode'), "the single finish must carry the brief-mode message");
+  });
+});
+
+describe("shared oldest-unreviewed query (audit 2026-09-20-round1 Task 3)", () => {
+  it("brief mode and extra brief share one oldest query per run", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("SELECT created_at FROM opportunities WHERE notes LIKE").length - 1, 1, "oldest-unreviewed must be queried once per run");
+    assert.ok(src.includes("oldestUnreviewedAgeMs"), "worker lost the shared backlog-age variable");
   });
 });
 

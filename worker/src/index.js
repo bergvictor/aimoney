@@ -371,11 +371,16 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
     // unless the clock is nearly spent (it lands on a later run instead).
     let briefMode = "skipped";
     let bare = null;
+    // Backlog age shared by the brief-mode flip and the extra-brief gate: one
+    // oldest-unreviewed query per run (new proposals land newer, so the oldest
+    // cannot change mid-run).
+    let oldestUnreviewedAgeMs = NaN;
     if (Date.now() - t0 < briefDeadline) {
       briefMode = "top-scored";
       if (trigger === "cron") {
         const oldestForBrief = await env.DB.prepare("SELECT created_at FROM opportunities WHERE notes LIKE ? ORDER BY created_at ASC LIMIT 1").bind(String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)).first().catch(() => null);
         const ageMsForBrief = oldestForBrief && oldestForBrief.created_at ? Date.now() - Date.parse(oldestForBrief.created_at) : NaN;
+        oldestUnreviewedAgeMs = ageMsForBrief;
         if (Number.isFinite(ageMsForBrief) && ageMsForBrief > 48 * 3600000) {
           briefMode = "oldest-first";
         }
@@ -427,11 +432,8 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
     // bare row per cron tick. Mirrors the brief pass above (retries:0 to stay
     // within MAX_AI_CALLS); best-effort, lands next run on failure.
     if (trigger === "cron" && bare && state.ai_calls < MAX_AI_CALLS && Date.now() - t0 < briefDeadline) {
-      const oldest = await env.DB.prepare(
-        "SELECT created_at FROM opportunities WHERE notes LIKE '%UNREVIEWED%' ORDER BY created_at ASC LIMIT 1"
-      ).first().catch(() => null);
-      const ageMs = oldest && oldest.created_at ? Date.now() - Date.parse(oldest.created_at) : NaN;
-      if (Number.isFinite(ageMs) && ageMs > 48 * 3600000) {
+      // Reuses the backlog age from the brief-mode check above: no second query.
+      if (Number.isFinite(oldestUnreviewedAgeMs) && oldestUnreviewedAgeMs > 48 * 3600000) {
         const extraBare = await env.DB.prepare(
           `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
            WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' AND o.id != ? ORDER BY o.created_at ASC LIMIT 1`
@@ -471,7 +473,8 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
         }
       }
     }
-    await finish("ok");
+    // Single run-log write carrying the brief mode (a bare finish used to run
+    // first and be overwritten here).
     await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
