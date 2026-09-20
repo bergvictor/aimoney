@@ -94,6 +94,11 @@ function makeDB(seed = {}) {
       const briefed = new Set(data.briefs.map((b) => b.opportunity_id));
       return { n: data.opportunities.filter((o) => !briefed.has(o.id)).length };
     }
+    if (sql.includes("UNREVIEWED") && sql.includes("MIN(created_at)")) {
+      const unrev = data.opportunities.filter((o) => String(o.notes || "").includes("UNREVIEWED"));
+      const oldest = unrev.length ? unrev.map((o) => String(o.created_at || "")).sort()[0] : null;
+      return { n: unrev.length, oldest };
+    }
     if (sql.includes("UNREVIEWED") && sql.includes("COUNT(*)")) {
       return { n: data.opportunities.filter((o) => String(o.notes || "").includes("UNREVIEWED")).length };
     }
@@ -115,6 +120,27 @@ function makeDB(seed = {}) {
     if (sql.includes("FROM agent_runs") && sql.includes("status='ok'")) {
       const oks = data.runs.filter((r) => r.status === "ok").sort((a, b) => b.id - a.id);
       return oks[0] || null;
+    }
+    if (sql.includes("SUM(revenue_cents)") && sql.includes("SUM(spent_cents)") && !sql.includes("-7 days")) {
+      let revenue = 0;
+      let spent = 0;
+      for (const e of data.experiments) {
+        if (e.status !== "won" && e.status !== "lost") continue;
+        revenue += (Number(e.revenue_cents) || 0);
+        spent += (Number(e.spent_cents) || 0);
+      }
+      return { revenue, spent };
+    }
+    if (sql.includes("COUNT(*)") && sql.includes("SUM(revenue_cents)") && sql.includes("-7 days")) {
+      const cutoff = Date.now() - 7 * 86400000;
+      let n = 0;
+      let total = 0;
+      for (const e of data.experiments) {
+        if (e.status !== "won" && e.status !== "lost") continue;
+        const ms = Date.parse(e.ended_at || "");
+        if (Number.isFinite(ms) && ms >= cutoff) { n++; total += (Number(e.revenue_cents) || 0); }
+      }
+      return { n, total };
     }
     if (sql.includes("FROM experiments") && sql.includes("SUM(revenue_cents)")) {
       const revenueLifetime = !sql.includes("-7 days");
@@ -217,8 +243,20 @@ function makeDB(seed = {}) {
 
   const db = {
     data,
+    async batch(stmts) {
+      db._batchCalls = (db._batchCalls || 0) + 1;
+      return (stmts || []).map((s) => {
+        const sql = (s && s._sql) || "";
+        const args = (s && s._args) || [];
+        if (sql.includes("GROUP BY status")) return handleAll(sql, args);
+        const row = handleFirst(sql, args);
+        return { results: row ? [row] : [] };
+      });
+    },
     prepare(sql) {
+      (db._prepared = db._prepared || []).push(sql);
       const stmt = {
+        _sql: sql,
         _args: [],
         bind(...a) { stmt._args = a; return stmt; },
         async all() { return handleAll(sql, stmt._args); },
@@ -1042,6 +1080,65 @@ describe("experiment revenue source (audit 2026-09-20-round2 Task 3)", () => {
       { method: "PATCH", token: "secret", body: { status: "won", result: "made $", revenue_source: "Stripe" } }, db);
     assert.equal(r.status, 400);
     assert.ok(r.body.fields && r.body.fields.post_mortem);
+  });
+});
+
+describe("health batch + rev cache (audit 2026-09-20-round2 Task 2)", () => {
+  it("answers health from a single batch of merged selects", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(db._batchCalls, 1, "health must issue exactly one DB.batch");
+    const prepared = db._prepared || [];
+    assert.equal(prepared.length, 10, `health must prepare 10 statements, got ${prepared.length}`);
+    assert.ok(prepared.some((s) => s.includes("COUNT(*)") && s.includes("SUM(revenue_cents)") && s.includes("-7 days")), "decisions+revenue must merge to one scan");
+    assert.ok(prepared.some((s) => s.includes("SUM(revenue_cents)") && s.includes("SUM(spent_cents)")), "lifetime totals must merge to one scan");
+    assert.ok(prepared.some((s) => s.includes("UNREVIEWED") && s.includes("MIN(created_at)")), "unreviewed count+oldest must merge to one scan");
+  });
+
+  it("keeps every health key byte-identical (order included) for verify.sh", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "time"]);
+  });
+
+  it("reports merged figures identical to the old per-query math", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "UNREVIEWED", created_at: daysAgo(6), updated_at: daysAgo(6) },
+        { id: 2, slug: "b", title: "B", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "UNREVIEWED", created_at: daysAgo(2), updated_at: daysAgo(2) },
+      ],
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: daysAgo(2), revenue_cents: 50000, spent_cents: 1200 },
+        { id: 2, opportunity_id: 1, status: "lost", ended_at: daysAgo(10), revenue_cents: 700, spent_cents: 300 },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.unreviewed, 2);
+    assert.ok(Math.abs(r.body.oldest_unreviewed_age_h - 144) < 1, `oldest age wrong: ${r.body.oldest_unreviewed_age_h}`);
+    assert.equal(r.body.decisions_last_7d, 1);
+    assert.equal(r.body.revenue_last_7d, 50000);
+    assert.equal(r.body.revenue_total, 50700);
+    assert.equal(r.body.spent_total, 1500);
+  });
+
+  it("fetches release.json once per deploy and reuses the revision", async () => {
+    const realFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => { calls++; return { ok: true, json: async () => ({ revision: "test-rev-batch" }) }; };
+    try {
+      const db = makeDB({ opportunities: oppSeed() });
+      const first = await callApi(["health"], "http://localhost/api/health", {}, db);
+      const second = await callApi(["health"], "http://localhost/api/health", {}, db);
+      assert.equal(first.body.rev, "test-rev-batch");
+      assert.equal(second.body.rev, "test-rev-batch");
+      assert.equal(calls, 1, "release.json must be fetched once, then cached");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });
 

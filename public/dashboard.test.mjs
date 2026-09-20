@@ -319,7 +319,8 @@ describe("strip Vet/Kill (audit 2026-09-20-round2 Task 1)", () => {
   it("vet keeps the Log-experiment handoff toast and refresh", () => {
     assert.ok(js.includes("Vetted — log the experiment"), "vet toast lost the next-step copy");
     assert.ok(js.includes("openExperimentModal(null, id)"), "vet handoff must reuse openExperimentModal(null, id)");
-    assert.ok(js.includes("await refresh()"), "vet must refresh after the decision");
+    const vet = js.slice(js.indexOf("async function vetOpportunity"), js.indexOf("async function vetAndLogStarter"));
+    assert.ok(vet.includes("await refreshTargets({ experiments: false, runs: false })"), "vet must refetch opportunities+health only");
   });
 });
 
@@ -516,7 +517,7 @@ describe("vet & log starter (audit 2026-09-20-round3 Task 1)", () => {
     assert.ok(fn.includes("starter logged, moved to testing"), "starter lost its success toast");
     assert.ok(fn.includes("startExperiment(created.id)"), "starter toast must carry a Start shortcut for the created experiment");
     assert.ok(fn.includes('openAdminModal("Enter the admin token first.")'), "starter must open the admin modal without a token");
-    assert.ok(fn.includes("await refresh()"), "starter must refresh after the decision");
+    assert.ok(fn.includes("await refreshTargets({ runs: false })"), "starter must refetch opportunities+experiments+health (runs only change on triage)");
   });
 });
 
@@ -641,6 +642,91 @@ describe("client-side review list (audit 2026-09-20-round1 Task 1)", () => {
   it("refresh fetches the opportunity list exactly once (no second list fetch)", () => {
     const fn = js.slice(js.indexOf("async function refresh()"));
     assert.equal(fn.split('api("/api/opportunities').length - 1, 1, "refresh must fetch the opportunity list exactly once");
+  });
+});
+
+describe("targeted refresh per action (audit 2026-09-20-round2 Task 1)", () => {
+  const fnBetween = (start, end) => js.slice(js.indexOf(start), js.indexOf(end));
+  const vet = fnBetween("async function vetOpportunity", "async function vetAndLogStarter");
+  const starter = fnBetween("async function vetAndLogStarter", "async function killOpportunity");
+  const kill = fnBetween("async function killOpportunity", 'document.querySelectorAll(".filters .chip")');
+  const start = fnBetween("async function startExperiment", "async function loseExperiment");
+  const lose = fnBetween("async function loseExperiment", "async function winExperiment");
+  const win = fnBetween("async function winExperiment", "function renderExperiments");
+  const admin = fnBetween("function renderAdminZone", "/* ---- modals ---- */");
+  const expSave = fnBetween("function openExperimentModal", '$("#btn-add-exp")');
+
+  it("vet/kill refetch opportunities+health only (runs change on triage, not on review)", () => {
+    for (const [name, fn] of [["vet", vet], ["kill", kill]]) {
+      assert.ok(fn.includes("await refreshTargets({ experiments: false, runs: false })"), `${name} must refetch opportunities+health only`);
+      assert.ok(!fn.includes("await refresh()"), `${name} must not pay for a full refresh`);
+    }
+  });
+
+  it("Start refetches experiments+health only (starting writes no ledger line)", () => {
+    assert.ok(start.includes("await refreshTargets({ opportunities: false, runs: false })"), "Start must refetch experiments+health only");
+    assert.ok(!start.includes("await refresh()"), "Start must not pay for a full refresh");
+  });
+
+  it("win/lose also refetch opportunities (closing appends the outcome-ledger line)", () => {
+    for (const [name, fn] of [["lose", lose], ["win", win]]) {
+      assert.ok(fn.includes("await refreshTargets({ runs: false })"), `${name} must refetch opportunities+experiments+health`);
+      assert.ok(!fn.includes("await refresh()"), `${name} must not refetch the research log`);
+    }
+  });
+
+  it("vet-&-log-starter and experiment saves refetch opportunities too (they create rows)", () => {
+    for (const [name, fn] of [["starter", starter], ["experiment save", expSave]]) {
+      assert.ok(fn.includes("await refreshTargets({ runs: false })"), `${name} must refetch opportunities+experiments+health`);
+      assert.ok(!fn.includes("await refresh()"), `${name} must not refetch the research log`);
+    }
+  });
+
+  it("drawer save/kill/rescore and add-opportunity refetch opportunities+health only", () => {
+    assert.equal(admin.split("await refreshTargets({ experiments: false, runs: false })").length - 1, 3, "admin save/kill/rescore must each refetch opportunities+health only");
+    assert.ok(!admin.includes("await refresh()"), "admin saves must not pay for a full refresh");
+    const addAt = js.indexOf('toast("Added to the priority list")');
+    const add = js.slice(addAt, addAt + 150);
+    assert.ok(add.includes("await refreshTargets({ experiments: false, runs: false })"), "add must refetch opportunities+health only");
+  });
+
+  it("runs still refetch on boot, banner Retry, the delayed triage refresh, and Research-tab switch", () => {
+    const full = js.slice(js.indexOf("async function refresh()"));
+    assert.ok(full.includes("return refreshTargets({})"), "refresh() must stay the full repaint via refreshTargets({})");
+    assert.ok(js.includes("refresh().catch"), "boot must keep the full refresh");
+    assert.ok(js.includes("() => refresh()"), "banner Retry must stay a full refresh");
+    assert.ok(js.includes("setTimeout(refresh, 45000)"), "delayed post-triage refresh must stay full");
+    const tabs = fnBetween('tab.addEventListener("click", () => {', "activateTab(new URLSearchParams");
+    assert.ok(tabs.includes('tab.dataset.tab === "research"'), "tab switch must refetch the log when opening Research");
+    assert.ok(tabs.includes("refreshTargets({ opportunities: false, experiments: false })"), "Research-tab switch must refetch runs+health only");
+  });
+
+  it("scoped refresh keeps failure tracking, the review derive, and all three renders", () => {
+    const rt = js.slice(js.indexOf("async function refreshTargets"));
+    assert.ok(rt.includes('state.apiFailures.push("/api/opportunities")'), "opps failure untracked");
+    assert.ok(rt.includes('state.apiFailures.push("/api/experiments")'), "experiments failure untracked");
+    assert.ok(rt.includes('state.apiFailures.push("/api/runs")'), "runs failure untracked");
+    assert.ok(rt.includes('state.apiFailures.push("/api/health")'), "health failure untracked");
+    assert.ok(rt.includes("filter((f) => !refetching.has(f))"), "scoped refresh must keep unrelated failure flags");
+    assert.ok(rt.includes("await refreshReview()"), "refresh must keep the client-side review derive");
+    assert.ok(rt.includes("renderLedger()") && rt.includes("renderExperiments()") && rt.includes("renderRuns()"), "refresh must repaint all sections (renders are free)");
+  });
+});
+
+describe("start-here list excerpt (audit 2026-09-20-round2 Task 3)", () => {
+  const strip = js.slice(js.indexOf("function renderStartHere"), js.indexOf("/* ---- priority list ---- */"));
+
+  it("reads the next action from the list payload, with the bare-row fallback", () => {
+    assert.ok(strip.includes("firstStepsFirstLine({ first_steps: top.brief_first_steps })"), "strip must reuse the list-API brief excerpt");
+    assert.ok(strip.includes('excerpt || "No brief yet — open the drawer for facts."'), "strip must keep the bare-row fallback");
+    assert.ok(strip.includes("money(top.est_monthly_low, top.est_monthly_high)"), "strip must keep the $/mo range");
+  });
+
+  it("issues zero detail fetches and keeps no brief-text cache", () => {
+    assert.ok(!strip.includes("api(`/api/opportunities/${top.id}`)"), "strip must not fetch the detail endpoint");
+    assert.ok(!strip.includes("topBriefText"), "strip must not keep the brief-text cache");
+    assert.ok(!js.includes("topBriefText"), "topBriefText state must be gone everywhere");
+    assert.ok(!strip.includes("Loading next action"), "strip must not show a loading state for data it already has");
   });
 });
 

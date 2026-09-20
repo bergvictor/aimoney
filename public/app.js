@@ -5,7 +5,7 @@
 const $ = (sel, el = document) => el.querySelector(sel);
 const state = {
   opportunities: [], experiments: [], runs: [], meta: {},
-  statusFilter: "", detail: null, reviewOnly: false, reviewList: [], zeroOnly: false, topBriefText: {},
+  statusFilter: "", detail: null, reviewOnly: false, reviewList: [], zeroOnly: false,
   health: {},
   apiFailures: [],
   token: localStorage.getItem("aimoney_admin") || "",
@@ -72,7 +72,12 @@ function activateTab(name, push) {
   }
 }
 document.querySelectorAll(".tab").forEach((tab) => {
-  tab.addEventListener("click", () => activateTab(tab.dataset.tab, true));
+  tab.addEventListener("click", () => {
+    activateTab(tab.dataset.tab, true);
+    // Runs refetch only where they are shown: actions skip them, so opening
+    // the Research tab re-reads the log (+health for its noise line).
+    if (tab.dataset.tab === "research") refreshTargets({ opportunities: false, experiments: false }).catch(() => {});
+  });
 });
 activateTab(new URLSearchParams(location.search).get("tab") || "priority", false);
 
@@ -89,20 +94,19 @@ const firstStepsFirstLine = (brief) =>
   String((brief && brief.first_steps) || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
 
 // "Start here today" strip: the #1-by-score opportunity with its $/mo range,
-// capital to start, and the brief's first next action. The brief line loads
-// via one detail fetch per top pick (cached in state.topBriefText); the
-// button deep-links into the drawer via openDrawer. When the top pick still
-// carries UNREVIEWED, the strip also shows Vet/Kill reusing vetOpportunity /
-// killOpportunity (same toasts + refresh); vetted picks keep the drawer link only.
+// capital to start, and the brief's first next action. The list payload
+// already carries the latest brief's first_steps per row (brief_first_steps),
+// so the strip reads it directly with no detail fetch. The button deep-links
+// into the drawer via openDrawer. When the top pick still carries UNREVIEWED,
+// the strip also shows Vet/Kill reusing vetOpportunity / killOpportunity
+// (same toasts + refresh); vetted picks keep the drawer link only.
 function renderStartHere() {
   const el = $("#start-here");
   if (!el) return;
   const top = topOpportunity(state.opportunities);
   if (!top) { el.classList.add("hidden"); el.innerHTML = ""; return; }
-  const cached = state.topBriefText[top.id];
-  const nextAction = cached !== undefined
-    ? (cached || "No brief yet — open the drawer for facts.")
-    : "Loading next action…";
+  const excerpt = firstStepsFirstLine({ first_steps: top.brief_first_steps });
+  const nextAction = excerpt || "No brief yet — open the drawer for facts.";
   const needsReview = String(top.notes || "").includes("UNREVIEWED");
   el.classList.remove("hidden");
   el.innerHTML =
@@ -119,15 +123,6 @@ function renderStartHere() {
   if (needsReview) {
     $("#start-here-vet").addEventListener("click", () => vetOpportunity(top.id));
     $("#start-here-kill").addEventListener("click", (ev) => killOpportunity(top.id, ev.currentTarget));
-  }
-  if (cached === undefined) {
-    api(`/api/opportunities/${top.id}`).then((d) => {
-      state.topBriefText[top.id] = firstStepsFirstLine(d.briefs && d.briefs[0]);
-      if (topOpportunity(state.opportunities) && topOpportunity(state.opportunities).id === top.id) renderStartHere();
-    }).catch(() => {
-      state.topBriefText[top.id] = "";
-      if (topOpportunity(state.opportunities) && topOpportunity(state.opportunities).id === top.id) renderStartHere();
-    });
   }
 }
 
@@ -404,7 +399,7 @@ async function vetOpportunity(id) {
       body: JSON.stringify({ notes }),
     });
     toast("Vetted — log the experiment or move to testing", { label: "Log experiment", onClick: () => openExperimentModal(null, id) });
-    await refresh();
+    await refreshTargets({ experiments: false, runs: false });
     await refreshReview();
     if (state.reviewOnly) renderLedger();
   } catch (e) { toast(`Vet failed: ${e.message}`); }
@@ -442,7 +437,7 @@ async function vetAndLogStarter(id) {
       body: JSON.stringify({ status: "testing" }),
     });
     toast("Vetted — starter logged, moved to testing", { label: "Start", onClick: () => startExperiment(created.id) });
-    await refresh();
+    await refreshTargets({ runs: false });
     await refreshReview();
     if (state.reviewOnly) renderLedger();
   } catch (e) { toast(`Starter failed: ${e.message}`); }
@@ -465,7 +460,7 @@ async function killOpportunity(id, anchorEl) {
       body: JSON.stringify({ status: "killed", notes }),
     });
     toast("Killed with post-mortem");
-    await refresh();
+    await refreshTargets({ experiments: false, runs: false });
     await refreshReview();
     if (state.reviewOnly) renderLedger();
     if (state.detail) openDrawer(state.detail.opportunity.id);
@@ -543,7 +538,7 @@ async function startExperiment(id) {
       body: JSON.stringify({ status: "running" }),
     });
     toast("Experiment started");
-    await refresh();
+    await refreshTargets({ opportunities: false, runs: false });
   } catch (e) { toast(`Start failed: ${e.message}`); }
 }
 
@@ -565,7 +560,7 @@ async function loseExperiment(id, anchorEl) {
       body: JSON.stringify({ status: "lost", result: pm.trim(), post_mortem: pm.trim() }),
     });
     toast("Experiment closed as lost");
-    await refresh();
+    await refreshTargets({ runs: false });
   } catch (e) { toast(`Close failed: ${e.message}`); }
   };
   inlinePostMortem(loseContainer, { label: "One-line post-mortem (required to close as lost):", placeholder: "One-line post-mortem (required to close as lost):", confirmText: "Lose", onSubmit: (pm) => doLose(pm), cancelToast: "Close cancelled — post-mortem required." });
@@ -591,7 +586,7 @@ async function winExperiment(id, anchorEl) {
       body: JSON.stringify({ status: "won", result: pm.trim(), post_mortem: pm.trim(), revenue_cents: revenueCents, revenue_source: revenueSource }),
     });
     toast("Experiment closed as won");
-    await refresh();
+    await refreshTargets({ runs: false });
   } catch (e) { toast(`Close failed: ${e.message}`); }
   };
   inlineWinClose(winContainer, { label: "One-line post-mortem (required to close as won):", placeholder: "One-line post-mortem (required to close as won):", confirmText: "Win", onSubmit: (pm, revenueCents, revenueSource) => doWin(pm, revenueCents, revenueSource), cancelToast: "Win cancelled — post-mortem required." });
@@ -849,7 +844,7 @@ function renderAdminZone() {
             }),
           });
           toast(`Saved — new score ${r.score}`);
-          await refresh();
+          await refreshTargets({ experiments: false, runs: false });
           openDrawer(o.id);
         } catch (e) { toast(`Save failed: ${e.message}`); }
         };
@@ -868,7 +863,7 @@ function renderAdminZone() {
         }),
       });
       toast(`Saved — new score ${r.score}`);
-      await refresh();
+      await refreshTargets({ experiments: false, runs: false });
       openDrawer(o.id);
     } catch (e) { toast(`Save failed: ${e.message}`); }
   });
@@ -887,7 +882,7 @@ function renderAdminZone() {
         }),
       });
       toast(`Suggested rescore applied — new score ${r.score}`);
-      await refresh();
+      await refreshTargets({ experiments: false, runs: false });
       openDrawer(o.id);
     } catch (e) { toast(`Rescore failed: ${e.message}`); }
   });
@@ -984,7 +979,7 @@ $("#btn-add").addEventListener("click", () => {
       });
       $("#modal").close();
       toast("Added to the priority list");
-      await refresh();
+      await refreshTargets({ experiments: false, runs: false });
     } catch (e) { toast(`Add failed: ${e.message}`); }
   });
 });
@@ -1036,7 +1031,7 @@ function openExperimentModal(exp, defaultOpp = null) {
       else await api(`/api/experiments/${exp.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
       $("#modal").close();
       toast(isNew ? "Experiment logged" : "Experiment updated");
-      await refresh();
+      await refreshTargets({ runs: false });
       if (state.detail) openDrawer(state.detail.opportunity.id);
     } catch (e) { toast(`Save failed: ${e.message}`); }
   });
@@ -1132,24 +1127,48 @@ function renderApiErrors() {
 }
 
 /* ---- boot ---- */
+// refresh() stays the full repaint (boot, banner Retry, delayed post-triage
+// refresh): it delegates to refreshTargets with every endpoint enabled.
 async function refresh() {
-  state.apiFailures = [];
-  const [opps, exps, runs, health] = await Promise.all([
-    api("/api/opportunities?limit=200").catch(() => { state.apiFailures.push("/api/opportunities"); return { opportunities: [] }; }),
-    api("/api/experiments").catch(() => { state.apiFailures.push("/api/experiments"); return { experiments: [] }; }),
-    api("/api/runs?limit=20").catch(() => { state.apiFailures.push("/api/runs"); return { runs: [] }; }),
-    api("/api/health").catch(() => { state.apiFailures.push("/api/health"); return {}; }),
+  return refreshTargets({});
+}
+// Targeted refresh: every phone action refetches only the endpoints its write
+// can dirty — vet/kill/add/save/rescore touch opportunities+health, Start
+// touches experiments+health, win/lose and experiment saves also touch
+// opportunities (closing appends the outcome-ledger line to parent notes;
+// new rows shift parent experiment counts), and runs change only on cron
+// ticks or the manual trigger. Flags default to true; renders always run
+// (cheap and idempotent) so a scoped fetch never leaves a stale section.
+async function refreshTargets(want = {}) {
+  const fetchOpps = want.opportunities !== false;
+  const fetchExps = want.experiments !== false;
+  const fetchRuns = want.runs !== false;
+  const fetchHealth = want.health !== false;
+  // Clear stale failure flags only for endpoints about to be fetched, so a
+  // scoped refresh never hides an unrelated still-failing section.
+  const refetching = new Set([
+    ...(fetchOpps ? ["/api/opportunities"] : []),
+    ...(fetchExps ? ["/api/experiments"] : []),
+    ...(fetchRuns ? ["/api/runs"] : []),
+    ...(fetchHealth ? ["/api/health"] : []),
   ]);
-  state.opportunities = opps.opportunities || [];
-  state.experiments = exps.experiments || [];
-  state.runs = runs.runs || [];
-  state.health = health || {};
+  state.apiFailures = (state.apiFailures || []).filter((f) => !refetching.has(f));
+  const [opps, exps, runs, health] = await Promise.all([
+    fetchOpps ? api("/api/opportunities?limit=200").catch(() => { state.apiFailures.push("/api/opportunities"); return { opportunities: [] }; }) : null,
+    fetchExps ? api("/api/experiments").catch(() => { state.apiFailures.push("/api/experiments"); return { experiments: [] }; }) : null,
+    fetchRuns ? api("/api/runs?limit=20").catch(() => { state.apiFailures.push("/api/runs"); return { runs: [] }; }) : null,
+    fetchHealth ? api("/api/health").catch(() => { state.apiFailures.push("/api/health"); return {}; }) : null,
+  ]);
+  if (opps) state.opportunities = opps.opportunities || [];
+  if (exps) state.experiments = exps.experiments || [];
+  if (runs) state.runs = runs.runs || [];
+  if (health) state.health = health || {};
   if (!metaLoaded) {
     try { state.meta = await api("/api/meta"); metaLoaded = true; }
     catch { state.meta = {}; }
   }
   await refreshReview().catch(() => {});
-  $("#rev").textContent = health.rev ? `rev ${health.rev}` : "";
+  if (health) $("#rev").textContent = health.rev ? `rev ${health.rev}` : "";
   renderApiErrors();
   renderLedger();
   renderExperiments();

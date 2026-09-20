@@ -9,6 +9,10 @@ const json = (data, status = 200) =>
 
 import { effectiveScore } from "../../worker/src/lib.js";
 
+// release.json is deploy-static: its revision is fetched once per isolate and
+// reused by every later /api/health call (a failed fetch retries next call).
+let cachedHealthRev = null;
+
 const clamp10 = (v, dflt) => {
   const n = Number(v);
   if (!Number.isFinite(n)) return dflt;
@@ -353,23 +357,41 @@ export async function onRequest(context) {
   const method = request.method.toUpperCase();
   try {
     if (parts.length === 1 && parts[0] === "health" && method === "GET") {
-      const db = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities").first().catch(() => null) : null;
-      const unreviewedRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%UNREVIEWED%'").first().catch(() => null) : null;
-      const bareRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL").first().catch(() => null) : null;
-      const expRows = env.DB ? await env.DB.prepare("SELECT status, COUNT(*) AS n FROM experiments GROUP BY status").all().catch(() => ({ results: [] })) : { results: [] };
-      const lastOk = env.DB ? await env.DB.prepare("SELECT finished_at, started_at FROM agent_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first().catch(() => null) : null;
-      const oldestUnreviewed = env.DB ? await env.DB.prepare("SELECT created_at FROM opportunities WHERE notes LIKE '%UNREVIEWED%' ORDER BY created_at ASC, id ASC LIMIT 1").first().catch(() => null) : null;
+      const dayAgoIso = new Date(Date.now() - 86400000).toISOString();
+      // One batched round-trip for every independent health select (paired
+      // scans merged: decisions+revenue, lifetime totals, unreviewed+oldest).
+      const healthStmts = env.DB ? [
+        env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities"),
+        env.DB.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM opportunities WHERE notes LIKE '%UNREVIEWED%'"),
+        env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL"),
+        env.DB.prepare("SELECT status, COUNT(*) AS n FROM experiments GROUP BY status"),
+        env.DB.prepare("SELECT finished_at, started_at FROM agent_runs WHERE status='ok' ORDER BY id DESC LIMIT 1"),
+        env.DB.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
+        env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS revenue, COALESCE(SUM(spent_cents),0) AS spent FROM experiments WHERE status IN ('won','lost')"),
+        env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%vetted]%' AND updated_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
+        env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
+        env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso),
+      ] : [];
+      const healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;
+      const firstRow = (i) => (healthRes && healthRes[i] && healthRes[i].results && healthRes[i].results[0]) || null;
+      const db = firstRow(0);
+      const unreviewedRow = firstRow(1);
+      const bareRow = firstRow(2);
+      const expRows = { results: (healthRes && healthRes[3] && healthRes[3].results) || [] };
+      const lastOk = firstRow(4);
+      const weekRow = firstRow(5);
+      const lifetimeRow = firstRow(6);
+      const vettedRow = firstRow(7);
+      const vettedNoExpRow = firstRow(8);
+      const noiseRow = firstRow(9);
       // Lane metric, read-only from existing columns (no migration): decisions
       // are won/lost rows closed in the window; vetted counts rows carrying
       // the "[YYYY-MM-DD vetted]" tag (see vetOpportunity) touched in 7d.
-      const decisionsRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
-      const revenueRow = env.DB ? await env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
-      const revenueTotalRow = env.DB ? await env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost')").first().catch(() => null) : null;
-      const spentTotalRow = env.DB ? await env.DB.prepare("SELECT COALESCE(SUM(spent_cents),0) AS total FROM experiments WHERE status IN ('won','lost')").first().catch(() => null) : null;
-      const vettedRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%vetted]%' AND updated_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
-      const vettedNoExpRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)").first().catch(() => null) : null;
-      const dayAgoIso = new Date(Date.now() - 86400000).toISOString();
-      const noiseRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso).first().catch(() => null) : null;
+      const decisionsRow = weekRow ? { n: weekRow.n } : null;
+      const revenueRow = weekRow ? { total: weekRow.total } : null;
+      const revenueTotalRow = lifetimeRow ? { total: lifetimeRow.revenue } : null;
+      const spentTotalRow = lifetimeRow ? { total: lifetimeRow.spent } : null;
+      const oldestUnreviewed = unreviewedRow && unreviewedRow.oldest ? { created_at: unreviewedRow.oldest } : null;
       let oldest_unreviewed_age_h = null;
       let hours_since_last_ok_run = null;
       if (lastOk) {
@@ -383,10 +405,13 @@ export async function onRequest(context) {
       }
       const experiments_by_status = {};
       for (const r of (expRows.results || [])) experiments_by_status[r.status] = r.n;
-      let rev = "unknown";
+      let rev = cachedHealthRev || "unknown";
       try {
-        const r = await fetch(new URL("/release.json", url.origin));
-        if (r.ok) rev = (await r.json()).revision || rev;
+        const r = cachedHealthRev ? { ok: false } : await fetch(new URL("/release.json", url.origin));
+        if (r.ok) {
+          const gotRev = (await r.json()).revision;
+          if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
+        }
       } catch { /* static file may be absent in previews */ }
       return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, revenue_last_7d: revenueRow ? (revenueRow.total || 0) : 0, revenue_total: revenueTotalRow ? (revenueTotalRow.total || 0) : 0, spent_total: spentTotalRow ? (spentTotalRow.total || 0) : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, vetted_no_experiment: vettedNoExpRow ? vettedNoExpRow.n : 0, noise_24h: noiseRow ? noiseRow.n : 0, time: new Date().toISOString() });
     }
