@@ -14,6 +14,18 @@ const html = readFileSync(join(ROOT, "index.html"), "utf8");
 const js = readFileSync(join(ROOT, "app.js"), "utf8");
 const css = readFileSync(join(ROOT, "styles.css"), "utf8");
 
+describe("start-here skips killed/paused (audit 2026-09-20-round3 Task 3)", () => {
+  it("topOpportunity filters killed and paused rows", () => {
+    assert.ok(js.includes('o.status !== "killed"'), "topOpportunity must exclude killed rows");
+    assert.ok(js.includes('o.status !== "paused"'), "topOpportunity must exclude paused rows");
+  });
+
+  it("scaling rows stay eligible and the strip hides when nothing actionable remains", () => {
+    assert.ok(!js.includes('o.status !== "scaling"'), "topOpportunity must keep scaling rows eligible");
+    assert.ok(js.includes("if (!top)"), "strip must hide when no actionable row remains");
+  });
+});
+
 describe("zero-spend starter (Task 1)", () => {
   it("served page owns the Start-here strip container above the ledger", () => {
     assert.ok(html.includes('id="start-here"'), "index.html lost #start-here");
@@ -93,7 +105,8 @@ describe("decisions/week header (Task 1)", () => {
     assert.ok(js.includes("decisions_last_7d"), "app.js never reads health.decisions_last_7d");
     assert.ok(js.includes("vetted_last_7d"), "app.js never reads health.vetted_last_7d");
     assert.ok(js.includes("decisions this week"), "exp summary lost 'decisions this week'");
-    assert.ok(js.includes("vetted →"), "exp summary lost 'Y vetted → Z experiments'");
+    assert.ok(js.includes("vetted this week →"), "exp summary lost 'Y vetted this week → Z total experiments'");
+    assert.ok(js.includes("total experiments"), "exp summary lost the 'total experiments' window label");
   });
 });
 
@@ -206,6 +219,22 @@ describe("drawer Vet/Kill with post-mortem parity (audit 2026-09-20 Task 3)", ()
   });
 });
 
+describe("weekly revenue header (audit 2026-09-20-round3 Task 1)", () => {
+  it("experiments summary appends $X revenue this week from health, hidden on old backends", () => {
+    assert.ok(js.includes("revenue_last_7d"), "app.js never reads health.revenue_last_7d");
+    assert.ok(js.includes("revenue this week"), "exp summary lost the 'revenue this week' copy");
+    assert.ok(js.includes("moneyCents(revenue)"), "exp summary must format revenue_last_7d via moneyCents");
+    assert.ok(js.includes("revenue !== null"), "revenue line must hide when the key is absent (old backends)");
+  });
+
+  it("cents render as fixed-2dp dollars, never raw", () => {
+    assert.ok(js.includes("moneyCents"), "app.js lost the moneyCents helper");
+    assert.ok(js.includes("toFixed(2)"), "moneyCents must render fixed-2dp dollars");
+    assert.ok(!js.includes("money(e.revenue_cents/100"), "board still formats revenue via the $/mo money() helper");
+    assert.ok(!js.includes("money(e.spent_cents/100"), "board still formats spend via the $/mo money() helper");
+  });
+});
+
 describe("experiment money in cents (audit 2026-09-20 Task 4)", () => {
   it("experiment modal owns revenue and precise-spend inputs", () => {
     assert.ok(js.includes('id="m-revenue"'), "experiment modal lost the revenue input");
@@ -219,8 +248,8 @@ describe("experiment money in cents (audit 2026-09-20 Task 4)", () => {
   });
 
   it("board cards show revenue/spend $ figures", () => {
-    assert.ok(js.includes("e.revenue_cents/100"), "board must format revenue_cents as $");
-    assert.ok(js.includes("e.spent_cents/100"), "board must format spent_cents as $");
+    assert.ok(js.includes("moneyCents(e.revenue_cents)"), "board must format revenue_cents via moneyCents");
+    assert.ok(js.includes("moneyCents(e.spent_cents)"), "board must format spent_cents via moneyCents");
     assert.ok(js.includes("} rev</span>"), "board lost the revenue figure copy");
     assert.ok(js.includes("} spent</span>"), "board lost the spend figure copy");
   });

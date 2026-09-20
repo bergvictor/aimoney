@@ -202,8 +202,8 @@ async function runResearch(env, trigger) {
       "SELECT * FROM signals WHERE processed = 0 ORDER BY id ASC LIMIT ?")
       .bind(MAX_AI_SIGNALS).all().then((r) => r.results || []);
     if (!fresh.length) {
-      await finish("ok");
-      return { status: "ok", note: "no fresh signals", ...state };
+      // Intentionally no early return: quiet ticks still brief bare rows below.
+      // The classify AI call is skipped when fresh is empty (see verdicts guard).
     }
 
     // 2. One AI pass: classify signals against the live priority list.
@@ -221,9 +221,9 @@ async function runResearch(env, trigger) {
 {"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10}
 Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to earn money (pricing, revenue, customers, or an obvious buyer) that is NOT on the list. A GitHub repo, tool launch, or tutorial with no business model is noise. A variant of a listed method is "supports" with its numeric id. Confidence above 6 requires named revenue/users in the signal, else 5 or less. opportunity_id must be a numeric id from the list or null, never text.` },
     ];
-    await mark("classify-ai");
+    if (fresh.length) await mark("classify-ai");
     const isCron = trigger === "cron";
-    const verdicts = parseJsonLines(await aiComplete(env, state, {
+    const verdicts = !fresh.length ? [] : parseJsonLines(await aiComplete(env, state, {
       model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
       messages: classifyPrompt,
       timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
@@ -393,7 +393,7 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
     }
     await finish("ok");
     await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : ""));
-    return { status: "ok", ...state };
+    return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);
     return { status: "error", error: String(e && e.message || e), ...state };

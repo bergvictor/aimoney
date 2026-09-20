@@ -46,6 +46,10 @@ const money = (lo, hi) => {
   return lo && hi && lo !== hi ? `${f(lo)}–${f(hi)}` : f(hi || lo);
 };
 
+// Precise dollars from integer cents: always fixed-2dp ($10.50, never $10.5).
+// Separate from money(), which formats $/mo ranges with k-suffixes.
+const moneyCents = (cents) => `$${(Number(cents) / 100).toFixed(2)}`;
+
 const meter = (v) => {
   v = Math.max(1, Math.min(10, Number(v) || 1));
   return `<span class="meter"><b>${v}</b> <span>${"●".repeat(v)}${"○".repeat(10 - v)}</span></span>`;
@@ -77,7 +81,7 @@ const isZeroSpend = (o) =>
   String((o && o.capital_needed) || "").trim().startsWith("$0");
 
 const topOpportunity = (opps) =>
-  (opps || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0))[0] || null;
+  (opps || []).filter((o) => o.status !== "killed" && o.status !== "paused").sort((a, b) => (b.score || 0) - (a.score || 0))[0] || null;
 
 const firstStepsFirstLine = (brief) =>
   String((brief && brief.first_steps) || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
@@ -305,13 +309,15 @@ function renderExperiments() {
   const decisions = state.health && typeof state.health.decisions_last_7d === "number" ? state.health.decisions_last_7d : null;
   const vetted = state.health && typeof state.health.vetted_last_7d === "number" ? state.health.vetted_last_7d : null;
   const vettedNoExp = state.health && typeof state.health.vetted_no_experiment === "number" ? state.health.vetted_no_experiment : null;
+  const revenue = state.health && typeof state.health.revenue_last_7d === "number" ? state.health.revenue_last_7d : null;
   let summary = exps.length
     ? `${exps.length} experiments · ${running} running · ${won} won`
     : (state.apiFailures.includes("/api/experiments")
       ? "Could not load experiments — see the banner above and retry."
       : "No experiments yet.");
   if (decisions !== null && vetted !== null) {
-    let conv = `${decisions} decisions this week · ${vetted} vetted → ${exps.length} experiments`;
+    let conv = `${decisions} decisions this week · ${vetted} vetted this week → ${exps.length} total experiments`;
+    if (revenue !== null) conv += ` · ${moneyCents(revenue)} revenue this week`;
     if (vettedNoExp !== null && vettedNoExp > 0) conv += ` · ${vettedNoExp} vetted, no experiment`;
     summary = `${summary} · ${conv}`;
   }
@@ -333,7 +339,7 @@ function renderExperiments() {
       (list.map((e) => `
         <div class="card" data-id="${e.id}" data-opp="${e.opportunity_id}"${e.orphaned ? ` data-orphan="1"` : ""}>
           <h4>${esc(e.name)}</h4>
-          <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}${runningMismatchBadge(e)}${e.revenue_cents > 0 ? ` · <span class="mono">${money(e.revenue_cents/100, e.revenue_cents/100)} rev</span>` : ""}${e.spent_cents > 0 ? ` · <span class="mono">${money(e.spent_cents/100, e.spent_cents/100)} spent</span>` : ""}</p>
+          <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}${runningMismatchBadge(e)}${e.revenue_cents > 0 ? ` · <span class="mono">${moneyCents(e.revenue_cents)} rev</span>` : ""}${e.spent_cents > 0 ? ` · <span class="mono">${moneyCents(e.spent_cents)} spent</span>` : ""}</p>
           <div class="meta">${statusPill(e.status)}
             <span class="muted mono">${esc(e.result ? `→ ${e.result.slice(0, 40)}` : (e.target || ""))}</span></div>
         </div>`).join("") || `<p class="muted">—</p>`) + `</div>`;

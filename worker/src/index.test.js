@@ -61,6 +61,24 @@ describe("oldest-first triage with staleness bound (static guard)", () => {
   });
 });
 
+describe("brief on quiet ticks (audit 2026-09-20-round3 Task 2)", () => {
+  it("zero fresh signals still reach the brief pass; classify AI stays skipped", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("!fresh.length ? [] : parseJsonLines(await aiComplete"), "classify AI call lost its empty-fresh guard");
+    const briefAt = src.indexOf('mark("brief-ai")');
+    assert.ok(briefAt !== -1, "worker lost the brief-ai pass");
+    const firstFinish = src.indexOf('await finish("ok")');
+    assert.ok(firstFinish !== -1 && firstFinish > briefAt, "quiet tick still finishes before the brief pass");
+    const noteAt = src.indexOf('note: "no fresh signals"');
+    assert.ok(noteAt !== -1 && noteAt > briefAt, "quiet-tick note must only appear at the final return, after the brief pass");
+  });
+
+  it("manual runs still skip the brief pass by deadline", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes('trigger === "cron" ? 300000 : -1'), "manual path lost its brief-skipping deadline");
+  });
+});
+
 describe("extra brief on old backlog (static guard)", () => {
   it("cron path briefs one extra oldest-unreviewed row past 48h within budget", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
