@@ -101,6 +101,9 @@ async function createOpportunity(request, env) {
     notes: String(b.notes || "").slice(0, 8000),
   };
   o.score = effectiveScore(o);
+  if (o.est_monthly_low > o.est_monthly_high) {
+    return json({ error: "est_monthly_low must be <= est_monthly_high", field: "est_monthly_low" }, 400);
+  }
   try {
     const r = await env.DB.prepare(
       `INSERT INTO opportunities (${OPP_FIELDS.join(",")}, score)
@@ -222,17 +225,34 @@ async function createExperiment(request, env) {
   if (!a.ok) return json({ error: a.reason }, a.reason.startsWith("writes") ? 503 : 401);
   const b = await request.json().catch(() => ({}));
   if (!b.opportunity_id || !b.name) return json({ error: "opportunity_id and name required" }, 400);
+  if (b.status !== undefined && !EXP_STATUSES.has(b.status)) {
+    return json({ error: `invalid status: ${String(b.status).slice(0, 40)}`, field: "status" }, 400);
+  }
+  const status = EXP_STATUSES.has(b.status) ? b.status : "planned";
+  const parent = await env.DB.prepare("SELECT id FROM opportunities WHERE id = ?").bind(b.opportunity_id).first();
+  if (!parent) return json({ error: "opportunity not found", field: "opportunity_id" }, 404);
+  if (status === "won" || status === "lost") {
+    const fields = {};
+    if (!String(b.result || "").trim()) fields.result = "result is required to close as won/lost";
+    if (!String(b.post_mortem || "").trim()) fields.post_mortem = "post_mortem is required to close as won/lost";
+    if (Object.keys(fields).length) return json({ error: "result and post_mortem are required to close as won/lost", fields }, 400);
+  }
+  const nowIso = new Date().toISOString();
+  let started_at = String(b.started_at || "");
+  let ended_at = String(b.ended_at || "");
+  if (status === "running" && !started_at.trim()) started_at = nowIso;
+  if ((status === "won" || status === "lost") && !ended_at.trim()) ended_at = nowIso;
   const str = (v) => String(v || "");
   const r = await env.DB.prepare(
     `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
      spent, metric, target, result, started_at, ended_at, post_mortem)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(b.opportunity_id, str(b.name).slice(0, 200), str(b.hypothesis).slice(0, 8000),
-    EXP_STATUSES.has(b.status) ? b.status : "planned",
+    status,
     str(b.budget_cap).slice(0, 120), str(b.spent).slice(0, 120),
     str(b.metric).slice(0, 300), str(b.target).slice(0, 300),
-    str(b.result).slice(0, 8000), str(b.started_at).slice(0, 30),
-    str(b.ended_at).slice(0, 30), str(b.post_mortem).slice(0, 8000)).run();
+    str(b.result).slice(0, 8000), started_at.slice(0, 30),
+    ended_at.slice(0, 30), str(b.post_mortem).slice(0, 8000)).run();
   return json({ id: r.meta.last_row_id }, 201);
 }
 
@@ -259,6 +279,18 @@ async function updateExperiment(request, env, id) {
     if (!String(next.post_mortem || "").trim()) fields.post_mortem = "post_mortem is required to close as won/lost";
     if (Object.keys(fields).length) return json({ error: "result and post_mortem are required to close as won/lost", fields }, 400);
     if (!String(next.ended_at || "").trim()) next.ended_at = nowIso;
+    // Outcome ledger (round3 Task 3): on the transition into won/lost, append
+    // a one-line outcome to the parent opportunity notes (newest-kept 8000,
+    // same substr idiom as the worker's evidence append). Score untouched —
+    // the drawer offers a suggested rescore the human applies with one click.
+    if (cur.status !== "won" && cur.status !== "lost" && cur.opportunity_id) {
+      const day = nowIso.slice(0, 10);
+      const oneLine = String(next.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
+      const line = `[${day} outcome] Experiment "${String(next.name || "").slice(0, 120)}" ${next.status}: ${oneLine}`;
+      await env.DB.prepare(
+        "UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?"
+      ).bind("\n" + line, cur.opportunity_id).run();
+    }
   }
   await env.DB.prepare(
     `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
@@ -295,6 +327,7 @@ export async function onRequest(context) {
       // the "[YYYY-MM-DD vetted]" tag (see vetOpportunity) touched in 7d.
       const decisionsRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
       const vettedRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%vetted]%' AND updated_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
+      const vettedNoExpRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)").first().catch(() => null) : null;
       let oldest_unreviewed_age_h = null;
       let hours_since_last_ok_run = null;
       if (lastOk) {
@@ -313,7 +346,7 @@ export async function onRequest(context) {
         const r = await fetch(new URL("/release.json", url.origin));
         if (r.ok) rev = (await r.json()).revision || rev;
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, time: new Date().toISOString() });
+      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, vetted_no_experiment: vettedNoExpRow ? vettedNoExpRow.n : 0, time: new Date().toISOString() });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

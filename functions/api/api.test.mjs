@@ -120,6 +120,10 @@ function makeDB(seed = {}) {
       }
       return { n };
     }
+    if (sql.includes("vetted]%") && sql.includes("NOT EXISTS")) {
+      const withExp = new Set(data.experiments.map((e) => String(e.opportunity_id)));
+      return { n: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]") && !withExp.has(String(o.id))).length };
+    }
     if (sql.includes("vetted]%") && sql.includes("COUNT(*)")) {
       const cutoff = Date.now() - 7 * 86400000;
       let n = 0;
@@ -134,11 +138,37 @@ function makeDB(seed = {}) {
   }
 
   function handleRun(sql, args) {
+    if (sql.includes("INSERT INTO experiments")) {
+      const [opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem] = args;
+      const id = data.experiments.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0) + 1;
+      const now = new Date().toISOString();
+      data.experiments.push({ id, opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, created_at: now, updated_at: now });
+      return { success: true, meta: { last_row_id: id } };
+    }
+    if (sql.includes("INSERT INTO opportunities")) {
+      const fields = ["slug", "title", "one_liner", "category", "status", "value", "effort", "confidence", "fit", "est_monthly_low", "est_monthly_high", "time_to_first_dollar", "capital_needed", "skills_needed", "source", "source_url", "notes"];
+      const row = { id: data.opportunities.reduce((m, o) => Math.max(m, Number(o.id) || 0), 0) + 1 };
+      fields.forEach((f, i) => { row[f] = args[i]; });
+      row.score = args[fields.length];
+      const now = new Date().toISOString();
+      row.created_at = now; row.updated_at = now;
+      data.opportunities.push(row);
+      return { success: true, meta: { last_row_id: row.id } };
+    }
     if (sql.includes("UPDATE experiments SET")) {
       const [name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, id] = args;
       const row = data.experiments.find((e) => String(e.id) === String(id));
       if (row) {
         Object.assign(row, { name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem });
+      }
+      return { success: true };
+    }
+    if (sql.includes("UPDATE opportunities SET notes = substr")) {
+      const [addition, id] = args;
+      const row = data.opportunities.find((o) => String(o.id) === String(id));
+      if (row) {
+        const combined = String(row.notes || "") + String(addition || "");
+        row.notes = combined.length <= 8000 ? combined : combined.slice(-8000);
       }
       return { success: true };
     }
@@ -193,6 +223,151 @@ function expSeed() {
     { id: 2, opportunity_id: 1, name: "E2", hypothesis: "", status: "planned", budget_cap: "", spent: "", metric: "", target: "", result: "", started_at: "2026-01-01T00:00:00Z", ended_at: "", post_mortem: "" },
   ];
 }
+
+describe("create guards (round3 Task 1)", () => {
+  it("POST /experiments 400s on invalid status with a field-level reason", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "X", status: "bogus" } }, db);
+    assert.equal(r.status, 400);
+    assert.equal(r.body.field, "status");
+    assert.equal(db.data.experiments.length, 0);
+  });
+
+  it("POST /experiments 404s on unknown opportunity_id", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 999, name: "Orphan" } }, db);
+    assert.equal(r.status, 404);
+    assert.equal(db.data.experiments.length, 0);
+  });
+
+  it("POST /experiments mirrors PATCH closure rules for won/lost", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const noResult = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "X", status: "won", post_mortem: "pm" } }, db);
+    assert.equal(noResult.status, 400);
+    assert.ok(noResult.body.fields && noResult.body.fields.result);
+    const noPm = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "X", status: "lost", result: "r" } }, db);
+    assert.equal(noPm.status, 400);
+    assert.ok(noPm.body.fields && noPm.body.fields.post_mortem);
+    assert.equal(db.data.experiments.length, 0);
+  });
+
+  it("POST /experiments happy paths stamp started_at/ended_at like PATCH", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const running = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "R", status: "running" } }, db);
+    assert.equal(running.status, 201);
+    assert.ok(running.body.id);
+    const won = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "W", status: "won", result: "made $", post_mortem: "worked" } }, db);
+    assert.equal(won.status, 201);
+    const byId = Object.fromEntries(db.data.experiments.map((e) => [e.id, e]));
+    assert.ok(byId[running.body.id].started_at);
+    assert.equal(byId[running.body.id].ended_at, "");
+    assert.ok(byId[won.body.id].ended_at);
+    const planned = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "P" } }, db);
+    assert.equal(planned.status, 201);
+    assert.equal(db.data.experiments.find((e) => e.id === planned.body.id).status, "planned");
+  });
+
+  it("POST /opportunities 400s when est_monthly_low > est_monthly_high", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities",
+      { method: "POST", token: "secret", body: { slug: "bad-range", title: "Bad range", est_monthly_low: 5000, est_monthly_high: 500 } }, db);
+    assert.equal(r.status, 400);
+    assert.equal(r.body.field, "est_monthly_low");
+    assert.equal(db.data.opportunities.length, 3);
+    const ok = await callApi(["opportunities"], "http://localhost/api/opportunities",
+      { method: "POST", token: "secret", body: { slug: "good-range", title: "Good range", est_monthly_low: 500, est_monthly_high: 5000 } }, db);
+    assert.equal(ok.status, 201);
+    assert.equal(db.data.opportunities.length, 4);
+  });
+});
+
+describe("vetted without experiment (round3 Task 2)", () => {
+  it("reports vetted_no_experiment from existing columns", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x\n[2026-09-18 vetted] Human vetted; cap lifted.", created_at: daysAgo(10), updated_at: daysAgo(2) },
+        { id: 2, slug: "b", title: "B", status: "testing", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "y\n[2026-09-18 vetted] Human vetted; cap lifted.", created_at: daysAgo(10), updated_at: daysAgo(2) },
+        { id: 3, slug: "c", title: "C", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal  vetted] but never an experiment", created_at: daysAgo(1), updated_at: daysAgo(1) },
+        { id: 4, slug: "d", title: "D", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal UNREVIEWED", created_at: daysAgo(1), updated_at: daysAgo(1) },
+      ],
+      experiments: [
+        { id: 1, opportunity_id: 2, name: "E", status: "running" },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.vetted_no_experiment, 2);
+  });
+});
+
+describe("closed-experiment outcomes (round3 Task 3)", () => {
+  const opp = () => ([
+    { id: 1, slug: "a", title: "A", status: "testing", value: 7, effort: 3, confidence: 5, fit: 8, score: 7000, notes: "seed notes", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+  ]);
+  const exp = (over = {}) => ([
+    { id: 1, opportunity_id: 1, name: "Landing test", hypothesis: "", status: "running", budget_cap: "", spent: "", metric: "", target: "", result: "", started_at: "2026-09-01T00:00:00Z", ended_at: "", post_mortem: "", ...over },
+  ]);
+
+  it("PATCH to won appends a one-line outcome to parent notes, score untouched", async () => {
+    const db = makeDB({ opportunities: opp(), experiments: exp() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "won", result: "12 signups in 7d", post_mortem: "headline worked" } }, db);
+    assert.equal(r.status, 200);
+    const row = db.data.opportunities[0];
+    assert.equal(row.score, 7000);
+    assert.equal(row.notes.split("\n").length, 2);
+    assert.ok(row.notes.includes('outcome] Experiment "Landing test" won: 12 signups in 7d'));
+  });
+
+  it("PATCH to lost collapses multi-line results to one line", async () => {
+    const db = makeDB({ opportunities: opp(), experiments: exp() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "lost", result: "zero sales\nad account banned", post_mortem: "wrong channel" } }, db);
+    assert.equal(r.status, 200);
+    const row = db.data.opportunities[0];
+    assert.equal(row.score, 7000);
+    assert.ok(row.notes.includes('outcome] Experiment "Landing test" lost: zero sales ad account banned'));
+  });
+
+  it("editing an already-closed row appends nothing", async () => {
+    const db = makeDB({
+      opportunities: opp(),
+      experiments: exp({ status: "won", result: "old", post_mortem: "old pm", ended_at: "2026-09-10T00:00:00Z" }),
+    });
+    const before = db.data.opportunities[0].notes;
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { result: "updated result" } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(db.data.opportunities[0].notes, before);
+  });
+
+  it("closing an orphaned experiment still succeeds without a parent row", async () => {
+    const db = makeDB({
+      opportunities: opp(),
+      experiments: exp({ opportunity_id: 999 }),
+    });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "lost", result: "r", post_mortem: "pm" } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(db.data.opportunities[0].notes, "seed notes");
+  });
+
+  it("one-click rescore PATCHes value/confidence through the shared scorer", async () => {
+    const db = makeDB({ opportunities: opp(), experiments: exp() });
+    const r = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      { method: "PATCH", token: "secret", body: { value: 8, confidence: 6 } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.score, 9600);
+  });
+});
 
 describe("review queue (F2)", () => {
   it("filters UNREVIEWED rows", async () => {

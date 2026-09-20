@@ -23,9 +23,18 @@ async function api(path, opts = {}) {
   return body;
 }
 
-function toast(msg) {
+function toast(msg, action = null) {
   const t = $("#toast");
   t.textContent = msg;
+  if (action && action.label && typeof action.onClick === "function") {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn small ghost toast-action";
+    btn.textContent = action.label;
+    btn.addEventListener("click", () => { t.classList.add("hidden"); action.onClick(); });
+    t.appendChild(document.createTextNode(" "));
+    t.appendChild(btn);
+  }
   t.classList.remove("hidden");
   clearTimeout(t._h);
   t._h = setTimeout(() => t.classList.add("hidden"), 3200);
@@ -160,7 +169,7 @@ async function vetOpportunity(id) {
       method: "PATCH", headers: { "content-type": "application/json" },
       body: JSON.stringify({ notes }),
     });
-    toast("Vetted — cap lifted");
+    toast("Vetted — log the experiment or move to testing", { label: "Log experiment", onClick: () => openExperimentModal(null, id) });
     await refresh();
     await refreshReview();
     if (state.reviewOnly) renderLedger();
@@ -211,6 +220,16 @@ const ageChip = (e) =>
   (e.status === "planned" || e.status === "running") && Number.isFinite(e.days_in_status)
     ? ` <span class="age-chip" title="Days in ${esc(e.status)}">${e.days_in_status}d</span>` : "";
 
+// Stalest open (planned/running) non-orphaned experiment by days_in_status,
+// or null when every open card is fresh, closed, or orphaned.
+const stalestOpenExp = (exps) => {
+  const open = (exps || []).filter((e) =>
+    (e.status === "planned" || e.status === "running") && !e.orphaned &&
+    Number.isFinite(e.days_in_status));
+  open.sort((a, b) => b.days_in_status - a.days_in_status);
+  return open[0] || null;
+};
+
 function renderExperiments() {
   const exps = state.experiments;
   $("#exp-count").textContent = exps.length || "";
@@ -218,16 +237,28 @@ function renderExperiments() {
   const won = exps.filter((e) => e.status === "won").length;
   const decisions = state.health && typeof state.health.decisions_last_7d === "number" ? state.health.decisions_last_7d : null;
   const vetted = state.health && typeof state.health.vetted_last_7d === "number" ? state.health.vetted_last_7d : null;
+  const vettedNoExp = state.health && typeof state.health.vetted_no_experiment === "number" ? state.health.vetted_no_experiment : null;
   let summary = exps.length
     ? `${exps.length} experiments · ${running} running · ${won} won`
     : (state.apiFailures.includes("/api/experiments")
       ? "Could not load experiments — see the banner above and retry."
       : "No experiments yet.");
   if (decisions !== null && vetted !== null) {
-    const conv = `${decisions} decisions this week · ${vetted} vetted → ${exps.length} experiments`;
+    let conv = `${decisions} decisions this week · ${vetted} vetted → ${exps.length} experiments`;
+    if (vettedNoExp !== null && vettedNoExp > 0) conv += ` · ${vettedNoExp} vetted, no experiment`;
     summary = `${summary} · ${conv}`;
   }
-  $("#exp-summary").textContent = summary;
+  // Stall nudge (read-only): when the week has zero decisions, name the
+  // stalest open card with its age so the next move is one click away.
+  // No auto-transitions — the human still owns every status move.
+  const nudge = (decisions === 0) ? stalestOpenExp(exps) : null;
+  const summaryEl = $("#exp-summary");
+  if (nudge) {
+    summaryEl.innerHTML = `${esc(summary)} · <span class="nudge">Nudge: &ldquo;${esc(nudge.name)}&rdquo; has been ${esc(nudge.status)} ${nudge.days_in_status}d <button id="exp-nudge-open" class="btn small ghost" type="button">Open it</button></span>`;
+    $("#exp-nudge-open").addEventListener("click", () => openDrawer(nudge.opportunity_id, nudge.id));
+  } else {
+    summaryEl.textContent = summary;
+  }
   $("#board").innerHTML = EXP_COLS.map(([st, label]) => {
     const list = exps.filter((e) => e.status === st)
       .sort((a, b) => (b.days_in_status ?? -1) - (a.days_in_status ?? -1));
@@ -351,11 +382,34 @@ function closeDrawer() {
 $("#drawer-close").addEventListener("click", closeDrawer);
 $("#drawer-scrim").addEventListener("click", closeDrawer);
 
+// Suggested (never auto-applied) confidence/value delta from the most recent
+// closed experiment: won nudges +1/+1, lost nudges −1/−1, clamped 1–10.
+// Returns null when nothing closed yet or nothing would change.
+const suggestRescore = (o, experiments) => {
+  const closed = (experiments || []).filter((e) => e.status === "won" || e.status === "lost");
+  if (!closed.length) return null;
+  closed.sort((a, b) => String(b.ended_at || b.updated_at || "").localeCompare(String(a.ended_at || a.updated_at || "")));
+  const last = closed[0];
+  const delta = last.status === "won" ? 1 : -1;
+  const confidence = Math.min(10, Math.max(1, Number(o.confidence) + delta));
+  const value = Math.min(10, Math.max(1, Number(o.value) + delta));
+  if (confidence === Number(o.confidence) && value === Number(o.value)) return null;
+  return { from: { value: Number(o.value), confidence: Number(o.confidence) }, to: { value, confidence }, status: last.status, name: last.name };
+};
+
 function renderAdminZone() {
   const z = $("#admin-zone");
   if (!z || !state.detail) return;
   const o = state.detail.opportunity;
+  const suggestion = suggestRescore(o, state.detail.experiments || []);
+  const suggestHtml = suggestion ? `
+    <div style="margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--wash);font-size:13px">
+      <b>Suggested rescore</b> from &ldquo;${esc(suggestion.name)}&rdquo; (${esc(suggestion.status)}):
+      value ${suggestion.from.value}→${suggestion.to.value}, confidence ${suggestion.from.confidence}→${suggestion.to.confidence}.
+      <button class="btn small" id="az-apply-suggest" type="button">Apply suggestion</button>
+    </div>` : "";
   z.innerHTML = state.token ? `
+    ${suggestHtml}
     <h3>Re-optimize (admin)</h3>
     <div class="admin-grid">
       <label>Status
@@ -396,6 +450,24 @@ function renderAdminZone() {
     } catch (e) { toast(`Save failed: ${e.message}`); }
   });
   $("#az-exp").addEventListener("click", () => openExperimentModal(null, o.id));
+  const applySuggest = $("#az-apply-suggest");
+  if (applySuggest && suggestion) applySuggest.addEventListener("click", async () => {
+    try {
+      const day = new Date().toISOString().slice(0, 10);
+      const r = await api(`/api/opportunities/${o.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          value: suggestion.to.value,
+          confidence: suggestion.to.confidence,
+          notes: `${o.notes || ""}\n[${day} rescore] Applied outcome suggestion from "${suggestion.name}" (${suggestion.status}): value ${suggestion.from.value}→${suggestion.to.value}, confidence ${suggestion.from.confidence}→${suggestion.to.confidence}.`.slice(-8000),
+        }),
+      });
+      toast(`Suggested rescore applied — new score ${r.score}`);
+      await refresh();
+      openDrawer(o.id);
+    } catch (e) { toast(`Rescore failed: ${e.message}`); }
+  });
 }
 
 /* ---- modals ---- */

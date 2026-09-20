@@ -14,6 +14,38 @@ const html = readFileSync(join(ROOT, "index.html"), "utf8");
 const js = readFileSync(join(ROOT, "app.js"), "utf8");
 const css = readFileSync(join(ROOT, "styles.css"), "utf8");
 
+describe("stale nudge + vet handoff (round3 Task 2)", () => {
+  it("experiments header nudges the stalest open card when decisions are zero", () => {
+    assert.ok(js.includes("stalestOpenExp"), "app.js lost the stalest-open helper");
+    assert.ok(js.includes("decisions === 0"), "nudge must fire only when decisions_last_7d is 0");
+    assert.ok(js.includes("Nudge:"), "exp summary lost the 'Nudge:' copy");
+    assert.ok(js.includes("days_in_status"), "nudge must reuse days_in_status");
+    assert.ok(js.includes("exp-nudge-open"), "nudge lacks its opener button");
+    assert.ok(js.includes("openDrawer(nudge.opportunity_id, nudge.id)"), "nudge must open the stalest card drawer");
+  });
+
+  it("experiments header shows the vetted-without-experiment count", () => {
+    assert.ok(js.includes("vetted_no_experiment"), "app.js never reads health.vetted_no_experiment");
+    assert.ok(js.includes("vetted, no experiment"), "exp summary lost the vetted-no-experiment count");
+  });
+
+  it("vet toast offers one-click Log experiment", () => {
+    assert.ok(js.includes("Vetted — log the experiment"), "vet toast lost the next-step copy");
+    assert.ok(js.includes("Log experiment"), "vet toast lost its Log experiment action");
+    assert.ok(js.includes("openExperimentModal(null, id)"), "vet handoff must reuse openExperimentModal(null, id)");
+  });
+});
+
+describe("outcome rescore suggestion (round3 Task 3)", () => {
+  it("drawer admin zone suggests a confidence/value delta, never auto-applied", () => {
+    assert.ok(js.includes("suggestRescore"), "app.js lost the suggestRescore helper");
+    assert.ok(js.includes("Suggested rescore"), "drawer lost the 'Suggested rescore' copy");
+    assert.ok(js.includes("az-apply-suggest"), "suggestion lacks its one-click apply button");
+    assert.ok(js.includes("Applied outcome suggestion"), "apply must note the outcome suggestion in notes");
+    assert.ok(js.includes("never auto-applied"), "suggestion must stay human-applied");
+  });
+});
+
 describe("decisions/week header (Task 1)", () => {
   it("experiments summary renders decisions and vetted conversion", () => {
     assert.ok(js.includes("decisions_last_7d"), "app.js never reads health.decisions_last_7d");
