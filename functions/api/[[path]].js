@@ -53,6 +53,7 @@ async function listOpportunities(env, url) {
   const rows = await env.DB.prepare(
     `SELECT o.*,
        (SELECT COUNT(*) FROM briefs b WHERE b.opportunity_id = o.id) AS brief_count,
+       (SELECT b.first_steps FROM briefs b WHERE b.opportunity_id = o.id ORDER BY b.version DESC LIMIT 1) AS brief_first_steps,
        (SELECT COUNT(*) FROM experiments e WHERE e.opportunity_id = o.id) AS experiment_count
      FROM opportunities o
      ${where.length ? "WHERE " + where.join(" AND ") : ""}

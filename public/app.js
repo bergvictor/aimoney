@@ -148,6 +148,21 @@ function renderLedger() {
   });
 }
 
+// Review decision line: capital + next action + source under each review row,
+// so the vet-vs-kill call needs no drawer round-trip. Next hides when the row
+// has no brief (brief_first_steps is null-safe from the list API); the source
+// falls back to plain text when no URL is stored.
+const reviewDecisionLine = (o) => {
+  const next = firstStepsFirstLine({ first_steps: o.brief_first_steps });
+  const source = o.source_url
+    ? `<a href="${esc(o.source_url)}" target="_blank" rel="noreferrer">source</a>`
+    : esc(o.source || "");
+  const parts = [`Capital: ${esc(o.capital_needed || "—")}`];
+  if (next) parts.push(`Next: ${esc(next)}`);
+  if (source) parts.push(source);
+  return `<div class="review-decision muted">${parts.join(" · ")}</div>`;
+};
+
 function renderReview() {
   const rows = state.reviewList.filter((o) => !state.zeroOnly || isZeroSpend(o));
   const max = Math.max(1, ...rows.map((o) => o.score || 0));
@@ -156,6 +171,7 @@ function renderReview() {
       <td class="num rank">${i + 1}</td>
       <td><div class="opp-title">${esc(o.title)} <span class="cat muted">· ${esc(o.category)}</span></div>
         <div class="opp-sub">${esc(o.one_liner || "")}</div>
+        ${reviewDecisionLine(o)}
         <div class="review-actions">
           <button class="btn small" data-vet="${o.id}" type="button">Vet</button>
           <button class="btn small ghost danger" data-kill="${o.id}" type="button">Kill</button>
@@ -301,6 +317,23 @@ const stalestOpenExp = (exps) => {
   return open[0] || null;
 };
 
+// One-click Start for planned experiments: a single PATCH to running (the API
+// stamps started_at; won/lost still require result + post-mortem). Token-gated
+// like vetOpportunity; orphaned cards never render the button.
+// First candidate to start: 'Spec-ad sprint: 10 brands, 10 free ads'
+// (d1/seed.sql) — a human still presses it.
+async function startExperiment(id) {
+  if (!state.token) return toast("Enter the admin token first.");
+  try {
+    await api(`/api/experiments/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status: "running" }),
+    });
+    toast("Experiment started");
+    await refresh();
+  } catch (e) { toast(`Start failed: ${e.message}`); }
+}
+
 function renderExperiments() {
   const exps = state.experiments;
   $("#exp-count").textContent = exps.length || "";
@@ -342,10 +375,12 @@ function renderExperiments() {
           <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}${runningMismatchBadge(e)}${e.revenue_cents > 0 ? ` · <span class="mono">${moneyCents(e.revenue_cents)} rev</span>` : ""}${e.spent_cents > 0 ? ` · <span class="mono">${moneyCents(e.spent_cents)} spent</span>` : ""}</p>
           <div class="meta">${statusPill(e.status)}
             <span class="muted mono">${esc(e.result ? `→ ${e.result.slice(0, 40)}` : (e.target || ""))}</span></div>
+          ${e.status === "planned" && !e.orphaned ? `<p style="margin:6px 0 0"><button class="btn small" data-start-exp="${e.id}" type="button">Start</button></p>` : ""}
         </div>`).join("") || `<p class="muted">—</p>`) + `</div>`;
   }).join("");
   document.querySelectorAll("#board .card").forEach((c) => {
-    c.addEventListener("click", () => {
+    c.addEventListener("click", (ev) => {
+      if (ev.target.closest("[data-start-exp]")) return;
       if (c.dataset.orphan === "1") return toast("Orphaned experiment — its opportunity was deleted.");
       openDrawer(Number(c.dataset.opp), Number(c.dataset.id));
     });
@@ -712,6 +747,15 @@ function openExperimentModal(exp, defaultOpp = null) {
   });
 }
 $("#btn-add-exp").addEventListener("click", () => openExperimentModal(null));
+
+// Delegated one-click Start: board cards re-render on every refresh, so one
+// #board listener covers all Start buttons (card clicks ignore the button).
+$("#board").addEventListener("click", (ev) => {
+  const b = ev.target.closest("[data-start-exp]");
+  if (!b) return;
+  ev.stopPropagation();
+  startExperiment(Number(b.dataset.startExp));
+});
 
 /* ---- manual research trigger ---- */
 $("#btn-run").addEventListener("click", async () => {

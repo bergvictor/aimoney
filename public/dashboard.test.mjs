@@ -235,6 +235,46 @@ describe("weekly revenue header (audit 2026-09-20-round3 Task 1)", () => {
   });
 });
 
+describe("review decision line (audit 2026-09-20-round1 Task 2)", () => {
+  it("review rows show capital, next action, and source without the drawer", () => {
+    assert.ok(js.includes("reviewDecisionLine"), "app.js lost the reviewDecisionLine helper");
+    assert.ok(js.includes("${reviewDecisionLine(o)}"), "renderReview must render reviewDecisionLine(o)");
+    assert.ok(js.includes('Capital: ${esc(o.capital_needed'), "decision line must show capital_needed");
+    assert.ok(js.includes("Next: ${esc(next)}"), "decision line must show the brief next action");
+    assert.ok(js.includes("brief_first_steps"), "decision line must reuse the list-API brief excerpt");
+    assert.ok(js.includes("firstStepsFirstLine({ first_steps: o.brief_first_steps })"), "decision line must reuse firstStepsFirstLine");
+  });
+
+  it("next action hides when the row has no brief; source falls back to text", () => {
+    assert.ok(js.includes("if (next) parts.push"), "Next segment must hide when the excerpt is empty");
+    assert.ok(js.includes("o.source_url"), "decision line must link source_url");
+    assert.ok(js.includes('target="_blank"'), "source link must open in a new tab");
+    assert.ok(js.includes('rel="noreferrer"'), "source link must carry rel=noreferrer");
+    assert.ok(js.includes('esc(o.source || "")'), "source must fall back to plain text without a URL");
+  });
+});
+
+describe("one-click Start (audit 2026-09-20-round1 Task 3)", () => {
+  it("planned cards show a Start button; orphaned cards never do", () => {
+    assert.ok(js.includes("data-start-exp"), "board lost the Start button");
+    assert.ok(js.includes('e.status === "planned" && !e.orphaned'), "Start must show only on planned, non-orphaned cards");
+    assert.ok(js.includes(">Start</button>"), "Start button lost its label");
+  });
+
+  it("one click PATCHes running via a token-gated handler", () => {
+    assert.ok(js.includes("startExperiment"), "app.js lost the startExperiment handler");
+    assert.ok(js.includes("startExperiment(Number("), "Start click must call startExperiment with the card id");
+    assert.ok(js.includes('JSON.stringify({ status: "running" })'), "Start must PATCH status=running only");
+    assert.ok(js.includes("Experiment started"), "Start lost its success toast");
+    assert.ok(js.includes('if (ev.target.closest("[data-start-exp]")) return;'), "card clicks must ignore the Start button");
+  });
+
+  it("names the spec-ad sprint as the first candidate, human-pressed", () => {
+    assert.ok(js.includes("Spec-ad sprint: 10 brands, 10 free ads"), "app.js lost the first-candidate experiment name");
+    assert.ok(js.includes("a human still presses it"), "Start must stay a human decision");
+  });
+});
+
 describe("experiment money in cents (audit 2026-09-20 Task 4)", () => {
   it("experiment modal owns revenue and precise-spend inputs", () => {
     assert.ok(js.includes('id="m-revenue"'), "experiment modal lost the revenue input");

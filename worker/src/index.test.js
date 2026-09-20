@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker from "./index.js";
+import worker, { agentMoneyEstimates } from "./index.js";
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {
@@ -76,6 +76,80 @@ describe("brief on quiet ticks (audit 2026-09-20-round3 Task 2)", () => {
   it("manual runs still skip the brief pass by deadline", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
     assert.ok(src.includes('trigger === "cron" ? 300000 : -1'), "manual path lost its brief-skipping deadline");
+  });
+});
+
+describe("agent money estimates (audit 2026-09-20-round1 Task 1)", () => {
+  it("triage verdict schema asks for the four money keys", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    for (const k of ["est_monthly_low", "est_monthly_high", "capital_needed", "time_to_first_dollar"]) {
+      assert.ok(src.includes(`"${k}"`), `classify schema lost "${k}"`);
+    }
+    // Both the live pass and /debug-classify carry the schema.
+    assert.ok(src.indexOf("est_monthly_low") !== src.lastIndexOf("est_monthly_low"), "money schema must appear in both classify prompts");
+  });
+
+  it("new-row INSERT persists the four money columns", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("est_monthly_low, est_monthly_high,"), "INSERT lost the $/mo columns");
+    assert.ok(src.includes("capital_needed, time_to_first_dollar,"), "INSERT lost the capital/first-$ columns");
+    assert.ok(src.includes("m.est_monthly_low, m.est_monthly_high, m.capital_needed, m.time_to_first_dollar"), "INSERT lost the money binds");
+  });
+
+  it("notes tag the estimates for correction on vet", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("agent estimates — correct on vet"), "new-row notes lost the agent-estimates tag");
+  });
+
+  it("same AI budget, no status moves, manual skip intact", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+  });
+
+  it("README names the estimate fields and their reversibility", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("est_monthly_low") && readme.includes("time_to_first_dollar"), "README lost the estimate field names");
+    assert.ok(readme.includes("agent estimates — correct on vet"), "README lost the estimates tag");
+    assert.ok(readme.includes("reversible"), "README lost the reversibility rule");
+  });
+});
+
+describe("agentMoneyEstimates", () => {
+  it("passes sane estimates through", () => {
+    assert.deepEqual(agentMoneyEstimates({ est_monthly_low: 500, est_monthly_high: 5000, capital_needed: "$0-200/mo tools", time_to_first_dollar: "2-4 weeks" }),
+      { est_monthly_low: 500, est_monthly_high: 5000, capital_needed: "$0-200/mo tools", time_to_first_dollar: "2-4 weeks" });
+  });
+
+  it("defaults missing keys to 0/0/''/''", () => {
+    const dflt = { est_monthly_low: 0, est_monthly_high: 0, capital_needed: "", time_to_first_dollar: "" };
+    assert.deepEqual(agentMoneyEstimates({}), dflt);
+    assert.deepEqual(agentMoneyEstimates(null), dflt);
+    assert.deepEqual(agentMoneyEstimates(undefined), dflt);
+  });
+
+  it("clamps malformed numbers to 0 instead of NaN/negatives", () => {
+    const m = agentMoneyEstimates({ est_monthly_low: "bogus", est_monthly_high: -500, capital_needed: 123, time_to_first_dollar: null });
+    assert.equal(m.est_monthly_low, 0);
+    assert.equal(m.est_monthly_high, 0);
+    assert.equal(m.capital_needed, "123");
+    assert.equal(m.time_to_first_dollar, "");
+  });
+
+  it("clamps an inverted range high up to low, never rejects", () => {
+    const m = agentMoneyEstimates({ est_monthly_low: 5000, est_monthly_high: 500 });
+    assert.equal(m.est_monthly_low, 5000);
+    assert.equal(m.est_monthly_high, 5000);
+  });
+
+  it("floors fractional dollars and truncates long strings to 120", () => {
+    const m = agentMoneyEstimates({ est_monthly_low: 99.9, est_monthly_high: 100.9, capital_needed: "x".repeat(200), time_to_first_dollar: "y".repeat(200) });
+    assert.equal(m.est_monthly_low, 99);
+    assert.equal(m.est_monthly_high, 100);
+    assert.equal(m.capital_needed.length, 120);
+    assert.equal(m.time_to_first_dollar.length, 120);
   });
 });
 

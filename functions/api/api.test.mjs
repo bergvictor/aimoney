@@ -5,6 +5,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { onRequest } from "./[[path]].js";
 import { effectiveScore as workerEffectiveScore } from "../../worker/src/lib.js";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ---------- In-memory D1 stub (prepare().bind().all()/first()/run()) ----------
 function makeDB(seed = {}) {
@@ -41,6 +44,7 @@ function makeDB(seed = {}) {
     rows = rows.slice(0, limit).map((o) => ({
       ...o,
       brief_count: data.briefs.filter((b) => b.opportunity_id === o.id).length,
+      brief_first_steps: (() => { const bl = data.briefs.filter((b) => b.opportunity_id === o.id).sort((a, b) => (b.version || 0) - (a.version || 0)); return bl.length ? bl[0].first_steps : null; })(),
       experiment_count: data.experiments.filter((e) => e.opportunity_id === o.id).length,
     }));
     return { results: rows };
@@ -727,6 +731,66 @@ describe("experiment revenue/spend cents (audit 2026-09-20 Task 4)", () => {
       assert.ok(k in r.body, "health missing " + k);
     }
     assert.equal(r.body.revenue_last_7d, 0);
+  });
+});
+
+describe("review brief excerpt (audit 2026-09-20-round1 Task 2)", () => {
+  it("list SQL selects the latest brief first_steps per row", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "[[path]].js"), "utf8");
+    assert.ok(src.includes("AS brief_first_steps"), "listOpportunities lost the brief excerpt subquery");
+    assert.ok(src.includes("ORDER BY b.version DESC LIMIT 1"), "excerpt must take the latest brief version");
+  });
+
+  it("returns the excerpt, null when the row has no brief", async () => {
+    const db = makeDB({
+      opportunities: oppSeed(),
+      briefs: [
+        { id: 1, opportunity_id: 2, version: 1, first_steps: "1. Old step" },
+        { id: 2, opportunity_id: 2, version: 2, first_steps: "1. New step\n2. More" },
+      ],
+    });
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities?unreviewed=1&sort=oldest", {}, db);
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.body.opportunities.map((o) => [o.id, o]));
+    assert.equal(byId[2].brief_first_steps, "1. New step\n2. More");
+    assert.equal(byId[3].brief_first_steps, null);
+  });
+
+  it("leaves ledger order, scoring, and writes untouched", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities", {}, db);
+    assert.deepEqual(r.body.opportunities.map((o) => o.id), [1, 2, 3]);
+    const byId = Object.fromEntries(r.body.opportunities.map((o) => [o.id, o]));
+    assert.equal(byId[2].score, 6000);
+    assert.equal(byId[1].score, 16000);
+  });
+});
+
+describe("one-click Start (audit 2026-09-20-round1 Task 3)", () => {
+  it("PATCH planned→running stamps started_at with one click", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running" } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.status, "running");
+    assert.equal(db.data.experiments[0].status, "running");
+    assert.ok(db.data.experiments[0].started_at);
+  });
+
+  it("401s without the admin token, row untouched", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", body: { status: "running" } }, db);
+    assert.equal(r.status, 401);
+    assert.equal(db.data.experiments[0].status, "planned");
+  });
+
+  it("won/lost still require result + post-mortem", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "won", result: "made $" } }, db);
+    assert.equal(r.status, 400);
+    assert.ok(r.body.fields && r.body.fields.post_mortem);
   });
 });
 

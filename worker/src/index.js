@@ -138,6 +138,24 @@ async function aiComplete(env, state, { model, fallback, maxTokens, messages, ti
 
 import { clamp10, slugify, scoreOf, effectiveScore, parseJsonLines, repairJson } from "./lib.js";
 
+// Agent money estimates (F1): the triage verdict may carry est_monthly_low,
+// est_monthly_high, capital_needed, and time_to_first_dollar for "new" rows.
+// Missing/malformed keys default safely (0/0/''/''); an inverted range clamps
+// high up to low instead of rejecting (the API's 400 guard must never fire on
+// agent rows, so a bad estimate can never 500 the cron pass). Pure for tests.
+export function agentMoneyEstimates(v) {
+  const o = (v && typeof v === "object") ? v : {};
+  const est_monthly_low = Math.max(0, Math.floor(Number(o.est_monthly_low) || 0));
+  let est_monthly_high = Math.max(0, Math.floor(Number(o.est_monthly_high) || 0));
+  if (est_monthly_high < est_monthly_low) est_monthly_high = est_monthly_low;
+  return {
+    est_monthly_low,
+    est_monthly_high,
+    capital_needed: String(o.capital_needed || "").slice(0, 120),
+    time_to_first_dollar: String(o.time_to_first_dollar || "").slice(0, 120),
+  };
+}
+
 async function runResearch(env, trigger) {
   const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0, stale: 0 };
   // Reap runs a killed worker left behind: a "running" row older than the
@@ -218,8 +236,8 @@ async function runResearch(env, trigger) {
         `\n\nFRESH SIGNALS (n | source | title | url):\n` +
         fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
         `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:
-{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10}
-Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to earn money (pricing, revenue, customers, or an obvious buyer) that is NOT on the list. A GitHub repo, tool launch, or tutorial with no business model is noise. A variant of a listed method is "supports" with its numeric id. Confidence above 6 requires named revenue/users in the signal, else 5 or less. opportunity_id must be a numeric id from the list or null, never text.` },
+{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"est_monthly_low":0,"est_monthly_high":0,"capital_needed":"$0","time_to_first_dollar":"2-4 weeks"}
+Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to earn money (pricing, revenue, customers, or an obvious buyer) that is NOT on the list. A GitHub repo, tool launch, or tutorial with no business model is noise. A variant of a listed method is "supports" with its numeric id. Confidence above 6 requires named revenue/users in the signal, else 5 or less. opportunity_id must be a numeric id from the list or null, never text. For "new", also estimate est_monthly_low/high ($/mo integers, low<=high), capital_needed ("$0" style, <=120 chars) and time_to_first_dollar ("2-4 weeks" style, <=120 chars); omit any you cannot estimate (safe defaults apply).` },
     ];
     if (fresh.length) await mark("classify-ai");
     const isCron = trigger === "cron";
@@ -257,16 +275,19 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
           confidence: Math.min(5, clamp10(v.confidence, 3)), fit: clamp10(v.fit) };
         const oneLiner = String(v.one_liner || "").trim()
           || `Via ${sig.source}: ${sig.title}`.slice(0, 500);
+        const m = agentMoneyEstimates(v);
         try {
           const r = await env.DB.prepare(
             `INSERT INTO opportunities (slug, title, one_liner, category, status,
-             value, effort, confidence, fit, score, source, source_url, notes)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+             value, effort, confidence, fit, score, est_monthly_low, est_monthly_high,
+             capital_needed, time_to_first_dollar, source, source_url, notes)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
           ).bind(slug, String(v.title).slice(0, 200), oneLiner.slice(0, 500),
             String(v.category || "other").slice(0, 40), "researching",
             o.value, o.effort, o.confidence, o.fit, effectiveScore({ ...o, notes: "UNREVIEWED" }),
+            m.est_monthly_low, m.est_monthly_high, m.capital_needed, m.time_to_first_dollar,
             "agent", String(sig.url || "").slice(0, 500),
-            `Agent proposal from ${sig.source} signal "${sig.title}" (${sig.url}) — UNREVIEWED, scores capped until a human vets it.`.slice(0, 1000)).run();
+            `Agent proposal from ${sig.source} signal "${sig.title}" (${sig.url}) — UNREVIEWED, scores capped until a human vets it (agent estimates — correct on vet).`.slice(0, 1000)).run();
           state.added++;
           await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
             .bind(r.meta.last_row_id, sig.id).run();
@@ -444,7 +465,7 @@ export default {
           `\n\nFRESH SIGNALS (n | source | title | url):\n` +
           fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
           `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:\n` +
-          `{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10}` },
+          `{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"est_monthly_low":0,"est_monthly_high":0,"capital_needed":"$0","time_to_first_dollar":"2-4 weeks"} For "new", also estimate est_monthly_low/high ($/mo integers, low<=high), capital_needed ("$0" style, <=120 chars) and time_to_first_dollar ("2-4 weeks" style, <=120 chars); omit any you cannot estimate (safe defaults apply).` },
       ];
       const t0 = Date.now();
       try {

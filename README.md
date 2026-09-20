@@ -62,7 +62,7 @@ then enter it once in the dashboard — it is kept in `localStorage` only.
 
 Status flow: `backlog → researching → testing → scaling | paused | killed`.
 Killed strategies stay on the board with their post-mortem — that is the point.
-Agent proposals enter as `researching` with an `UNREVIEWED` marker in notes and an effective score capped to ≤6000 until a human vets them (shared `effectiveScore` in `worker/src/lib.js`, used by both worker and API).
+Agent proposals enter as `researching` with an `UNREVIEWED` marker in notes and an effective score capped to ≤6000 until a human vets them (shared `effectiveScore` in `worker/src/lib.js`, used by both worker and API). Each proposal carries rough `est_monthly_low`/`est_monthly_high`, `capital_needed`, and `time_to_first_dollar` estimates from the same triage call — missing keys default to 0/0/''/'', inverted ranges clamp high up to low, and notes are tagged `agent estimates — correct on vet`; every field stays human-editable in the drawer, so the estimate is reversible at vet time.
 
 ## Review flow (who vets, what moves)
 
