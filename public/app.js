@@ -5,7 +5,7 @@
 const $ = (sel, el = document) => el.querySelector(sel);
 const state = {
   opportunities: [], experiments: [], runs: [], meta: {},
-  statusFilter: "", detail: null, reviewOnly: false, reviewList: [],
+  statusFilter: "", detail: null, reviewOnly: false, reviewList: [], zeroOnly: false, topBriefText: {},
   health: {},
   apiFailures: [],
   token: localStorage.getItem("aimoney_admin") || "",
@@ -70,11 +70,58 @@ document.querySelectorAll(".tab").forEach((tab) => {
 });
 activateTab(new URLSearchParams(location.search).get("tab") || "priority", false);
 
+/* ---- zero-spend starter: hero strip + $0 filter (read-only) ---- */
+// A row is zero-spend when capital_needed starts with "$0" ("$0",
+// "$0-200/mo tools", ...). Scoring, status, and the API are unchanged.
+const isZeroSpend = (o) =>
+  String((o && o.capital_needed) || "").trim().startsWith("$0");
+
+const topOpportunity = (opps) =>
+  (opps || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0))[0] || null;
+
+const firstStepsFirstLine = (brief) =>
+  String((brief && brief.first_steps) || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
+
+// "Start here today" strip: the #1-by-score opportunity with its $/mo range,
+// capital to start, and the brief's first next action. The brief line loads
+// via one detail fetch per top pick (cached in state.topBriefText); the
+// button deep-links into the drawer via openDrawer. Read-only.
+function renderStartHere() {
+  const el = $("#start-here");
+  if (!el) return;
+  const top = topOpportunity(state.opportunities);
+  if (!top) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  const cached = state.topBriefText[top.id];
+  const nextAction = cached !== undefined
+    ? (cached || "No brief yet — open the drawer for facts.")
+    : "Loading next action…";
+  el.classList.remove("hidden");
+  el.innerHTML =
+    `<div style="background:var(--green-wash);border:1px solid var(--green);border-radius:8px;padding:10px 12px;margin-bottom:12px">` +
+    `<p style="margin:0 0 4px"><b>Start here today:</b> ${esc(top.title)}</p>` +
+    `<p class="muted" style="margin:0 0 8px;font-size:13px"><span class="mono">${money(top.est_monthly_low, top.est_monthly_high)}/mo</span>` +
+    ` · <span>Capital: ${esc(top.capital_needed || "—")}</span>` +
+    ` · <span>Next: ${esc(nextAction)}</span></p>` +
+    `<p style="margin:0"><button id="start-here-open" class="btn small" type="button">Open in drawer</button></p>` +
+    `</div>`;
+  $("#start-here-open").addEventListener("click", () => openDrawer(top.id));
+  if (cached === undefined) {
+    api(`/api/opportunities/${top.id}`).then((d) => {
+      state.topBriefText[top.id] = firstStepsFirstLine(d.briefs && d.briefs[0]);
+      if (topOpportunity(state.opportunities) && topOpportunity(state.opportunities).id === top.id) renderStartHere();
+    }).catch(() => {
+      state.topBriefText[top.id] = "";
+      if (topOpportunity(state.opportunities) && topOpportunity(state.opportunities).id === top.id) renderStartHere();
+    });
+  }
+}
+
 /* ---- priority list ---- */
 function renderLedger() {
+  renderStartHere();
   if (state.reviewOnly) return renderReview();
   const rows = state.opportunities.filter((o) =>
-    !state.statusFilter || o.status === state.statusFilter);
+    (!state.statusFilter || o.status === state.statusFilter) && (!state.zeroOnly || isZeroSpend(o)));
   const max = Math.max(1, ...state.opportunities.map((o) => o.score || 0));
   $("#ledger-body").innerHTML = rows.length ? rows.map((o, i) => `
     <tr class="row" data-id="${o.id}">
@@ -82,7 +129,7 @@ function renderLedger() {
       <td><div class="opp-title">${esc(o.title)} <span class="cat muted">· ${esc(o.category)}</span></div>
         <div class="opp-sub">${esc(o.one_liner || "")}</div>${testingBadge(o)}</td>
       <td>${statusPill(o.status)}</td>
-      <td class="score-cell"><span class="score-num">${esc(o.score)}</span>
+      <td class="score-cell"><span class="score-num">${esc(o.score)}</span>${noBriefBadge(o)}
         <div class="score-bar"><i style="width:${Math.round(100 * (o.score || 0) / max)}%"></i></div></td>
       <td>${meter(o.value)}</td><td>${meter(o.effort)}</td>
       <td>${meter(o.confidence)}</td><td>${meter(o.fit)}</td>
@@ -98,7 +145,7 @@ function renderLedger() {
 }
 
 function renderReview() {
-  const rows = state.reviewList;
+  const rows = state.reviewList.filter((o) => !state.zeroOnly || isZeroSpend(o));
   const max = Math.max(1, ...rows.map((o) => o.score || 0));
   $("#ledger-body").innerHTML = rows.length ? rows.map((o, i) => `
     <tr class="row" data-id="${o.id}">
@@ -110,7 +157,7 @@ function renderReview() {
           <button class="btn small ghost danger" data-kill="${o.id}" type="button">Kill</button>
         </div></td>
       <td>${statusPill(o.status)}</td>
-      <td class="score-cell"><span class="score-num">${esc(o.score)}</span>
+      <td class="score-cell"><span class="score-num">${esc(o.score)}</span>${noBriefBadge(o)}
         <div class="score-bar"><i style="width:${Math.round(100 * (o.score || 0) / max)}%"></i></div></td>
       <td>${meter(o.value)}</td><td>${meter(o.effort)}</td>
       <td>${meter(o.confidence)}</td><td>${meter(o.fit)}</td>
@@ -138,6 +185,7 @@ async function refreshReview() {
   if (el) el.textContent = state.reviewList.length;
   const ageEl = $("#review-age");
   if (ageEl) ageEl.textContent = oldestReviewAge();
+  updateReviewChipTitle();
 }
 
 const fmtAgeH = (h) =>
@@ -152,6 +200,17 @@ function oldestReviewAge() {
   const ms = Date.parse(state.reviewList[0].created_at || "");
   if (!Number.isFinite(ms)) return "";
   return fmtAgeH((Date.now() - ms) / 3600000);
+}
+
+// Review chip tooltip: append the without-briefs count from the
+// already-fetched health payload so the evidence gap is visible pre-click.
+function updateReviewChipTitle() {
+  const chip = document.querySelector('.filters .chip[data-review="1"]');
+  if (!chip) return;
+  const n = state.health && state.health.bare_without_brief;
+  chip.title = (typeof n === "number" && Number.isFinite(n))
+    ? `${state.reviewList.length} need review · ${n} without briefs`
+    : `${state.reviewList.length} need review`;
 }
 
 function cleanUnreviewed(notes) {
@@ -198,8 +257,16 @@ async function killOpportunity(id) {
 
 document.querySelectorAll(".filters .chip").forEach((chip) => {
   chip.addEventListener("click", () => {
-    document.querySelectorAll(".filters .chip").forEach((c) => c.classList.remove("active"));
+    if (chip.dataset.zero) {
+      state.zeroOnly = !state.zeroOnly;
+      chip.classList.toggle("active", state.zeroOnly);
+      renderLedger();
+      return;
+    }
+    document.querySelectorAll(".filters .chip").forEach((c) => { if (!c.dataset.zero) c.classList.remove("active"); });
     chip.classList.add("active");
+    const zeroChip = document.querySelector('.filters .chip[data-zero="1"]');
+    if (zeroChip) zeroChip.classList.toggle("active", !!state.zeroOnly);
     if (chip.dataset.review) {
       state.reviewOnly = true;
       state.statusFilter = "";
@@ -351,7 +418,7 @@ async function openDrawer(id, focusExp = null) {
     const o = d.opportunity;
     $("#drawer-slug").textContent = o.slug;
     $("#drawer-body").innerHTML = `
-      <p>${statusPill(o.status)} <span class="muted">· ${esc(o.category)} · score </span><b class="mono">${esc(o.score)}</b></p>
+      <p>${statusPill(o.status)} <span class="muted">· ${esc(o.category)} · score </span><b class="mono">${esc(o.score)}</b>${String(o.notes || "").includes("UNREVIEWED") ? ' <span class="muted">(capped — unreviewed)</span>' : ""}</p>
       <h2>${esc(o.title)}</h2>
       <p class="muted">${esc(o.one_liner || "")}</p>
       <h3>Facts</h3>
@@ -629,6 +696,13 @@ const testingBadge = (o) =>
     ? ` <span class="warn-badge" title="Status is testing but no experiments are logged">testing · 0 experiments</span>`
     : "";
 
+// A score with no evidence behind it must say so: pill in the score cell
+// when the row's returned brief_count is zero. Read-only.
+const noBriefBadge = (o) =>
+  Number(o.brief_count) === 0
+    ? ` <span class="warn-badge" title="No research brief yet — score has no evidence behind it">no brief</span>`
+    : "";
+
 const runningMismatchBadge = (e) => {
   if (e.status !== "running" || e.orphaned) return "";
   const parent = state.opportunities.find((o) => String(o.id) === String(e.opportunity_id));
@@ -678,4 +752,3 @@ async function refresh() {
 refresh().catch((e) => {
   $("#ledger-body").innerHTML = `<tr><td colspan="10">API unreachable: ${esc(e.message)} — is the D1 binding attached?</td></tr>`;
 });
-

@@ -75,7 +75,7 @@ async function getOpportunity(env, id) {
   const experiments = await env.DB.prepare(
     "SELECT * FROM experiments WHERE opportunity_id = ? ORDER BY updated_at DESC")
     .bind(id).all();
-  return json({ opportunity: row, briefs: briefs.results || [], experiments: experiments.results || [] });
+  return json({ opportunity: { ...row, score: effectiveScore(row) }, briefs: briefs.results || [], experiments: experiments.results || [] });
 }
 
 async function createOpportunity(request, env) {

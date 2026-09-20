@@ -14,6 +14,39 @@ const html = readFileSync(join(ROOT, "index.html"), "utf8");
 const js = readFileSync(join(ROOT, "app.js"), "utf8");
 const css = readFileSync(join(ROOT, "styles.css"), "utf8");
 
+describe("zero-spend starter (Task 1)", () => {
+  it("served page owns the Start-here strip container above the ledger", () => {
+    assert.ok(html.includes('id="start-here"'), "index.html lost #start-here");
+    const stripAt = html.indexOf('id="start-here"');
+    const ledgerAt = html.indexOf('id="ledger"');
+    assert.ok(stripAt !== -1 && ledgerAt !== -1 && stripAt < ledgerAt, "#start-here must sit above #ledger");
+  });
+
+  it("served page owns a Zero spend chip", () => {
+    assert.ok(html.includes('data-zero="1"'), "index.html lost the data-zero chip");
+    assert.ok(html.includes("Zero spend"), "index.html lost the 'Zero spend' chip copy");
+  });
+
+  it("strip shows the #1-by-score pick with money, capital, next action, and a drawer link", () => {
+    assert.ok(js.includes("Start here today"), "app.js lost the 'Start here today' copy");
+    assert.ok(js.includes("renderStartHere"), "app.js lost renderStartHere");
+    assert.ok(js.includes("topOpportunity"), "app.js lost the topOpportunity helper");
+    assert.ok(js.includes("firstStepsFirstLine"), "app.js lost the first-steps line helper");
+    assert.ok(js.includes("first_steps"), "strip must read brief first_steps");
+    assert.ok(js.includes("money(top.est_monthly_low, top.est_monthly_high)"), "strip must reuse money() for the $/mo range");
+    assert.ok(js.includes("capital_needed"), "strip must show capital_needed");
+    assert.ok(js.includes("start-here-open"), "strip lacks its drawer opener button");
+    assert.ok(js.includes("openDrawer(top.id)"), "strip must deep-link via openDrawer(top.id)");
+  });
+
+  it("Zero spend chip filters capital_needed $0 rows", () => {
+    assert.ok(js.includes("isZeroSpend"), "app.js lost the isZeroSpend helper");
+    assert.ok(js.includes('startsWith("$0")'), "zero-spend must match capital_needed starting with $0");
+    assert.ok(js.includes("state.zeroOnly"), "app.js lost the zeroOnly filter state");
+    assert.ok(js.includes("chip.dataset.zero"), "chip handler ignores the Zero spend chip");
+  });
+});
+
 describe("stale nudge + vet handoff (round3 Task 2)", () => {
   it("experiments header nudges the stalest open card when decisions are zero", () => {
     assert.ok(js.includes("stalestOpenExp"), "app.js lost the stalest-open helper");
@@ -110,5 +143,25 @@ describe("failure banner and mismatch badges (Task 3)", () => {
     assert.ok(css.includes(".error-banner"), "styles.css lost .error-banner");
     assert.ok(css.includes(".warn-badge"), "styles.css lost .warn-badge");
     assert.ok(!css.includes("prefers-color-scheme"), "styles.css gained a dark-mode query");
+  });
+});
+
+describe("honest drawer + no-brief pill (Task 2)", () => {
+  it("drawer marks capped unreviewed scores", () => {
+    assert.ok(js.includes("(capped — unreviewed)"), "drawer lost the capped-unreviewed marker");
+    assert.ok(js.includes('includes("UNREVIEWED")'), "drawer marker must key off the UNREVIEWED marker");
+  });
+
+  it("ledger pills rows without briefs in the score cell", () => {
+    assert.ok(js.includes("noBriefBadge"), "app.js lost the noBriefBadge helper");
+    assert.ok(js.includes("brief_count"), "pill must reuse the returned brief_count");
+    assert.ok(js.includes("no brief"), "ledger lost the 'no brief' pill copy");
+    assert.ok(js.includes("${noBriefBadge(o)}"), "score cell must render noBriefBadge(o)");
+  });
+
+  it("review chip tooltip carries the without-briefs count", () => {
+    assert.ok(js.includes("updateReviewChipTitle"), "app.js lost updateReviewChipTitle");
+    assert.ok(js.includes("bare_without_brief"), "chip title must reuse health.bare_without_brief");
+    assert.ok(js.includes("without briefs"), "chip title lost the 'without briefs' copy");
   });
 });

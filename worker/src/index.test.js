@@ -46,6 +46,21 @@ describe("main brief oldest-first on old backlog (static guard)", () => {
   });
 });
 
+describe("oldest-first triage with staleness bound (static guard)", () => {
+  it("takes the oldest unprocessed signals first in the pass and the debug probe", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("SELECT * FROM signals WHERE processed = 0 ORDER BY id ASC LIMIT"), "triage lost the oldest-first take");
+    assert.ok(!src.includes("SELECT * FROM signals WHERE processed = 0 ORDER BY id DESC"), "triage still starves older signals newest-first");
+  });
+
+  it("marks signals older than 30d as noise with a count", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("UPDATE signals SET processed = 1 WHERE processed = 0"), "worker lost the stale-mark UPDATE");
+    assert.ok(src.includes("-30 days"), "worker lost the 30-day staleness bound");
+    assert.ok(src.includes("state.stale"), "worker lost the stale-signal count");
+  });
+});
+
 describe("extra brief on old backlog (static guard)", () => {
   it("cron path briefs one extra oldest-unreviewed row past 48h within budget", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");

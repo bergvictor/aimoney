@@ -139,7 +139,7 @@ async function aiComplete(env, state, { model, fallback, maxTokens, messages, ti
 import { clamp10, slugify, scoreOf, effectiveScore, parseJsonLines, repairJson } from "./lib.js";
 
 async function runResearch(env, trigger) {
-  const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0 };
+  const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0, stale: 0 };
   // Reap runs a killed worker left behind: a "running" row older than the
   // cutoff is dead by definition (a live run finishes in minutes).
   await env.DB.prepare(
@@ -188,9 +188,18 @@ async function runResearch(env, trigger) {
       ? env.DB.prepare("UPDATE agent_runs SET signals_seen=?, ai_calls=?, error=? WHERE id=?")
         .bind(state.seen, state.ai_calls, `phase:${phase}`).run().catch(() => null)
       : Promise.resolve();
-    await mark("collected");
+    // Staleness bound: unprocessed signals older than 30d become noise
+    // (counted in state.stale) so the oldest-first take cannot wedge on
+    // ancient pre-deploy backlog. Best-effort; the take still bounds work.
+    try {
+      const staleRun = await env.DB.prepare(
+        "UPDATE signals SET processed = 1 WHERE processed = 0 AND created_at != '' AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')").run();
+      const staleMeta = (staleRun && staleRun.meta) || {};
+      state.stale = Number(staleMeta.changes || staleMeta.rows_written) || 0;
+    } catch { /* stale sweep failed; triage proceeds anyway */ }
+    await mark(state.stale ? `collected stale:${state.stale}` : "collected");
     const fresh = await env.DB.prepare(
-      "SELECT * FROM signals WHERE processed = 0 ORDER BY id DESC LIMIT ?")
+      "SELECT * FROM signals WHERE processed = 0 ORDER BY id ASC LIMIT ?")
       .bind(MAX_AI_SIGNALS).all().then((r) => r.results || []);
     if (!fresh.length) {
       await finish("ok");
@@ -383,7 +392,7 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
       }
     }
     await finish("ok");
-    await finish("ok", briefMode === "skipped" ? "" : "brief:" + briefMode);
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : ""));
     return { status: "ok", ...state };
   } catch (e) {
     await finish("error", e && e.message || e);
@@ -422,7 +431,7 @@ export default {
       const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
       if (!want || got !== want) return json({ error: "unauthorized" }, 401);
       const fresh = await env.DB.prepare(
-        "SELECT * FROM signals WHERE processed = 0 ORDER BY id DESC LIMIT ?")
+        "SELECT * FROM signals WHERE processed = 0 ORDER BY id ASC LIMIT ?")
         .bind(MAX_AI_SIGNALS).all().then((r) => r.results || []);
       const opps = await env.DB.prepare(
         "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")

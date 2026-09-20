@@ -624,6 +624,32 @@ describe("triage noise (Task 3)", () => {
   });
 });
 
+describe("detail-view cap agreement (Task 2)", () => {
+  it("GET /api/opportunities/:id returns the capped effective score, stored row untouched", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const detail = await callApi(["opportunities", "2"], "http://localhost/api/opportunities/2", {}, db);
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.opportunity.score, 6000);
+    const list = await callApi(["opportunities"], "http://localhost/api/opportunities", {}, db);
+    const listed = list.body.opportunities.find((o) => o.id === 2);
+    assert.equal(detail.body.opportunity.score, listed.score);
+    assert.equal(db.data.opportunities.find((o) => o.id === 2).score, 17500);
+  });
+
+  it("leaves reviewed detail scores untouched", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const detail = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1", {}, db);
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.opportunity.score, 16000);
+  });
+
+  it("404s on unknown detail id", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["opportunities", "999"], "http://localhost/api/opportunities/999", {}, db);
+    assert.equal(r.status, 404);
+  });
+});
+
 describe("health (G4)", () => {
   it("reports backlog and freshness fields", async () => {
     const twoHoursAgo = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
