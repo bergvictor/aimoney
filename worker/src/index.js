@@ -145,6 +145,22 @@ import { clamp10, slugify, scoreOf, effectiveScore, parseJsonLines, repairJson }
 // agent rows, so a bad estimate can never 500 the cron pass). Zero-spend
 // phrasings ("free"/"none"/bare "0", any case) normalize to "$0 …"-form with
 // the raw phrasing kept after the prefix (reversible at vet time). Pure for tests.
+// Exact-URL duplicate match (pure): returns the opportunity id a fresh signal
+// links to as supports, or null when no exact-URL match exists. A URL matching
+// an existing opportunity source_url — or an already-linked signal URL — needs
+// no model call. Empty URLs never match. Pure for tests.
+export function exactUrlTarget(signalUrl, opportunities, linkedSignals) {
+  const url = String(signalUrl || "");
+  if (!url) return null;
+  for (const o of (opportunities || [])) {
+    if (o && o.id && o.source_url && String(o.source_url) === url) return o.id;
+  }
+  for (const s of (linkedSignals || [])) {
+    if (s && s.opportunity_id && s.url && String(s.url) === url) return s.opportunity_id;
+  }
+  return null;
+}
+
 export function agentMoneyEstimates(v) {
   const o = (v && typeof v === "object") ? v : {};
   const est_monthly_low = Math.max(0, Math.floor(Number(o.est_monthly_low) || 0));
@@ -225,6 +241,29 @@ async function runResearch(env, trigger) {
     const fresh = await env.DB.prepare(
       "SELECT * FROM signals WHERE processed = 0 ORDER BY id ASC LIMIT ?")
       .bind(MAX_AI_SIGNALS).all().then((r) => r.results || []);
+    // Exact-URL supports pre-pass (no AI call): a taken signal whose URL
+    // exactly matches an existing opportunity source_url or an already-linked
+    // signal URL is linked as supports before triage — reversible, notes
+    // newest-kept, no status move. Linked rows leave `fresh` in place, so the
+    // classify prompt and verdict indices below only see genuinely new signals.
+    if (fresh.length) {
+      const oppUrls = await env.DB.prepare(
+        "SELECT id, source_url FROM opportunities WHERE source_url != ''")
+        .all().then((r) => r.results || []).catch(() => []);
+      const linkedUrls = await env.DB.prepare(
+        "SELECT url, opportunity_id FROM signals WHERE opportunity_id IS NOT NULL AND url != ''")
+        .all().then((r) => r.results || []).catch(() => []);
+      const rest = [];
+      for (const sig of fresh) {
+        const target = exactUrlTarget(sig.url, oppUrls, linkedUrls);
+        if (target === null) { rest.push(sig); continue; }
+        state.updated++;
+        await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(target, sig.id).run();
+        await env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, target).run().catch(() => null);
+      }
+      fresh.length = 0;
+      fresh.push(...rest);
+    }
     if (!fresh.length) {
       // Intentionally no early return: quiet ticks still brief bare rows below.
       // The classify AI call is skipped when fresh is empty (see verdicts guard).

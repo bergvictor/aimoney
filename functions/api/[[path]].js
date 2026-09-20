@@ -57,6 +57,7 @@ async function listOpportunities(env, url) {
     `SELECT o.*,
        (SELECT COUNT(*) FROM briefs b WHERE b.opportunity_id = o.id) AS brief_count,
        (SELECT b.first_steps FROM briefs b WHERE b.opportunity_id = o.id ORDER BY b.version DESC LIMIT 1) AS brief_first_steps,
+       (SELECT substr(b.summary, 1, 200) FROM briefs b WHERE b.opportunity_id = o.id ORDER BY b.version DESC LIMIT 1) AS brief_summary,
        (SELECT COUNT(*) FROM experiments e WHERE e.opportunity_id = o.id) AS experiment_count
      FROM opportunities o
      ${where.length ? "WHERE " + where.join(" AND ") : ""}
@@ -358,6 +359,8 @@ export async function onRequest(context) {
       // the "[YYYY-MM-DD vetted]" tag (see vetOpportunity) touched in 7d.
       const decisionsRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
       const revenueRow = env.DB ? await env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
+      const revenueTotalRow = env.DB ? await env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost')").first().catch(() => null) : null;
+      const spentTotalRow = env.DB ? await env.DB.prepare("SELECT COALESCE(SUM(spent_cents),0) AS total FROM experiments WHERE status IN ('won','lost')").first().catch(() => null) : null;
       const vettedRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%vetted]%' AND updated_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
       const vettedNoExpRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)").first().catch(() => null) : null;
       const dayAgoIso = new Date(Date.now() - 86400000).toISOString();
@@ -380,7 +383,7 @@ export async function onRequest(context) {
         const r = await fetch(new URL("/release.json", url.origin));
         if (r.ok) rev = (await r.json()).revision || rev;
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, revenue_last_7d: revenueRow ? (revenueRow.total || 0) : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, vetted_no_experiment: vettedNoExpRow ? vettedNoExpRow.n : 0, noise_24h: noiseRow ? noiseRow.n : 0, time: new Date().toISOString() });
+      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, revenue_last_7d: revenueRow ? (revenueRow.total || 0) : 0, revenue_total: revenueTotalRow ? (revenueTotalRow.total || 0) : 0, spent_total: spentTotalRow ? (spentTotalRow.total || 0) : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, vetted_no_experiment: vettedNoExpRow ? vettedNoExpRow.n : 0, noise_24h: noiseRow ? noiseRow.n : 0, time: new Date().toISOString() });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

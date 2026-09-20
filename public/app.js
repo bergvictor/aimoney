@@ -172,6 +172,17 @@ const reviewDecisionLine = (o) => {
   return `<div class="review-decision muted">${parts.join(" · ")}</div>`;
 };
 
+// Review brief line: the latest brief summary under the decision line, so the
+// vet-vs-kill call needs no drawer round-trip. Bare rows read "No brief yet"
+// (unproven, not empty); the excerpt is null-safe from the list API.
+const reviewBriefLine = (o) => {
+  // Scope the excerpt temp to the render block below.
+  {
+    const s = String(o.brief_summary || "").replace(/\s+/g, " ").trim().slice(0, 200);
+    return `<div class="review-brief muted">${esc(s || "No brief yet")}</div>`;
+};
+};
+
 function renderReview() {
   const rows = state.reviewList.filter((o) => !state.zeroOnly || isZeroSpend(o));
   const max = Math.max(1, ...rows.map((o) => o.score || 0));
@@ -181,6 +192,7 @@ function renderReview() {
       <td><div class="opp-title">${esc(o.title)} <span class="cat muted">· ${esc(o.category)}</span></div>
         <div class="opp-sub">${esc(o.one_liner || "")}</div>
         ${reviewDecisionLine(o)}
+        ${reviewBriefLine(o)}
         <div class="review-actions">
           <button class="btn small" data-vet="${o.id}" type="button">Vet</button>
           <button class="btn small ghost danger" data-kill="${o.id}" type="button">Kill</button>
@@ -429,6 +441,7 @@ function renderExperiments() {
   const vetted = state.health && typeof state.health.vetted_last_7d === "number" ? state.health.vetted_last_7d : null;
   const vettedNoExp = state.health && typeof state.health.vetted_no_experiment === "number" ? state.health.vetted_no_experiment : null;
   const revenue = state.health && typeof state.health.revenue_last_7d === "number" ? state.health.revenue_last_7d : null;
+  const revenueTotal = state.health && typeof state.health.revenue_total === "number" ? state.health.revenue_total : null;
   let summary = exps.length
     ? `${exps.length} experiments · ${running} running · ${won} won`
     : (state.apiFailures.includes("/api/experiments")
@@ -437,6 +450,7 @@ function renderExperiments() {
   if (decisions !== null && vetted !== null) {
     let conv = `${decisions} decisions this week · ${vetted} vetted this week → ${exps.length} total experiments`;
     if (revenue !== null) conv += ` · ${moneyCents(revenue)} revenue this week`;
+    if (revenueTotal !== null) conv += ` · ${moneyCents(revenueTotal)} lifetime`;
     if (vettedNoExp !== null && vettedNoExp > 0) conv += ` · ${vettedNoExp} vetted, no experiment`;
     summary = `${summary} · ${conv}`;
   }

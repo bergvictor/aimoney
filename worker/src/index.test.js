@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker, { agentMoneyEstimates } from "./index.js";
+import worker, { agentMoneyEstimates, exactUrlTarget } from "./index.js";
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {
@@ -176,6 +176,57 @@ describe("slug-collision link-as-supports (audit 2026-09-20-round3 Task 3)", () 
     assert.ok(readme.includes("supports"), "README must say link-as-supports");
     assert.ok(readme.includes("reversible"), "README must say reversible");
     assert.ok(readme.includes("no status move"), "README must say no status move");
+  });
+});
+
+describe("exact-URL supports pre-pass (audit 2026-09-20-round1 Task 2)", () => {
+  it("links exact-URL matches as supports before triage, excluded from the classify prompt", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("Exact-URL supports pre-pass"), "worker lost the pre-pass block");
+    assert.ok(src.includes("exactUrlTarget(sig.url, oppUrls, linkedUrls)"), "pre-pass must match each taken signal by exact URL");
+    assert.ok(src.includes("SELECT id, source_url FROM opportunities"), "pre-pass lost the opportunity URL lookup");
+    assert.ok(src.includes("opportunity_id IS NOT NULL"), "pre-pass lost the linked-signal URL lookup");
+    assert.ok(src.includes("fresh.push(...rest)"), "pre-pass must exclude linked signals from the classify prompt");
+    assert.ok(src.includes("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?"), "pre-pass must set the signal parent");
+    assert.ok(src.includes("substr(notes || ?, -8000)"), "pre-pass must append evidence newest-kept");
+    assert.ok(src.includes("state.updated++"), "pre-pass links must count as updated");
+  });
+
+  it("adds no AI calls and no status moves, manual skip intact", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+  });
+
+  it("README states the exact-URL rule", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("exactly matches"), "README lost the exact-URL rule");
+    assert.ok(readme.includes("linked as supports before triage"), "README must say linked as supports before triage");
+    assert.ok(readme.includes("no AI call"), "README must say no AI call");
+  });
+});
+
+describe("exactUrlTarget", () => {
+  it("matches an existing opportunity source_url exactly", () => {
+    assert.equal(exactUrlTarget("https://x.com/a", [{ id: 7, source_url: "https://x.com/a" }], []), 7);
+  });
+
+  it("falls back to an already-linked signal URL", () => {
+    assert.equal(exactUrlTarget("https://x.com/b", [{ id: 7, source_url: "https://x.com/a" }], [{ url: "https://x.com/b", opportunity_id: 3 }]), 3);
+  });
+
+  it("returns null without an exact match", () => {
+    assert.equal(exactUrlTarget("https://x.com/c", [{ id: 7, source_url: "https://x.com/a" }], []), null);
+    assert.equal(exactUrlTarget("https://x.com/a/", [{ id: 7, source_url: "https://x.com/a" }], []), null);
+    assert.equal(exactUrlTarget("HTTPS://X.COM/A", [{ id: 7, source_url: "https://x.com/a" }], []), null);
+  });
+
+  it("never matches empty URLs on either side", () => {
+    assert.equal(exactUrlTarget("", [{ id: 7, source_url: "https://x.com/a" }], []), null);
+    assert.equal(exactUrlTarget(null, [], []), null);
+    assert.equal(exactUrlTarget("https://x.com/a", [{ id: 7, source_url: "" }], [{ url: "", opportunity_id: 3 }]), null);
   });
 });
 

@@ -384,6 +384,37 @@ describe("token modal + inline post-mortem (audit 2026-09-20-round3 Task 2)", ()
   });
 });
 
+describe("review brief line (audit 2026-09-20-round1 Task 1)", () => {
+  it("review rows render the brief summary under the decision line", () => {
+    assert.ok(js.includes("reviewBriefLine"), "app.js lost the reviewBriefLine helper");
+    assert.ok(js.includes("${reviewDecisionLine(o)}"), "renderReview lost reviewDecisionLine(o)");
+    assert.ok(js.includes("${reviewBriefLine(o)}"), "renderReview must render reviewBriefLine(o)");
+    assert.ok(js.indexOf("${reviewBriefLine(o)}") > js.indexOf("${reviewDecisionLine(o)}"), "brief line must sit under the decision line");
+    assert.ok(js.includes("o.brief_summary"), "brief line must reuse the list-API brief excerpt");
+    assert.ok(js.includes("review-brief muted"), "brief line must render as one muted line");
+  });
+
+  it("bare rows read No brief yet instead of rendering empty", () => {
+    assert.ok(js.includes("No brief yet"), "brief line lost the 'No brief yet' copy");
+    assert.ok(js.includes('s || "No brief yet"'), "brief line must fall back to 'No brief yet' when the excerpt is empty");
+  });
+});
+
+describe("lifetime revenue header (audit 2026-09-20-round1 Task 3)", () => {
+  it("experiments summary appends the lifetime figure, hidden on old backends", () => {
+    assert.ok(js.includes("revenue_total"), "app.js never reads health.revenue_total");
+    assert.ok(js.includes("moneyCents(revenueTotal)"), "exp summary must format revenue_total via moneyCents");
+    assert.ok(js.includes("} lifetime"), "exp summary lost the lifetime figure copy");
+    assert.ok(js.includes("revenueTotal !== null"), "lifetime line must hide when the key is absent (old backends)");
+  });
+
+  it("weekly revenue figure stays unchanged", () => {
+    assert.ok(js.includes("moneyCents(revenue)"), "exp summary lost the weekly revenue format");
+    assert.ok(js.includes("revenue this week"), "exp summary lost the 'revenue this week' copy");
+    assert.ok(js.indexOf("revenue this week") < js.indexOf("} lifetime"), "lifetime figure must sit next to the weekly figure");
+  });
+});
+
 describe("tolerant zero-spend match (audit 2026-09-20-round2 Task 3)", () => {
   // The matcher is extracted from the shipped source (not copied) so these
   // cases fail if app.js regresses to prefix matching or drops a phrasing.

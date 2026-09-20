@@ -45,6 +45,7 @@ function makeDB(seed = {}) {
       ...o,
       brief_count: data.briefs.filter((b) => b.opportunity_id === o.id).length,
       brief_first_steps: (() => { const bl = data.briefs.filter((b) => b.opportunity_id === o.id).sort((a, b) => (b.version || 0) - (a.version || 0)); return bl.length ? bl[0].first_steps : null; })(),
+      brief_summary: (() => { const bl = data.briefs.filter((b) => b.opportunity_id === o.id).sort((a, b) => (b.version || 0) - (a.version || 0)); return bl.length ? String(bl[0].summary ?? "").slice(0, 200) : null; })(),
       experiment_count: data.experiments.filter((e) => e.opportunity_id === o.id).length,
     }));
     return { results: rows };
@@ -116,12 +117,21 @@ function makeDB(seed = {}) {
       return oks[0] || null;
     }
     if (sql.includes("FROM experiments") && sql.includes("SUM(revenue_cents)")) {
+      const revenueLifetime = !sql.includes("-7 days");
       const cutoff = Date.now() - 7 * 86400000;
       let total = 0;
       for (const e of data.experiments) {
         if (e.status !== "won" && e.status !== "lost") continue;
         const ms = Date.parse(e.ended_at || "");
-        if (Number.isFinite(ms) && ms >= cutoff) total += (Number(e.revenue_cents) || 0);
+        if (revenueLifetime || (Number.isFinite(ms) && ms >= cutoff)) total += (Number(e.revenue_cents) || 0);
+      }
+      return { total };
+    }
+    if (sql.includes("FROM experiments") && sql.includes("SUM(spent_cents)")) {
+      let total = 0;
+      for (const e of data.experiments) {
+        if (e.status !== "won" && e.status !== "lost") continue;
+        total += (Number(e.spent_cents) || 0);
       }
       return { total };
     }
@@ -868,6 +878,96 @@ describe("closed-experiment money in ledger (audit 2026-09-20-round3 Task 1)", (
       { method: "PATCH", token: "secret", body: { result: "updated" } }, db);
     assert.equal(r.status, 200);
     assert.equal(db.data.opportunities[0].notes, before);
+  });
+});
+
+describe("review brief summary (audit 2026-09-20-round1 Task 1)", () => {
+  it("list SQL selects the latest brief summary excerpt per row", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "[[path]].js"), "utf8");
+    assert.ok(src.includes("AS brief_summary"), "listOpportunities lost the brief summary subquery");
+    assert.ok(src.includes("substr(b.summary, 1, 200)"), "summary excerpt must truncate to ~200 chars in SQL");
+    assert.ok(src.includes("ORDER BY b.version DESC LIMIT 1"), "excerpt must take the latest brief version");
+  });
+
+  it("returns the summary excerpt, null when the row has no brief", async () => {
+    const db = makeDB({
+      opportunities: oppSeed(),
+      briefs: [
+        { id: 1, opportunity_id: 2, version: 1, summary: "Old summary", first_steps: "1. Old step" },
+        { id: 2, opportunity_id: 2, version: 2, summary: "New summary", first_steps: "1. New step" },
+      ],
+    });
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities?unreviewed=1&sort=oldest", {}, db);
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.body.opportunities.map((o) => [o.id, o]));
+    assert.equal(byId[2].brief_summary, "New summary");
+    assert.equal(byId[3].brief_summary, null);
+  });
+
+  it("truncates long summaries to 200 chars like the SQL substr", async () => {
+    const db = makeDB({
+      opportunities: oppSeed(),
+      briefs: [{ id: 1, opportunity_id: 2, version: 1, summary: "x".repeat(250), first_steps: "" }],
+    });
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities", {}, db);
+    assert.equal(r.status, 200);
+    const row = r.body.opportunities.find((o) => o.id === 2);
+    assert.equal(row.brief_summary.length, 200);
+  });
+
+  it("leaves ledger order, scoring, and writes untouched", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities", {}, db);
+    assert.deepEqual(r.body.opportunities.map((o) => o.id), [1, 2, 3]);
+    const byId = Object.fromEntries(r.body.opportunities.map((o) => [o.id, o]));
+    assert.equal(byId[2].score, 6000);
+    assert.equal(byId[1].score, 16000);
+  });
+});
+
+describe("lifetime revenue/spend totals (audit 2026-09-20-round1 Task 3)", () => {
+  it("reports revenue_total/spent_total over all won/lost, no date bound", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: daysAgo(2), revenue_cents: 50000, spent_cents: 1200 },
+        { id: 2, opportunity_id: 1, status: "lost", ended_at: daysAgo(6), revenue_cents: 700, spent_cents: 300 },
+        { id: 3, opportunity_id: 1, status: "won", ended_at: daysAgo(10), revenue_cents: 99999, spent_cents: 5000 },
+        { id: 4, opportunity_id: 1, status: "running", ended_at: "", revenue_cents: 12345, spent_cents: 999 },
+        { id: 5, opportunity_id: 1, status: "lost", ended_at: "", revenue_cents: 111, spent_cents: 11 },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.revenue_total, 150810);
+    assert.equal(r.body.spent_total, 6511);
+  });
+
+  it("keeps the weekly revenue figure unchanged", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: daysAgo(2), revenue_cents: 50000 },
+        { id: 3, opportunity_id: 1, status: "won", ended_at: daysAgo(10), revenue_cents: 99999 },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.revenue_last_7d, 50000);
+    assert.equal(r.body.revenue_total, 149999);
+  });
+
+  it("keeps lifetime totals alongside every existing health key", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "revenue_last_7d", "revenue_total", "spent_total", "time"]) {
+      assert.ok(k in r.body, "health missing " + k);
+    }
+    assert.equal(r.body.revenue_total, 0);
+    assert.equal(r.body.spent_total, 0);
   });
 });
 
