@@ -53,7 +53,7 @@ describe("zero-spend starter (Task 1)", () => {
 
   it("Zero spend chip filters capital_needed $0 rows", () => {
     assert.ok(js.includes("isZeroSpend"), "app.js lost the isZeroSpend helper");
-    assert.ok(js.includes('startsWith("$0")'), "zero-spend must match capital_needed starting with $0");
+    assert.ok(js.includes("0\\b|free\\b|none\\b"), "zero-spend must tolerate bare 0/free/none phrasings");
     assert.ok(js.includes("state.zeroOnly"), "app.js lost the zeroOnly filter state");
     assert.ok(js.includes("chip.dataset.zero"), "chip handler ignores the Zero spend chip");
   });
@@ -197,7 +197,7 @@ describe("add-modal money fields (audit 2026-09-20 Task 2)", () => {
 
   it("a manual $0 add flows to the Zero spend filter", () => {
     assert.ok(js.includes("isZeroSpend"), "app.js lost the isZeroSpend helper");
-    assert.ok(js.includes('startsWith("$0")'), "zero-spend must match capital_needed starting with $0");
+    assert.ok(js.includes("\\$0|0\\b"), "manual $0 rows must still match the Zero spend chip");
     assert.ok(js.includes('capital_needed: $("#m-capital").value.trim()'), "manual adds must POST capital_needed so $0 rows match the chip");
   });
 });
@@ -292,5 +292,83 @@ describe("experiment money in cents (audit 2026-09-20 Task 4)", () => {
     assert.ok(js.includes("moneyCents(e.spent_cents)"), "board must format spent_cents via moneyCents");
     assert.ok(js.includes("} rev</span>"), "board lost the revenue figure copy");
     assert.ok(js.includes("} spent</span>"), "board lost the spend figure copy");
+  });
+});
+
+describe("strip Vet/Kill (audit 2026-09-20-round2 Task 1)", () => {
+  it("strip shows Vet/Kill when the top pick carries UNREVIEWED, reusing the review handlers", () => {
+    assert.ok(js.includes('String(top.notes || "").includes("UNREVIEWED")'), "strip lost its UNREVIEWED gate");
+    assert.ok(js.includes('id="start-here-vet"'), "strip lost its Vet button");
+    assert.ok(js.includes('id="start-here-kill"'), "strip lost its Kill button");
+    assert.ok(js.includes("vetOpportunity(top.id)"), "strip Vet must reuse vetOpportunity");
+    assert.ok(js.includes("killOpportunity(top.id)"), "strip Kill must reuse killOpportunity");
+  });
+
+  it("vetted top picks render the strip unchanged (drawer link only)", () => {
+    assert.ok(js.includes("(needsReview ?"), "strip Vet/Kill must render only when needsReview");
+    assert.ok(js.includes("if (needsReview)"), "strip Vet/Kill listeners must attach only when needsReview");
+    assert.ok(js.includes('id="start-here-open"'), "strip lost its drawer opener button");
+  });
+
+  it("vet keeps the Log-experiment handoff toast and refresh", () => {
+    assert.ok(js.includes("Vetted — log the experiment"), "vet toast lost the next-step copy");
+    assert.ok(js.includes("openExperimentModal(null, id)"), "vet handoff must reuse openExperimentModal(null, id)");
+    assert.ok(js.includes("await refresh()"), "vet must refresh after the decision");
+  });
+});
+
+describe("one-click Lose (audit 2026-09-20-round2 Task 2)", () => {
+  it("planned/running cards show Lose; orphaned cards never do", () => {
+    assert.ok(js.includes("data-lose-exp"), "board lost the Lose button");
+    assert.ok(js.includes('(e.status === "planned" || e.status === "running") && !e.orphaned'), "Lose must show only on planned/running, non-orphaned cards");
+    assert.ok(js.includes(">Lose</button>"), "Lose button lost its label");
+  });
+
+  it("one click + one prompt line PATCHes lost with that line as result and post-mortem", () => {
+    assert.ok(js.includes("loseExperiment"), "app.js lost the loseExperiment handler");
+    assert.ok(js.includes("loseExperiment(Number("), "Lose click must call loseExperiment with the card id");
+    assert.ok(js.includes("One-line post-mortem (required to close as lost):"), "Lose lost its post-mortem prompt");
+    assert.ok(js.includes("Close cancelled — post-mortem required."), "Lose lost its empty-line cancel toast");
+    assert.ok(js.includes("result: pm.trim(), post_mortem: pm.trim()"), "Lose must send the prompt line as both result and post_mortem");
+    assert.ok(js.includes("Experiment closed as lost"), "Lose lost its success toast");
+    assert.ok(js.includes('if (ev.target.closest("[data-lose-exp]")) return;'), "card clicks must ignore the Lose button");
+  });
+
+  it("Lose delegates off #board like Start and stays token-gated", () => {
+    assert.equal(js.split('$("#board").addEventListener').length - 1, 2, "board must delegate both Start and Lose clicks");
+    assert.ok(js.includes("b.dataset.loseExp"), "Lose delegation must read the card id from data-lose-exp");
+    assert.ok(js.includes("Human-pressed, one decision"), "Lose must stay a human decision");
+  });
+});
+
+describe("tolerant zero-spend match (audit 2026-09-20-round2 Task 3)", () => {
+  // The matcher is extracted from the shipped source (not copied) so these
+  // cases fail if app.js regresses to prefix matching or drops a phrasing.
+  const isZeroSpendSrc = js.match(/const isZeroSpend = \(o\) =>\s*(\/[^;]*\/i)\.test/);
+  assert.ok(isZeroSpendSrc, "isZeroSpend must stay a single case-insensitive regex test");
+  const isZeroSpendRe = new RegExp(isZeroSpendSrc[1].slice(1, -2), "i");
+
+  it("matches $0, bare 0, free, and none case-insensitively", () => {
+    for (const c of ["$0", "$0-200/mo tools", "  $0 + 10 hours", "0", "0 USD", "Free", "free trial", "None", "none yet"]) {
+      assert.ok(isZeroSpendRe.test(c), `should match zero-spend: ${JSON.stringify(c)}`);
+    }
+  });
+
+  it("rejects non-zero, empty, and near-miss phrasings", () => {
+    for (const c of ["", "unknown", "$100-400/mo telco+AI", "$50-200/mo", "$5", "10 hours", "freelancer fees", "nonetheless"]) {
+      assert.ok(!isZeroSpendRe.test(c), `should not match zero-spend: ${JSON.stringify(c)}`);
+    }
+  });
+
+  it("seeds keep their $0 classification (none uses a newly-matched phrasing)", () => {
+    const seedSql = readFileSync(join(ROOT, "..", "d1", "seed.sql"), "utf8");
+    for (const c of ["$0", "$0-200/mo tools", "$0-100/mo", "$0-300/mo", "$0-500", "$0-200/mo"]) {
+      assert.ok(seedSql.includes(`'${c}'`), `seed lost capital ${JSON.stringify(c)} — recheck classification`);
+      assert.ok(isZeroSpendRe.test(c), `seed should match zero-spend: ${JSON.stringify(c)}`);
+    }
+    for (const c of ["$100-400/mo telco+AI", "$50-200/mo"]) {
+      assert.ok(seedSql.includes(`'${c}'`), `seed lost capital ${JSON.stringify(c)} — recheck classification`);
+      assert.ok(!isZeroSpendRe.test(c), `seed should not match zero-spend: ${JSON.stringify(c)}`);
+    }
   });
 });

@@ -162,3 +162,34 @@ describe("extra brief on old backlog (static guard)", () => {
     assert.ok(src.includes("state.ai_calls < MAX_AI_CALLS"), "extra brief must respect MAX_AI_CALLS");
   });
 });
+
+describe("agentMoneyEstimates zero-spend normalization (audit 2026-09-20-round2 Task 3)", () => {
+  it("prefixes bare 0/free/none phrasings with $0, raw phrasing preserved", () => {
+    assert.equal(agentMoneyEstimates({ capital_needed: "Free" }).capital_needed, "$0 Free");
+    assert.equal(agentMoneyEstimates({ capital_needed: "none" }).capital_needed, "$0 none");
+    assert.equal(agentMoneyEstimates({ capital_needed: "0" }).capital_needed, "$0 0");
+    assert.equal(agentMoneyEstimates({ capital_needed: "  FREE trial  " }).capital_needed, "$0 FREE trial");
+  });
+
+  it("leaves $0-form, non-zero, and empty capital untouched", () => {
+    assert.equal(agentMoneyEstimates({ capital_needed: "$0-200/mo tools" }).capital_needed, "$0-200/mo tools");
+    assert.equal(agentMoneyEstimates({ capital_needed: "$100/mo" }).capital_needed, "$100/mo");
+    assert.equal(agentMoneyEstimates({ capital_needed: "unknown" }).capital_needed, "unknown");
+    assert.equal(agentMoneyEstimates({ capital_needed: "freelancer fees" }).capital_needed, "freelancer fees");
+    assert.equal(agentMoneyEstimates({}).capital_needed, "");
+  });
+
+  it("normalized values still fit the 120-char column", () => {
+    const m = agentMoneyEstimates({ capital_needed: "free " + "x".repeat(200) });
+    assert.ok(m.capital_needed.startsWith("$0 free "));
+    assert.equal(m.capital_needed.length, 120);
+  });
+
+  it("same AI budget, no status moves, manual skip intact", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+  });
+});

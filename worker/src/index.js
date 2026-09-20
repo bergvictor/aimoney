@@ -142,16 +142,22 @@ import { clamp10, slugify, scoreOf, effectiveScore, parseJsonLines, repairJson }
 // est_monthly_high, capital_needed, and time_to_first_dollar for "new" rows.
 // Missing/malformed keys default safely (0/0/''/''); an inverted range clamps
 // high up to low instead of rejecting (the API's 400 guard must never fire on
-// agent rows, so a bad estimate can never 500 the cron pass). Pure for tests.
+// agent rows, so a bad estimate can never 500 the cron pass). Zero-spend
+// phrasings ("free"/"none"/bare "0", any case) normalize to "$0 …"-form with
+// the raw phrasing kept after the prefix (reversible at vet time). Pure for tests.
 export function agentMoneyEstimates(v) {
   const o = (v && typeof v === "object") ? v : {};
   const est_monthly_low = Math.max(0, Math.floor(Number(o.est_monthly_low) || 0));
   let est_monthly_high = Math.max(0, Math.floor(Number(o.est_monthly_high) || 0));
   if (est_monthly_high < est_monthly_low) est_monthly_high = est_monthly_low;
+  const rawCapital = String(o.capital_needed || "");
+  const capital_needed = (!/^\s*\$0/.test(rawCapital) && /^\s*(0\b|free\b|none\b)/i.test(rawCapital))
+    ? ("$0 " + rawCapital.trim()).slice(0, 120)
+    : rawCapital.slice(0, 120);
   return {
     est_monthly_low,
     est_monthly_high,
-    capital_needed: String(o.capital_needed || "").slice(0, 120),
+    capital_needed,
     time_to_first_dollar: String(o.time_to_first_dollar || "").slice(0, 120),
   };
 }

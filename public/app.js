@@ -75,10 +75,10 @@ document.querySelectorAll(".tab").forEach((tab) => {
 activateTab(new URLSearchParams(location.search).get("tab") || "priority", false);
 
 /* ---- zero-spend starter: hero strip + $0 filter (read-only) ---- */
-// A row is zero-spend when capital_needed starts with "$0" ("$0",
-// "$0-200/mo tools", ...). Scoring, status, and the API are unchanged.
+// A row is zero-spend when capital_needed reads as $0: "$0…" in any spacing,
+// or a bare "0", "free", or "none" (case-insensitive; the model writes verbatim).
 const isZeroSpend = (o) =>
-  String((o && o.capital_needed) || "").trim().startsWith("$0");
+  /^\s*(\$0|0\b|free\b|none\b)/i.test(String((o && o.capital_needed) || ""));
 
 const topOpportunity = (opps) =>
   (opps || []).filter((o) => o.status !== "killed" && o.status !== "paused").sort((a, b) => (b.score || 0) - (a.score || 0))[0] || null;
@@ -89,7 +89,9 @@ const firstStepsFirstLine = (brief) =>
 // "Start here today" strip: the #1-by-score opportunity with its $/mo range,
 // capital to start, and the brief's first next action. The brief line loads
 // via one detail fetch per top pick (cached in state.topBriefText); the
-// button deep-links into the drawer via openDrawer. Read-only.
+// button deep-links into the drawer via openDrawer. When the top pick still
+// carries UNREVIEWED, the strip also shows Vet/Kill reusing vetOpportunity /
+// killOpportunity (same toasts + refresh); vetted picks keep the drawer link only.
 function renderStartHere() {
   const el = $("#start-here");
   if (!el) return;
@@ -99,6 +101,7 @@ function renderStartHere() {
   const nextAction = cached !== undefined
     ? (cached || "No brief yet — open the drawer for facts.")
     : "Loading next action…";
+  const needsReview = String(top.notes || "").includes("UNREVIEWED");
   el.classList.remove("hidden");
   el.innerHTML =
     `<div style="background:var(--green-wash);border:1px solid var(--green);border-radius:8px;padding:10px 12px;margin-bottom:12px">` +
@@ -106,9 +109,15 @@ function renderStartHere() {
     `<p class="muted" style="margin:0 0 8px;font-size:13px"><span class="mono">${money(top.est_monthly_low, top.est_monthly_high)}/mo</span>` +
     ` · <span>Capital: ${esc(top.capital_needed || "—")}</span>` +
     ` · <span>Next: ${esc(nextAction)}</span></p>` +
-    `<p style="margin:0"><button id="start-here-open" class="btn small" type="button">Open in drawer</button></p>` +
+    `<p style="margin:0"><button id="start-here-open" class="btn small" type="button">Open in drawer</button>` +
+    (needsReview ? ` <button id="start-here-vet" class="btn small" type="button">Vet</button> <button id="start-here-kill" class="btn small ghost danger" type="button">Kill</button>` : "") +
+    `</p>` +
     `</div>`;
   $("#start-here-open").addEventListener("click", () => openDrawer(top.id));
+  if (needsReview) {
+    $("#start-here-vet").addEventListener("click", () => vetOpportunity(top.id));
+    $("#start-here-kill").addEventListener("click", () => killOpportunity(top.id));
+  }
   if (cached === undefined) {
     api(`/api/opportunities/${top.id}`).then((d) => {
       state.topBriefText[top.id] = firstStepsFirstLine(d.briefs && d.briefs[0]);
@@ -334,6 +343,25 @@ async function startExperiment(id) {
   } catch (e) { toast(`Start failed: ${e.message}`); }
 }
 
+// One-click Lose for planned/running experiments: one prompt() for the
+// post-mortem line, then a single PATCH to lost sending that line as both
+// result and post_mortem so the API closure gate holds unchanged. Token-gated
+// like startExperiment; orphaned cards never render the button; an empty
+// prompt line cancels with the row untouched. Human-pressed, one decision.
+async function loseExperiment(id) {
+  if (!state.token) return toast("Enter the admin token first.");
+  const pm = prompt("One-line post-mortem (required to close as lost):");
+  if (!pm || !pm.trim()) return toast("Close cancelled — post-mortem required.");
+  try {
+    await api(`/api/experiments/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status: "lost", result: pm.trim(), post_mortem: pm.trim() }),
+    });
+    toast("Experiment closed as lost");
+    await refresh();
+  } catch (e) { toast(`Close failed: ${e.message}`); }
+}
+
 function renderExperiments() {
   const exps = state.experiments;
   $("#exp-count").textContent = exps.length || "";
@@ -376,11 +404,13 @@ function renderExperiments() {
           <div class="meta">${statusPill(e.status)}
             <span class="muted mono">${esc(e.result ? `→ ${e.result.slice(0, 40)}` : (e.target || ""))}</span></div>
           ${e.status === "planned" && !e.orphaned ? `<p style="margin:6px 0 0"><button class="btn small" data-start-exp="${e.id}" type="button">Start</button></p>` : ""}
+          ${(e.status === "planned" || e.status === "running") && !e.orphaned ? `<p style="margin:6px 0 0"><button class="btn small ghost danger" data-lose-exp="${e.id}" type="button">Lose</button></p>` : ""}
         </div>`).join("") || `<p class="muted">—</p>`) + `</div>`;
   }).join("");
   document.querySelectorAll("#board .card").forEach((c) => {
     c.addEventListener("click", (ev) => {
       if (ev.target.closest("[data-start-exp]")) return;
+      if (ev.target.closest("[data-lose-exp]")) return;
       if (c.dataset.orphan === "1") return toast("Orphaned experiment — its opportunity was deleted.");
       openDrawer(Number(c.dataset.opp), Number(c.dataset.id));
     });
@@ -755,6 +785,15 @@ $("#board").addEventListener("click", (ev) => {
   if (!b) return;
   ev.stopPropagation();
   startExperiment(Number(b.dataset.startExp));
+});
+
+// Delegated one-click Lose: mirrors the Start listener above (cards re-render
+// on every refresh, so delegation covers all Lose buttons the same way).
+$("#board").addEventListener("click", (ev) => {
+  const b = ev.target.closest("[data-lose-exp]");
+  if (!b) return;
+  ev.stopPropagation();
+  loseExperiment(Number(b.dataset.loseExp));
 });
 
 /* ---- manual research trigger ---- */

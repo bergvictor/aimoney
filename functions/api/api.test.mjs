@@ -825,3 +825,38 @@ describe("health (G4)", () => {
     assert.deepEqual(Object.keys(r.body).sort(), ["scoring", "worker_url", "writes_enabled"]);
   });
 });
+
+describe("one-click Lose (audit 2026-09-20-round2 Task 2)", () => {
+  it("PATCH to lost with one line as result + post-mortem closes and stamps ended_at", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "lost", result: "2/10 replies, 0 pilots", post_mortem: "2/10 replies, 0 pilots" } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.status, "lost");
+    assert.equal(db.data.experiments[0].status, "lost");
+    assert.ok(db.data.experiments[0].ended_at);
+  });
+
+  it("401s without the admin token, row untouched", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", body: { status: "lost", result: "x", post_mortem: "x" } }, db);
+    assert.equal(r.status, 401);
+    assert.equal(db.data.experiments[0].status, "planned");
+    assert.equal(db.data.experiments[0].ended_at, "");
+  });
+
+  it("closure gate unchanged: empty result or post-mortem still 400s, row untouched", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const noResult = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "lost", result: "  ", post_mortem: "pm" } }, db);
+    assert.equal(noResult.status, 400);
+    assert.ok(noResult.body.fields && noResult.body.fields.result);
+    const noPm = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "lost", result: "r", post_mortem: "" } }, db);
+    assert.equal(noPm.status, 400);
+    assert.ok(noPm.body.fields && noPm.body.fields.post_mortem);
+    assert.equal(db.data.experiments[0].status, "planned");
+    assert.equal(db.data.experiments[0].ended_at, "");
+  });
+});
