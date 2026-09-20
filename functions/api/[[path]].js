@@ -15,6 +15,9 @@ const clamp10 = (v, dflt) => {
   return Math.min(10, Math.max(1, Math.round(n)));
 };
 
+// Ledger money: integer cents to fixed-2dp dollars ($10.50, never $10.5).
+// Mirrors public/app.js moneyCents so drawer and ledger agree.
+const centsDollars = (cents) => "$" + (Number(cents) / 100).toFixed(2);
 // effectiveScore shared via worker/src/lib.js (F3); scoreOf deduped (F6).
 // (local duplicate removed; see import above)
 
@@ -269,7 +272,8 @@ async function createExperiment(request, env) {
   if (status === "won" || status === "lost") {
     const day = nowIso.slice(0, 10);
     const oneLine = String(b.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
-    const line = "[" + day + " outcome] Experiment " + String.fromCharCode(34) + String(b.name || "").slice(0, 120) + String.fromCharCode(34) + " " + status + ": " + oneLine;
+    const moneyBit = " (" + centsDollars(revenue_cents) + " rev / " + centsDollars(spent_cents) + " spent)";
+    const line = "[" + day + " outcome] Experiment " + String.fromCharCode(34) + String(b.name || "").slice(0, 120) + String.fromCharCode(34) + " " + status + ": " + oneLine + moneyBit;
     await env.DB.prepare(
       "UPDATE opportunities SET notes = substr(notes || ?, -8000) WHERE id = ?"
     ).bind(String.fromCharCode(10) + line, b.opportunity_id).run();
@@ -311,7 +315,8 @@ async function updateExperiment(request, env, id) {
     if (cur.status !== "won" && cur.status !== "lost" && cur.opportunity_id) {
       const day = nowIso.slice(0, 10);
       const oneLine = String(next.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
-      const line = `[${day} outcome] Experiment "${String(next.name || "").slice(0, 120)}" ${next.status}: ${oneLine}`;
+      const moneyBit = ` (${centsDollars(next.revenue_cents)} rev / ${centsDollars(next.spent_cents)} spent)`;
+      const line = `[${day} outcome] Experiment "${String(next.name || "").slice(0, 120)}" ${next.status}: ${oneLine}${moneyBit}`;
       await env.DB.prepare(
         "UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?"
       ).bind("\n" + line, cur.opportunity_id).run();

@@ -87,6 +87,8 @@ body {
 .chip.review { border-color: var(--amber); color: var(--amber); font-weight: 650; }
 .chip.review.active { background: var(--amber); border-color: var(--amber); color: #fff; }
 .review-actions { display: flex; gap: 6px; margin-top: 6px; }
+.pm-inline { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.pm-inline input { flex: 1 1 200px; font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); }
 .age-chip {
   font-family: var(--mono); font-size: 11px; white-space: nowrap;
   color: var(--amber); background: var(--amber-wash);

@@ -153,6 +153,32 @@ describe("agentMoneyEstimates", () => {
   });
 });
 
+describe("slug-collision link-as-supports (audit 2026-09-20-round3 Task 3)", () => {
+  it("links the colliding signal to the existing row, never drops it", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("Slug collision: link as supports"), "worker lost the collision rule comment");
+    assert.ok(src.includes("SELECT id FROM opportunities WHERE slug = ?"), "collision lost the existing-row lookup by slug");
+    assert.ok(src.includes("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?"), "collision must set the signal parent");
+    assert.ok(src.includes("substr(notes || ?, -8000)"), "collision must append evidence newest-kept");
+    assert.ok(src.includes("[signal ${new Date().toISOString().slice(0, 10)}]"), "collision must reuse the supports evidence line");
+    assert.ok(src.includes("state.updated++"), "collision-as-supports must count as updated");
+  });
+
+  it("adds no AI calls and no status moves", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+  });
+
+  it("README states the collision rule", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("slug collision"), "README lost the collision rule");
+    assert.ok(readme.includes("supports"), "README must say link-as-supports");
+    assert.ok(readme.includes("reversible"), "README must say reversible");
+    assert.ok(readme.includes("no status move"), "README must say no status move");
+  });
+});
+
 describe("extra brief on old backlog (static guard)", () => {
   it("cron path briefs one extra oldest-unreviewed row past 48h within budget", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");

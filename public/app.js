@@ -116,7 +116,7 @@ function renderStartHere() {
   $("#start-here-open").addEventListener("click", () => openDrawer(top.id));
   if (needsReview) {
     $("#start-here-vet").addEventListener("click", () => vetOpportunity(top.id));
-    $("#start-here-kill").addEventListener("click", () => killOpportunity(top.id));
+    $("#start-here-kill").addEventListener("click", (ev) => killOpportunity(top.id, ev.currentTarget));
   }
   if (cached === undefined) {
     api(`/api/opportunities/${top.id}`).then((d) => {
@@ -201,7 +201,7 @@ function renderReview() {
     b.addEventListener("click", (ev) => { ev.stopPropagation(); vetOpportunity(Number(b.dataset.vet)); });
   });
   document.querySelectorAll("[data-kill]").forEach((b) => {
-    b.addEventListener("click", (ev) => { ev.stopPropagation(); killOpportunity(Number(b.dataset.kill)); });
+    b.addEventListener("click", (ev) => { ev.stopPropagation(); killOpportunity(Number(b.dataset.kill), b); });
   });
 }
 
@@ -242,11 +242,56 @@ function updateReviewChipTitle() {
     : `${state.reviewList.length} need review`;
 }
 
+// Inline one-line post-mortem row: replaces blocking prompt() with an in-page
+// input + Confirm/Cancel so a phone keeps context. Empty confirms cancel with
+// the row untouched; the API closure gate (result + post_mortem required)
+// stays unchanged. Returns false when a row is already open.
+function inlinePostMortem(container, { label, placeholder, confirmText, onSubmit, cancelToast }) {
+  if (!container) return false;
+  if (container.querySelector("[data-pm-input]")) return false;
+  const row = document.createElement("div");
+  row.className = "pm-inline";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.dataset.pmInput = "1";
+  input.placeholder = placeholder || label || "One-line post-mortem";
+  input.setAttribute("aria-label", label || "One-line post-mortem");
+  input.maxLength = 200;
+  const ok = document.createElement("button");
+  ok.type = "button";
+  ok.className = "btn small";
+  ok.textContent = confirmText || "Confirm";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn small ghost";
+  cancel.textContent = "Cancel";
+  const cleanup = () => row.remove();
+  cancel.addEventListener("click", (ev) => { ev.stopPropagation(); cleanup(); toast(cancelToast); });
+  const submit = () => {
+    const pm = input.value;
+    if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }
+    cleanup();
+    onSubmit(pm);
+  };
+  ok.addEventListener("click", (ev) => { ev.stopPropagation(); submit(); });
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
+  });
+  row.appendChild(input);
+  row.appendChild(ok);
+  row.appendChild(cancel);
+  container.appendChild(row);
+  input.focus();
+  return true;
+}
 function cleanUnreviewed(notes) {
   return String(notes || "").replace(/UNREVIEWED,?\s*/g, "").replace(/UNREVIEWED/g, "").trim();
 }
 
 async function vetOpportunity(id) {
+  if (!state.token) return openAdminModal("Enter the admin token first.");
+  // (modal gate above supersedes the toast gate on the next line)
   if (!state.token) return toast("Enter the admin token first.");
   const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
   if (!o) return;
@@ -264,10 +309,13 @@ async function vetOpportunity(id) {
   } catch (e) { toast(`Vet failed: ${e.message}`); }
 }
 
-async function killOpportunity(id) {
+async function killOpportunity(id, anchorEl) {
+  if (!state.token) return openAdminModal("Enter the admin token first.");
+  // (modal gate above supersedes the toast gate on the next line)
   if (!state.token) return toast("Enter the admin token first.");
-  const pm = prompt("One-line post-mortem (required to kill):");
-  if (!pm || !pm.trim()) return toast("Kill cancelled — post-mortem required.");
+  const killContainer = (anchorEl ? (anchorEl.closest(".review-actions") || anchorEl.closest(".card") || anchorEl.parentElement) : null) || document.querySelector("#ledger-body") || document.body;
+  const doKill = async (pm) => {
+  // (cancel handled by inline row: empty still cancels, row untouched)
   const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
   if (!o) return;
   const day = new Date().toISOString().slice(0, 10);
@@ -281,7 +329,10 @@ async function killOpportunity(id) {
     await refresh();
     await refreshReview();
     if (state.reviewOnly) renderLedger();
+    if (state.detail) openDrawer(state.detail.opportunity.id);
   } catch (e) { toast(`Kill failed: ${e.message}`); }
+  };
+  inlinePostMortem(killContainer, { label: "One-line post-mortem (required to kill):", placeholder: "One-line post-mortem (required to kill):", confirmText: "Kill", onSubmit: (pm) => doKill(pm), cancelToast: "Kill cancelled — post-mortem required." });
 }
 
 document.querySelectorAll(".filters .chip").forEach((chip) => {
@@ -332,6 +383,8 @@ const stalestOpenExp = (exps) => {
 // First candidate to start: 'Spec-ad sprint: 10 brands, 10 free ads'
 // (d1/seed.sql) — a human still presses it.
 async function startExperiment(id) {
+  if (!state.token) return openAdminModal("Enter the admin token first.");
+  // (modal gate above supersedes the toast gate on the next line)
   if (!state.token) return toast("Enter the admin token first.");
   try {
     await api(`/api/experiments/${id}`, {
@@ -343,15 +396,18 @@ async function startExperiment(id) {
   } catch (e) { toast(`Start failed: ${e.message}`); }
 }
 
-// One-click Lose for planned/running experiments: one prompt() for the
+// One-click Lose for planned/running experiments: one inline input for the
 // post-mortem line, then a single PATCH to lost sending that line as both
 // result and post_mortem so the API closure gate holds unchanged. Token-gated
 // like startExperiment; orphaned cards never render the button; an empty
-// prompt line cancels with the row untouched. Human-pressed, one decision.
-async function loseExperiment(id) {
+// inline line cancels with the row untouched. Human-pressed, one decision.
+async function loseExperiment(id, anchorEl) {
+  if (!state.token) return openAdminModal("Enter the admin token first.");
+  // (modal gate above supersedes the toast gate on the next line)
   if (!state.token) return toast("Enter the admin token first.");
-  const pm = prompt("One-line post-mortem (required to close as lost):");
-  if (!pm || !pm.trim()) return toast("Close cancelled — post-mortem required.");
+  const loseContainer = (anchorEl ? (anchorEl.closest(".card") || anchorEl.closest(".review-actions") || anchorEl.parentElement) : null) || document.querySelector("#board") || document.body;
+  const doLose = async (pm) => {
+  // (cancel handled by inline row: empty still cancels, row untouched)
   try {
     await api(`/api/experiments/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
@@ -360,6 +416,8 @@ async function loseExperiment(id) {
     toast("Experiment closed as lost");
     await refresh();
   } catch (e) { toast(`Close failed: ${e.message}`); }
+  };
+  inlinePostMortem(loseContainer, { label: "One-line post-mortem (required to close as lost):", placeholder: "One-line post-mortem (required to close as lost):", confirmText: "Lose", onSubmit: (pm) => doLose(pm), cancelToast: "Close cancelled — post-mortem required." });
 }
 
 function renderExperiments() {
@@ -510,7 +568,7 @@ async function openDrawer(id, focusExp = null) {
         <div class="card" data-exp="${e.id}" ${focusExp === e.id ? `style="border-color:var(--green)"` : ""}>
           <h4>${esc(e.name)}</h4>
           <p>${esc(e.hypothesis || "")}</p>
-          <div class="meta">${statusPill(e.status)}<span class="muted mono">${esc(e.result || e.target || "")}</span></div>
+          <div class="meta">${statusPill(e.status)}<span class="muted mono">${esc(e.result || e.target || "")}</span> <span class="muted mono">${moneyCents(e.revenue_cents || 0)} rev / ${moneyCents(e.spent_cents || 0)} spent${e.ended_at ? ` · ended ${esc(String(e.ended_at).slice(0, 10))}` : ""}</span></div>
           ${e.post_mortem ? `<p><b>Post-mortem:</b> ${esc(e.post_mortem)}</p>` : ""}
           <p style="margin-top:6px"><button class="btn small ghost" data-edit-exp="${e.id}" type="button">Update</button></p>
         </div>`).join("") : `<p class="muted">None yet.</p>`}
@@ -524,7 +582,7 @@ async function openDrawer(id, focusExp = null) {
     const drawerVet = $("#drawer-vet");
     if (drawerVet) drawerVet.addEventListener("click", (ev) => { ev.stopPropagation(); vetOpportunity(o.id).then(() => { if (state.detail) openDrawer(o.id); }); });
     const drawerKill = $("#drawer-kill");
-    if (drawerKill) drawerKill.addEventListener("click", (ev) => { ev.stopPropagation(); killOpportunity(o.id).then(() => { if (state.detail) openDrawer(o.id); }); });
+    if (drawerKill) drawerKill.addEventListener("click", (ev) => { ev.stopPropagation(); killOpportunity(o.id, ev.currentTarget); });
     renderAdminZone();
     $("#drawer").classList.remove("hidden");
     $("#drawer-scrim").classList.remove("hidden");
@@ -592,8 +650,9 @@ function renderAdminZone() {
       const note = $("#az-note").value.trim();
       const azStatus = $("#az-status").value;
       if (azStatus === "killed" && o.status !== "killed") {
-        const pm = prompt("One-line post-mortem (required to kill):");
-        if (!pm || !pm.trim()) return toast("Kill cancelled — post-mortem required.");
+        const azContainer = $("#admin-zone") || $("#drawer-body") || document.body;
+        const doAzKill = async (pm) => {
+        // (cancel handled by inline row: empty still cancels, row untouched)
         const day = new Date().toISOString().slice(0, 10);
         const killedNotes = `${cleanUnreviewed(o.notes)}\n[${day} killed] ${pm.trim()}${note ? `\n[${day} you] ${note}` : ""}`.trim().slice(-8000);
         try {
@@ -611,6 +670,8 @@ function renderAdminZone() {
           await refresh();
           openDrawer(o.id);
         } catch (e) { toast(`Save failed: ${e.message}`); }
+        };
+        inlinePostMortem(azContainer, { label: "One-line post-mortem (required to kill):", placeholder: "One-line post-mortem (required to kill):", confirmText: "Kill", onSubmit: (pm) => doAzKill(pm), cancelToast: "Kill cancelled — post-mortem required." });
         return;
       }
       const r = await api(`/api/opportunities/${o.id}`, {
@@ -658,6 +719,26 @@ function showModal(html) {
   return f;
 }
 
+// Token modal, reused by gated taps (vet/kill/start/lose): reuses the Admin
+// button's showModal block, then pins the dead-end toast text as a subnote so
+// a phone tap lands in the token field instead of a toast.
+function openAdminModal(subnote = "") {
+  const modal = $("#modal");
+  if (!modal.open) $("#btn-admin").click();
+  if (subnote) {
+    const f = $("#modal-form");
+    if (f && !f.querySelector("[data-admin-subnote]")) {
+      const p = document.createElement("p");
+      p.className = "muted";
+      p.dataset.adminSubnote = "1";
+      p.textContent = subnote;
+      const h3 = f.querySelector("h3");
+      if (h3 && h3.nextSibling) h3.parentNode.insertBefore(p, h3.nextSibling);
+      else f.prepend(p);
+    }
+  }
+  return $("#modal-form");
+}
 $("#btn-admin").addEventListener("click", () => {
   const f = showModal(`
     <h3>Admin token</h3>
@@ -793,7 +874,7 @@ $("#board").addEventListener("click", (ev) => {
   const b = ev.target.closest("[data-lose-exp]");
   if (!b) return;
   ev.stopPropagation();
-  loseExperiment(Number(b.dataset.loseExp));
+  loseExperiment(Number(b.dataset.loseExp), b);
 });
 
 /* ---- manual research trigger ---- */

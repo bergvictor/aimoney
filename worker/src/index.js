@@ -298,7 +298,17 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
           await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
             .bind(r.meta.last_row_id, sig.id).run();
         } catch {
-          await env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id).run();
+          // Slug collision: link as supports, not drop — reversible, notes
+          // newest-kept, no status move. The duplicate proposal is free
+          // corroborating evidence for the existing row.
+          const existing = await env.DB.prepare("SELECT id FROM opportunities WHERE slug = ?").bind(slug).first().catch(() => null);
+          if (existing && existing.id) {
+            state.updated++;
+            await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(existing.id, sig.id).run();
+            await env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, existing.id).run().catch(() => null);
+          } else {
+            await env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id).run();
+          }
         }
       } else if (v.action === "supports" && v.opportunity_id) {
         state.updated++;

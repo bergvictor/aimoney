@@ -207,10 +207,10 @@ describe("drawer Vet/Kill with post-mortem parity (audit 2026-09-20 Task 3)", ()
     assert.ok(js.includes('id="drawer-vet"'), "drawer lost its Vet button");
     assert.ok(js.includes('id="drawer-kill"'), "drawer lost its Kill button");
     assert.ok(js.includes("vetOpportunity(o.id)"), "drawer Vet must reuse vetOpportunity");
-    assert.ok(js.includes("killOpportunity(o.id)"), "drawer Kill must reuse killOpportunity");
+    assert.ok(js.includes("killOpportunity(o.id, ev.currentTarget)"), "drawer Kill must reuse killOpportunity with its button anchor");
   });
 
-  it("drawer admin status-to-killed routes through the same post-mortem prompt", () => {
+  it("drawer admin status-to-killed routes through the same post-mortem inline input", () => {
     assert.ok(js.includes('azStatus === "killed"'), "admin save must gate the killed transition");
     assert.ok(js.includes("One-line post-mortem (required to kill):"), "killed gate lost the post-mortem prompt");
     assert.ok(js.includes("Kill cancelled — post-mortem required."), "killed gate lost the cancel toast");
@@ -301,7 +301,7 @@ describe("strip Vet/Kill (audit 2026-09-20-round2 Task 1)", () => {
     assert.ok(js.includes('id="start-here-vet"'), "strip lost its Vet button");
     assert.ok(js.includes('id="start-here-kill"'), "strip lost its Kill button");
     assert.ok(js.includes("vetOpportunity(top.id)"), "strip Vet must reuse vetOpportunity");
-    assert.ok(js.includes("killOpportunity(top.id)"), "strip Kill must reuse killOpportunity");
+    assert.ok(js.includes("killOpportunity(top.id, ev.currentTarget)"), "strip Kill must reuse killOpportunity with its button anchor");
   });
 
   it("vetted top picks render the strip unchanged (drawer link only)", () => {
@@ -324,7 +324,7 @@ describe("one-click Lose (audit 2026-09-20-round2 Task 2)", () => {
     assert.ok(js.includes(">Lose</button>"), "Lose button lost its label");
   });
 
-  it("one click + one prompt line PATCHes lost with that line as result and post-mortem", () => {
+  it("one click + one inline line PATCHes lost with that line as result and post-mortem", () => {
     assert.ok(js.includes("loseExperiment"), "app.js lost the loseExperiment handler");
     assert.ok(js.includes("loseExperiment(Number("), "Lose click must call loseExperiment with the card id");
     assert.ok(js.includes("One-line post-mortem (required to close as lost):"), "Lose lost its post-mortem prompt");
@@ -338,6 +338,49 @@ describe("one-click Lose (audit 2026-09-20-round2 Task 2)", () => {
     assert.equal(js.split('$("#board").addEventListener').length - 1, 2, "board must delegate both Start and Lose clicks");
     assert.ok(js.includes("b.dataset.loseExp"), "Lose delegation must read the card id from data-lose-exp");
     assert.ok(js.includes("Human-pressed, one decision"), "Lose must stay a human decision");
+  });
+});
+
+describe("closed-experiment money in drawer (audit 2026-09-20-round3 Task 1)", () => {
+  it("drawer cards show fixed-2dp revenue/spend plus ended date", () => {
+    assert.ok(js.includes("moneyCents(e.revenue_cents || 0)"), "drawer lost its revenue figure");
+    assert.ok(js.includes("moneyCents(e.spent_cents || 0)"), "drawer lost its spend figure");
+    assert.ok(js.includes("rev /"), "drawer lost the '$X rev / $Y spent' copy");
+    assert.ok(js.includes("e.ended_at"), "drawer lost the ended_at date");
+    assert.ok(js.includes("· ended"), "drawer lost the ended date copy");
+  });
+
+  it("board cards keep their existing money figures unchanged", () => {
+    assert.ok(js.includes("moneyCents(e.revenue_cents)"), "board lost its revenue figure");
+    assert.ok(js.includes("moneyCents(e.spent_cents)"), "board lost its spend figure");
+    assert.ok(js.includes("} rev</span>"), "board lost the revenue figure copy");
+    assert.ok(js.includes("} spent</span>"), "board lost the spend figure copy");
+  });
+});
+
+describe("token modal + inline post-mortem (audit 2026-09-20-round3 Task 2)", () => {
+  it("Vet/Kill/Start/Lose open the admin modal when the token is missing", () => {
+    assert.ok(js.includes("function openAdminModal"), "app.js lost openAdminModal");
+    assert.ok(js.includes('openAdminModal("Enter the admin token first.")'), "gated taps must open the admin modal with the toast text as subnote");
+    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 4, "Vet/Kill/Start/Lose must all open the modal");
+    assert.ok(js.includes("[data-admin-subnote]"), "modal must pin the subnote");
+    assert.ok(js.includes('$("#btn-admin").click()'), "openAdminModal must reuse the Admin showModal block");
+  });
+
+  it("kill and lose use an inline one-line input, empty cancels, row untouched", () => {
+    assert.ok(js.includes("inlinePostMortem"), "app.js lost the inlinePostMortem helper");
+    assert.ok(js.includes("[data-pm-input]"), "inline row lacks its one-line input");
+    assert.ok(js.includes("Kill cancelled — post-mortem required."), "kill lost its empty-cancel toast");
+    assert.ok(js.includes("Close cancelled — post-mortem required."), "lose lost its empty-cancel toast");
+    assert.ok(js.includes("One-line post-mortem (required to kill):"), "kill lost its post-mortem copy");
+    assert.ok(js.includes("One-line post-mortem (required to close as lost):"), "lose lost its post-mortem copy");
+    assert.ok(!js.includes("const pm = prompt("), "app.js still blocks on prompt()");
+    assert.ok(css.includes(".pm-inline"), "styles lack the inline row");
+  });
+
+  it("API closure gate intact: result + post-mortem still required", () => {
+    assert.ok(js.includes("result: pm.trim(), post_mortem: pm.trim()"), "lose must still send result + post-mortem");
+    assert.ok(js.includes("killed] ${pm.trim()}"), "kill must still append the post-mortem");
   });
 });
 

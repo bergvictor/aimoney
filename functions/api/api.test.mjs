@@ -826,6 +826,51 @@ describe("health (G4)", () => {
   });
 });
 
+describe("closed-experiment money in ledger (audit 2026-09-20-round3 Task 1)", () => {
+  const oppMoney = () => ([
+    { id: 1, slug: "a", title: "A", status: "testing", value: 7, effort: 3, confidence: 5, fit: 8, score: 7000, notes: "seed notes", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+  ]);
+  const expMoney = (over = {}) => ([
+    { id: 1, opportunity_id: 1, name: "Landing test", hypothesis: "", status: "running", budget_cap: "", spent: "", metric: "", target: "", result: "", started_at: "2026-09-01T00:00:00Z", ended_at: "", post_mortem: "", revenue_cents: 0, spent_cents: 0, ...over },
+  ]);
+
+  it("PATCH close appends $X rev / $Y spent from cents, score untouched", async () => {
+    const db = makeDB({ opportunities: oppMoney(), experiments: expMoney() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "won", result: "12 signups in 7d", post_mortem: "headline worked", revenue_cents: 50000, spent_cents: 1250 } }, db);
+    assert.equal(r.status, 200);
+    const row = db.data.opportunities[0];
+    assert.equal(row.score, 7000);
+    assert.ok(row.notes.includes('outcome] Experiment "Landing test" won: 12 signups in 7d ($500.00 rev / $12.50 spent)'));
+  });
+
+  it("POST close appends $X rev / $Y spent, zero defaults to $0.00", async () => {
+    const db = makeDB({ opportunities: oppMoney() });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "W", status: "won", result: "made cash", post_mortem: "worked", revenue_cents: 1050, spent_cents: 0 } }, db);
+    assert.equal(r.status, 201);
+    const row = db.data.opportunities[0];
+    assert.ok(row.notes.includes('outcome] Experiment "W" won: made cash ($10.50 rev / $0.00 spent)'));
+    const db2 = makeDB({ opportunities: oppMoney() });
+    const r2 = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Z", status: "lost", result: "no sales", post_mortem: "wrong channel" } }, db2);
+    assert.equal(r2.status, 201);
+    assert.ok(db2.data.opportunities[0].notes.includes('outcome] Experiment "Z" lost: no sales ($0.00 rev / $0.00 spent)'));
+  });
+
+  it("editing a closed row still appends nothing", async () => {
+    const db = makeDB({
+      opportunities: oppMoney(),
+      experiments: expMoney({ status: "won", result: "old", post_mortem: "old pm", ended_at: "2026-09-10T00:00:00Z", revenue_cents: 100, spent_cents: 50 }),
+    });
+    const before = db.data.opportunities[0].notes;
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { result: "updated" } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(db.data.opportunities[0].notes, before);
+  });
+});
+
 describe("one-click Lose (audit 2026-09-20-round2 Task 2)", () => {
   it("PATCH to lost with one line as result + post-mortem closes and stamps ended_at", async () => {
     const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
