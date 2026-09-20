@@ -290,6 +290,11 @@ export async function onRequest(context) {
       const expRows = env.DB ? await env.DB.prepare("SELECT status, COUNT(*) AS n FROM experiments GROUP BY status").all().catch(() => ({ results: [] })) : { results: [] };
       const lastOk = env.DB ? await env.DB.prepare("SELECT finished_at, started_at FROM agent_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first().catch(() => null) : null;
       const oldestUnreviewed = env.DB ? await env.DB.prepare("SELECT created_at FROM opportunities WHERE notes LIKE '%UNREVIEWED%' ORDER BY created_at ASC, id ASC LIMIT 1").first().catch(() => null) : null;
+      // Lane metric, read-only from existing columns (no migration): decisions
+      // are won/lost rows closed in the window; vetted counts rows carrying
+      // the "[YYYY-MM-DD vetted]" tag (see vetOpportunity) touched in 7d.
+      const decisionsRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
+      const vettedRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%vetted]%' AND updated_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
       let oldest_unreviewed_age_h = null;
       let hours_since_last_ok_run = null;
       if (lastOk) {
@@ -308,7 +313,7 @@ export async function onRequest(context) {
         const r = await fetch(new URL("/release.json", url.origin));
         if (r.ok) rev = (await r.json()).revision || rev;
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, time: new Date().toISOString() });
+      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, time: new Date().toISOString() });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

@@ -320,6 +320,54 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
       } catch { /* malformed brief JSON: skip, briefs stay human-seeded */ }
     }
 
+    // When the review backlog is old (>48h), brief one extra oldest-unreviewed
+    // bare row per cron tick. Mirrors the brief pass above (retries:0 to stay
+    // within MAX_AI_CALLS); best-effort, lands next run on failure.
+    if (trigger === "cron" && bare && state.ai_calls < MAX_AI_CALLS && Date.now() - t0 < briefDeadline) {
+      const oldest = await env.DB.prepare(
+        "SELECT created_at FROM opportunities WHERE notes LIKE '%UNREVIEWED%' ORDER BY created_at ASC LIMIT 1"
+      ).first().catch(() => null);
+      const ageMs = oldest && oldest.created_at ? Date.now() - Date.parse(oldest.created_at) : NaN;
+      if (Number.isFinite(ageMs) && ageMs > 48 * 3600000) {
+        const extraBare = await env.DB.prepare(
+          `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
+           WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' AND o.id != ? ORDER BY o.created_at ASC LIMIT 1`
+        ).bind(bare.id).first().catch(() => null);
+        if (extraBare && state.ai_calls < MAX_AI_CALLS) {
+          try {
+            const sigs2 = await env.DB.prepare(
+              "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
+              .bind(extraBare.id).all().then((r) => r.results || []);
+            await mark("brief-ai");
+            const text2 = await aiComplete(env, state, {
+              model: AI_BRIEF, fallback: AI_CLASSIFY, maxTokens: BRIEF_TOKENS,
+              timeoutMs: 90000, retries: 0,
+              messages: [
+                { role: "system", content: "You write terse, practical research briefs. Reply with ONLY a JSON object, no prose." },
+                { role: "user", content:
+                  `Write a research brief for this AI money-making opportunity as ONE JSON object with EXACTLY these keys: summary, what_works, numbers, risks, first_steps. Example shape:\n` +
+                  `{"summary":"2-3 sentences","what_works":"tactics as bullet lines","numbers":[{"claim":"...","source":"..."}],"risks":"...","first_steps":"numbered lines for week 1"}.\n` +
+                  `If you lack verified facts for a section, write that explicitly instead of inventing specifics.\n` +
+                  `Opportunity: ${extraBare.title} — ${extraBare.one_liner}\nSignals:\n${sigs2.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") || "(none — use general knowledge, mark confidence accordingly)"}` },
+              ],
+            });
+            const m2 = String(text2).match(/\{[\s\S]*\}/);
+            const b2 = JSON.parse(repairJson(m2 ? m2[0] : "{}"));
+            if (String(b2.summary || "").trim() && String(b2.first_steps || "").trim()) {
+              await env.DB.prepare(
+              `INSERT INTO briefs (opportunity_id, version, summary, what_works,
+               numbers_json, risks, first_steps, sources_json, author)
+               VALUES (?,1,?,?,?,?,?,?,'agent')`
+              ).bind(extraBare.id, String(b2.summary || ""), String(b2.what_works || ""),
+                JSON.stringify(b2.numbers || []), String(b2.risks || ""),
+                String(b2.first_steps || ""),
+                JSON.stringify(sigs2.map((s) => ({ title: s.title, url: s.url })))).run();
+              state.briefs++;
+            }
+          } catch { /* extra brief is best-effort; lands next run */ }
+        }
+      }
+    }
     await finish("ok");
     return { status: "ok", ...state };
   } catch (e) {
@@ -393,7 +441,7 @@ export default {
       // wall clock, so it runs in waitUntil exactly like the cron path.
       // Watch progress at GET / and in the dashboard research log.
       ctx.waitUntil(runResearch(env, "manual").catch(() => null));
-      return json({ status: "accepted" }, 202);
+      return json({ status: "accepted", briefs_skipped: true, reason: "manual skips brief pass" }, 202);
     }
     return json({ error: "not found" }, 404);
   },

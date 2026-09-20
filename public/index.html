@@ -23,7 +23,7 @@
         <span id="agent-text">agent: …</span>
       </div>
       <div class="masthead-actions">
-        <button id="btn-run" class="btn ghost" type="button">Run research now</button>
+        <button id="btn-run" class="btn ghost" type="button">Run triage now (briefs on cron)</button>
         <button id="btn-admin" class="btn" type="button">Admin</button>
       </div>
     </div>
@@ -37,6 +37,7 @@
 </header>
 
 <main>
+  <div id="api-errors" class="error-banner hidden" role="alert"></div>
   <section id="tab-priority" class="tabpanel">
     <div class="toolbar">
       <div class="filters" role="group" aria-label="Status filter">

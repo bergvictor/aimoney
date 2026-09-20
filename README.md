@@ -67,10 +67,13 @@ Agent proposals enter as `researching` with an `UNREVIEWED` marker in notes and 
 ## Review flow (who vets, what moves)
 
 - The Priority tab's "Needs review (N · oldest 3d)" chip lists agent proposals oldest-first (`GET /api/opportunities?unreviewed=1&sort=oldest`); the age comes from `oldest_unreviewed_age_h` in `/api/health`.
-- A human admin vets each row: "Vet" clears the `UNREVIEWED` marker (keeps status, lifts the 6000 cap); "Kill" sets `killed` and requires a one-line post-mortem in notes.
+- A human admin vets each row: "Vet" clears the `UNREVIEWED` marker (keeps status, lifts the 6000 cap) and appends a `[YYYY-MM-DD vetted]` tag that `/api/health` counts as `vetted_last_7d`; "Kill" sets `killed` and requires a one-line post-mortem in notes.
 - `researching → testing` is a human decision: flip to `testing` when you start a real experiment (log it on the Experiments tab, move it `planned → running`). The agent never moves status.
 - The Experiments tab sorts each column stale-first with `Nd` age chips on `planned`/`running` cards (`days_in_status` from `/api/experiments`); an experiment whose opportunity was deleted keeps its card with an `orphaned` pill instead of vanishing.
 - Closing an experiment as `won`/`lost` requires `result` + `post_mortem`; `ended_at` stamps automatically. `running` stamps `started_at` when empty.
+- The Experiments header shows `X decisions this week · Y vetted → Z experiments` from `/api/health` (`decisions_last_7d` = `won`/`lost` with `ended_at` in 7d; `vetted_last_7d` = vetted-tag rows touched in 7d).
+- Manual `Run triage now (briefs on cron)` collects and triages only (`POST /run` 202 carries `briefs_skipped:true`); briefs land on cron ticks — one top-scored bare row plus, when the oldest unreviewed is older than 48h, one extra oldest-unreviewed bare row.
+- A failed API fetch shows a named error banner with Retry (and `db down` turns the agent pill red) instead of an empty board; `testing · 0 experiments` and `running exp · opp still researching` badges flag status mismatches read-only — the human still owns every status move.
 
 ## Seed vs live counts
 

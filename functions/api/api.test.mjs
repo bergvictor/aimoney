@@ -110,6 +110,26 @@ function makeDB(seed = {}) {
       const oks = data.runs.filter((r) => r.status === "ok").sort((a, b) => b.id - a.id);
       return oks[0] || null;
     }
+    if (sql.includes("FROM experiments") && sql.includes("ended_at") && sql.includes("COUNT(*)")) {
+      const cutoff = Date.now() - 7 * 86400000;
+      let n = 0;
+      for (const e of data.experiments) {
+        if (e.status !== "won" && e.status !== "lost") continue;
+        const ms = Date.parse(e.ended_at || "");
+        if (Number.isFinite(ms) && ms >= cutoff) n++;
+      }
+      return { n };
+    }
+    if (sql.includes("vetted]%") && sql.includes("COUNT(*)")) {
+      const cutoff = Date.now() - 7 * 86400000;
+      let n = 0;
+      for (const o of data.opportunities) {
+        if (!String(o.notes || "").includes("vetted]")) continue;
+        const ms = Date.parse(o.updated_at || "");
+        if (Number.isFinite(ms) && ms >= cutoff) n++;
+      }
+      return { n };
+    }
     return null;
   }
 
@@ -311,6 +331,50 @@ describe("orphaned experiments (round1 Task 3)", () => {
     assert.equal(byId[9].opportunity_title, null);
     assert.equal(byId[10].orphaned, false);
     assert.equal(byId[10].opportunity_title, "Seed one");
+  });
+});
+
+describe("decisions/week + vetted rate (round2 Task 1)", () => {
+  it("counts decisions_last_7d from won/lost closed in 7d", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: daysAgo(2) },
+        { id: 2, opportunity_id: 1, status: "lost", ended_at: daysAgo(6) },
+        { id: 3, opportunity_id: 1, status: "won", ended_at: daysAgo(10) },
+        { id: 4, opportunity_id: 1, status: "running", ended_at: "" },
+        { id: 5, opportunity_id: 1, status: "lost", ended_at: "" },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.decisions_last_7d, 2);
+  });
+
+  it("counts vetted_last_7d from vetted-tag rows touched in 7d", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x\n[2026-09-18 vetted] Human vetted; cap lifted.", created_at: daysAgo(10), updated_at: daysAgo(2) },
+        { id: 2, slug: "b", title: "B", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "y\n[2026-09-01 vetted] Human vetted; cap lifted.", created_at: daysAgo(20), updated_at: daysAgo(10) },
+        { id: 3, slug: "c", title: "C", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal \u2014 UNREVIEWED", created_at: daysAgo(1), updated_at: daysAgo(1) },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.vetted_last_7d, 1);
+  });
+
+  it("keeps every existing health key for verify.sh", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "time"]) {
+      assert.ok(k in r.body, `health missing ${k}`);
+    }
+    assert.equal(typeof r.body.decisions_last_7d, "number");
+    assert.equal(typeof r.body.vetted_last_7d, "number");
   });
 });
 

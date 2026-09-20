@@ -7,6 +7,7 @@ const state = {
   opportunities: [], experiments: [], runs: [], meta: {},
   statusFilter: "", detail: null, reviewOnly: false, reviewList: [],
   health: {},
+  apiFailures: [],
   token: localStorage.getItem("aimoney_admin") || "",
 };
 
@@ -70,7 +71,7 @@ function renderLedger() {
     <tr class="row" data-id="${o.id}">
       <td class="num rank">${i + 1}</td>
       <td><div class="opp-title">${esc(o.title)} <span class="cat muted">· ${esc(o.category)}</span></div>
-        <div class="opp-sub">${esc(o.one_liner || "")}</div></td>
+        <div class="opp-sub">${esc(o.one_liner || "")}</div>${testingBadge(o)}</td>
       <td>${statusPill(o.status)}</td>
       <td class="score-cell"><span class="score-num">${esc(o.score)}</span>
         <div class="score-bar"><i style="width:${Math.round(100 * (o.score || 0) / max)}%"></i></div></td>
@@ -79,7 +80,9 @@ function renderLedger() {
       <td class="num money">${money(o.est_monthly_low, o.est_monthly_high)}</td>
       <td class="muted">${esc(o.time_to_first_dollar || "—")}</td>
     </tr>`).join("")
-    : `<tr><td colspan="10" class="muted">Nothing here. The next agent run may add some — or add one yourself.</td></tr>`;
+    : (state.apiFailures.includes("/api/opportunities")
+      ? `<tr><td colspan="10" class="muted">Could not load the priority list — see the banner above and retry.</td></tr>`
+      : `<tr><td colspan="10" class="muted">Nothing here. The next agent run may add some — or add one yourself.</td></tr>`);
   document.querySelectorAll("#ledger-body tr.row").forEach((tr) => {
     tr.addEventListener("click", () => openDrawer(Number(tr.dataset.id)));
   });
@@ -213,9 +216,18 @@ function renderExperiments() {
   $("#exp-count").textContent = exps.length || "";
   const running = exps.filter((e) => e.status === "running").length;
   const won = exps.filter((e) => e.status === "won").length;
-  $("#exp-summary").textContent = exps.length
+  const decisions = state.health && typeof state.health.decisions_last_7d === "number" ? state.health.decisions_last_7d : null;
+  const vetted = state.health && typeof state.health.vetted_last_7d === "number" ? state.health.vetted_last_7d : null;
+  let summary = exps.length
     ? `${exps.length} experiments · ${running} running · ${won} won`
-    : "No experiments yet.";
+    : (state.apiFailures.includes("/api/experiments")
+      ? "Could not load experiments — see the banner above and retry."
+      : "No experiments yet.");
+  if (decisions !== null && vetted !== null) {
+    const conv = `${decisions} decisions this week · ${vetted} vetted → ${exps.length} experiments`;
+    summary = `${summary} · ${conv}`;
+  }
+  $("#exp-summary").textContent = summary;
   $("#board").innerHTML = EXP_COLS.map(([st, label]) => {
     const list = exps.filter((e) => e.status === st)
       .sort((a, b) => (b.days_in_status ?? -1) - (a.days_in_status ?? -1));
@@ -223,7 +235,7 @@ function renderExperiments() {
       (list.map((e) => `
         <div class="card" data-id="${e.id}" data-opp="${e.opportunity_id}"${e.orphaned ? ` data-orphan="1"` : ""}>
           <h4>${esc(e.name)}</h4>
-          <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}</p>
+          <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}${runningMismatchBadge(e)}</p>
           <div class="meta">${statusPill(e.status)}
             <span class="muted mono">${esc(e.result ? `→ ${e.result.slice(0, 40)}` : (e.target || ""))}</span></div>
         </div>`).join("") || `<p class="muted">—</p>`) + `</div>`;
@@ -241,7 +253,14 @@ function renderRuns() {
   const runs = state.runs;
   const last = runs[0];
   const pill = $("#agent-pill");
-  if (last) {
+  const dbDown = state.health && state.health.db && state.health.db !== "up";
+  if (dbDown) {
+    $("#agent-text").textContent = "agent: db down";
+    pill.classList.remove("ok");
+    pill.classList.add("bad");
+    pill.title = "Database unreachable (health.db != up)";
+  } else if (last) {
+    pill.title = "Latest research run";
     const when = last.finished_at || last.started_at || "";
     $("#agent-text").textContent =
       `agent: ${last.status} · +${last.added}/${last.updated}/${last.briefs} · ${when.slice(0, 16).replace("T", " ")}`;
@@ -258,7 +277,9 @@ function renderRuns() {
       <td class="num">${r.updated}</td><td class="num">${r.briefs}</td>
       <td class="num">${r.ai_calls}</td>
       <td class="muted">${esc((r.error || "").slice(0, 80))}</td></tr>`).join("")
-    : `<tr><td colspan="10" class="muted">No agent runs yet — the first cron pass lands within 6h of deploy.</td></tr>`;
+    : (state.apiFailures.includes("/api/runs")
+      ? `<tr><td colspan="10" class="muted">Could not load the research log — see the banner above and retry.</td></tr>`
+      : `<tr><td colspan="10" class="muted">No agent runs yet — the first cron pass lands within 6h of deploy.</td></tr>`);
 }
 
 /* ---- detail drawer ---- */
@@ -501,28 +522,60 @@ $("#btn-run").addEventListener("click", async () => {
   if (!worker) return toast("Worker URL not configured (RESEARCH_WORKER_URL).");
   const btn = $("#btn-run");
   btn.disabled = true;
-  btn.textContent = "Researching…";
+  btn.textContent = "Triaging…";
   try {
     const r = await fetch(`${worker}/run`, {
       method: "POST", headers: { authorization: `Bearer ${state.token}` },
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
-    toast("Research pass started — watch the Research log tab for results.");
+    toast("Triage started — proposals land in Priority; briefs land on the next cron tick. Watch the Research log.");
     setTimeout(refresh, 45000);
     await refresh();
   } catch (e) { toast(`Research failed: ${e.message}`); }
   btn.disabled = false;
-  btn.textContent = "Run research now";
+  btn.textContent = "Run triage now (briefs on cron)";
 });
+
+/* ---- read-only warnings (no auto-transitions) ---- */
+const testingBadge = (o) =>
+  o.status === "testing" && !(Number(o.experiment_count) > 0)
+    ? ` <span class="warn-badge" title="Status is testing but no experiments are logged">testing · 0 experiments</span>`
+    : "";
+
+const runningMismatchBadge = (e) => {
+  if (e.status !== "running" || e.orphaned) return "";
+  const parent = state.opportunities.find((o) => String(o.id) === String(e.opportunity_id));
+  return parent && parent.status === "researching"
+    ? ` <span class="warn-badge" title="Experiment is running but its opportunity is still researching">running exp · opp still researching</span>`
+    : "";
+};
+
+function renderApiErrors() {
+  const el = $("#api-errors");
+  if (!el) return;
+  const fails = state.apiFailures || [];
+  if (!fails.length) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    return;
+  }
+  el.classList.remove("hidden");
+  el.innerHTML = `API ${fails.length === 1 ? "error" : "errors"}: ${fails.map((f) => esc(f)).join(", ")} failed to load. <button id="api-retry" class="btn small ghost" type="button">Retry</button> <button id="api-dismiss" class="btn small ghost" type="button" aria-label="Dismiss">Dismiss</button>`;
+  const retry = $("#api-retry");
+  if (retry) retry.addEventListener("click", () => refresh());
+  const dismiss = $("#api-dismiss");
+  if (dismiss) dismiss.addEventListener("click", () => el.classList.add("hidden"));
+}
 
 /* ---- boot ---- */
 async function refresh() {
+  state.apiFailures = [];
   const [opps, exps, runs, health] = await Promise.all([
-    api("/api/opportunities?limit=200").catch(() => ({ opportunities: [] })),
-    api("/api/experiments").catch(() => ({ experiments: [] })),
-    api("/api/runs?limit=20").catch(() => ({ runs: [] })),
-    api("/api/health").catch(() => ({})),
+    api("/api/opportunities?limit=200").catch(() => { state.apiFailures.push("/api/opportunities"); return { opportunities: [] }; }),
+    api("/api/experiments").catch(() => { state.apiFailures.push("/api/experiments"); return { experiments: [] }; }),
+    api("/api/runs?limit=20").catch(() => { state.apiFailures.push("/api/runs"); return { runs: [] }; }),
+    api("/api/health").catch(() => { state.apiFailures.push("/api/health"); return {}; }),
   ]);
   state.opportunities = opps.opportunities || [];
   state.experiments = exps.experiments || [];
@@ -531,6 +584,7 @@ async function refresh() {
   state.meta = await api("/api/meta").catch(() => ({}));
   await refreshReview().catch(() => {});
   $("#rev").textContent = health.rev ? `rev ${health.rev}` : "";
+  renderApiErrors();
   renderLedger();
   renderExperiments();
   renderRuns();
