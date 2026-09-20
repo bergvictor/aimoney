@@ -66,7 +66,13 @@ describe("stale nudge + vet handoff (round3 Task 2)", () => {
     assert.ok(js.includes("Nudge:"), "exp summary lost the 'Nudge:' copy");
     assert.ok(js.includes("days_in_status"), "nudge must reuse days_in_status");
     assert.ok(js.includes("exp-nudge-open"), "nudge lacks its opener button");
-    assert.ok(js.includes("openDrawer(nudge.opportunity_id, nudge.id)"), "nudge must open the stalest card drawer");
+    assert.ok(js.includes("focusNudgeCard"), "app.js lost the nudge deep-link helper");
+    assert.ok(js.includes("focusNudgeCard(nudge)"), "nudge must deep-link to the stalest board card");
+    assert.ok(js.includes('activateTab("experiments"'), "nudge deep-link must switch to the Experiments tab");
+    assert.ok(js.includes("scrollIntoView"), "nudge deep-link must scroll to the stalest card");
+    assert.ok(js.includes("exp-nudge-start"), "planned nudge lacks its one-click Start");
+    assert.ok(js.includes("startExperiment(nudge.id)"), "planned nudge must carry its own Start");
+    assert.ok(!js.includes("openDrawer(nudge.opportunity_id, nudge.id)"), "nudge must deep-link to the board card, not the drawer");
   });
 
   it("experiments header shows the vetted-without-experiment count", () => {
@@ -426,10 +432,10 @@ describe("closed-experiment money in drawer (audit 2026-09-20-round3 Task 1)", (
 });
 
 describe("token modal + inline post-mortem (audit 2026-09-20-round3 Task 2)", () => {
-  it("Vet/Kill/Start/Lose/Win open the admin modal when the token is missing", () => {
+  it("Vet/Kill/Start/Lose/Win/Starter open the admin modal when the token is missing", () => {
     assert.ok(js.includes("function openAdminModal"), "app.js lost openAdminModal");
     assert.ok(js.includes('openAdminModal("Enter the admin token first.")'), "gated taps must open the admin modal with the toast text as subnote");
-    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 5, "Vet/Kill/Start/Lose/Win must all open the modal");
+    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 6, "Vet/Kill/Start/Lose/Win/Starter must all open the modal");
     assert.ok(js.includes("[data-admin-subnote]"), "modal must pin the subnote");
     assert.ok(js.includes('$("#btn-admin").click()'), "openAdminModal must reuse the Admin showModal block");
   });
@@ -479,6 +485,83 @@ describe("lifetime revenue header (audit 2026-09-20-round1 Task 3)", () => {
     assert.ok(js.includes("moneyCents(revenue)"), "exp summary lost the weekly revenue format");
     assert.ok(js.includes("revenue this week"), "exp summary lost the 'revenue this week' copy");
     assert.ok(js.indexOf("revenue this week") < js.indexOf("} lifetime"), "lifetime figure must sit next to the weekly figure");
+  });
+});
+
+describe("vet & log starter (audit 2026-09-20-round3 Task 1)", () => {
+  it("review rows show Vet & log starter beside Vet", () => {
+    assert.ok(js.includes("data-vet-starter"), "review rows lost the Vet & log starter button");
+    assert.ok(js.includes("Vet &amp; log starter"), "starter button lost its label");
+    assert.ok(js.includes("vetAndLogStarter(Number("), "starter click must call vetAndLogStarter with the row id");
+    const actions = js.slice(js.indexOf('<div class="review-actions">'), js.indexOf('<div class="review-actions">') + 600);
+    assert.ok(actions.includes("data-vet=") && actions.includes("data-vet-starter"), "starter must sit beside Vet in the review actions");
+  });
+
+  it("one tap vets, POSTs a prefilled planned experiment, and flips to testing", () => {
+    assert.ok(js.includes("async function vetAndLogStarter"), "app.js lost the vetAndLogStarter handler");
+    const fn = js.slice(js.indexOf("async function vetAndLogStarter"), js.indexOf("async function killOpportunity"));
+    assert.ok(fn.includes("cleanUnreviewed(o.notes)"), "starter must clear UNREVIEWED like vetOpportunity");
+    assert.ok(fn.includes("[${day} vetted]"), "starter must append the vetted tag");
+    assert.ok(fn.includes('api("/api/experiments",'), "starter must POST the experiment");
+    assert.ok(fn.includes('status: "planned"'), "starter experiment must enter as planned");
+    assert.ok(fn.includes("Starter: ${o.title}"), "starter name must prefill from the row title");
+    assert.ok(fn.includes("o.one_liner"), "starter hypothesis must prefill from the row one-liner");
+    assert.ok(fn.includes("o.brief_first_steps"), "starter hypothesis must fall back to the brief next action");
+    assert.ok(fn.includes("metric:"), "starter must prefill a metric");
+    assert.ok(fn.includes('JSON.stringify({ status: "testing" })'), "starter must flip the row to testing");
+  });
+
+  it("toast carries a Start shortcut and the tap stays token-gated", () => {
+    const fn = js.slice(js.indexOf("async function vetAndLogStarter"), js.indexOf("async function killOpportunity"));
+    assert.ok(fn.includes("starter logged, moved to testing"), "starter lost its success toast");
+    assert.ok(fn.includes("startExperiment(created.id)"), "starter toast must carry a Start shortcut for the created experiment");
+    assert.ok(fn.includes('openAdminModal("Enter the admin token first.")'), "starter must open the admin modal without a token");
+    assert.ok(fn.includes("await refresh()"), "starter must refresh after the decision");
+  });
+});
+
+describe("win revenue source (audit 2026-09-20-round3 Task 2)", () => {
+  it("Win inline row owns an optional one-line source input beside $ + post-mortem", () => {
+    const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
+    assert.ok(winRow.includes("dataset.winSource"), "Win row lacks its source input");
+    assert.ok(winRow.includes("Revenue source (optional)"), "Win source input lost its optional copy");
+    assert.ok(winRow.includes("source.maxLength = 120"), "Win source input must cap at 120 chars like the modal");
+    assert.ok(winRow.includes("row.appendChild(source)"), "Win row must render the source input");
+  });
+
+  it("close sends revenue_source truncated to 120; empty renders exactly as today", () => {
+    const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
+    assert.ok(winRow.includes("source.value.trim().slice(0, 120)"), "Win must trim + truncate the source like the modal");
+    assert.ok(js.includes("revenue_source: revenueSource"), "Win close must send revenue_source");
+    assert.ok(js.includes("e.revenue_source ?"), "empty source must keep rendering without the via bit");
+    const doWin = js.slice(js.indexOf("const doWin = async"), js.indexOf("inlineWinClose(winContainer"));
+    assert.ok(doWin.includes('status: "won"'), "Win must still PATCH status=won");
+    assert.ok(doWin.includes("result: pm.trim(), post_mortem: pm.trim()"), "Win must still send the line as result + post-mortem");
+  });
+
+  it("empty post-mortem line still cancels with the row untouched", () => {
+    const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
+    assert.ok(winRow.includes("if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }"), "Win empty line must cancel with the row untouched");
+    assert.ok(winRow.includes("onSubmit(pm, revenueCents, revenueSource)"), "Win submit must pass the source through");
+  });
+});
+
+describe("nudge deep-link (audit 2026-09-20-round3 Task 3)", () => {
+  it("deep-link helper switches tab, scrolls, and highlights the stalest card", () => {
+    assert.ok(js.includes("function focusNudgeCard"), "app.js lost focusNudgeCard");
+    const fn = js.slice(js.indexOf("// Nudge deep-link"), js.indexOf("async function startExperiment"));
+    assert.ok(fn.includes('activateTab("experiments", true)'), "deep-link must switch to the Experiments tab");
+    assert.ok(fn.includes('#board .card[data-id="'), "deep-link must find the stalest card on the board");
+    assert.ok(fn.includes("scrollIntoView"), "deep-link must scroll to the card");
+    assert.ok(fn.includes("borderColor"), "deep-link must highlight the card");
+    assert.ok(fn.includes("No auto-transitions"), "deep-link must stay human-pressed");
+  });
+
+  it("planned nudges carry their own Start; the nudge still fires only at zero decisions", () => {
+    assert.ok(js.includes('nudge.status === "planned"'), "nudge Start must gate on planned status");
+    assert.ok(js.includes("exp-nudge-start"), "planned nudge lacks its Start button");
+    assert.ok(js.includes("startExperiment(nudge.id)"), "planned nudge Start must reuse startExperiment");
+    assert.ok(js.includes("decisions === 0"), "nudge must still fire only when decisions_last_7d is 0");
   });
 });
 

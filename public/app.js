@@ -195,6 +195,7 @@ function renderReview() {
         ${reviewBriefLine(o)}
         <div class="review-actions">
           <button class="btn small" data-vet="${o.id}" type="button">Vet</button>
+          <button class="btn small" data-vet-starter="${o.id}" type="button">Vet &amp; log starter</button>
           <button class="btn small ghost danger" data-kill="${o.id}" type="button">Kill</button>
         </div></td>
       <td>${statusPill(o.status)}</td>
@@ -211,6 +212,9 @@ function renderReview() {
   });
   document.querySelectorAll("[data-vet]").forEach((b) => {
     b.addEventListener("click", (ev) => { ev.stopPropagation(); vetOpportunity(Number(b.dataset.vet)); });
+  });
+  document.querySelectorAll("[data-vet-starter]").forEach((b) => {
+    b.addEventListener("click", (ev) => { ev.stopPropagation(); vetAndLogStarter(Number(b.dataset.vetStarter)); });
   });
   document.querySelectorAll("[data-kill]").forEach((b) => {
     b.addEventListener("click", (ev) => { ev.stopPropagation(); killOpportunity(Number(b.dataset.kill), b); });
@@ -300,7 +304,8 @@ function inlinePostMortem(container, { label, placeholder, confirmText, onSubmit
 // Inline $ + one-line close-as-won row: mirrors inlinePostMortem with an added
 // human-entered revenue input, so a win costs the same single click as a loss.
 // Empty lines cancel with the row untouched; bad/negative $ clamps to 0
-// exactly like the modal. Returns false when a row is already open.
+// exactly like the modal; the source truncates to 120 chars like the modal and
+// empty renders exactly as today (no via bit). Returns false when a row is already open.
 function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, cancelToast }) {
   if (!container) return false;
   if (container.querySelector("[data-pm-input]")) return false;
@@ -312,6 +317,12 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
   amount.placeholder = "Revenue $ (human-entered, e.g. 500)";
   amount.setAttribute("aria-label", "Revenue in dollars");
   amount.inputMode = "decimal";
+  const source = document.createElement("input");
+  source.type = "text";
+  source.dataset.winSource = "1";
+  source.placeholder = "Revenue source (optional)";
+  source.setAttribute("aria-label", "Revenue source");
+  source.maxLength = 120;
   const input = document.createElement("input");
   input.type = "text";
   input.dataset.pmInput = "1";
@@ -332,8 +343,9 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
     const pm = input.value;
     if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }
     const revenueCents = Math.max(0, Math.round(Number(amount.value.trim()) * 100) || 0);
+    const revenueSource = source.value.trim().slice(0, 120);
     cleanup();
-    onSubmit(pm, revenueCents);
+    onSubmit(pm, revenueCents, revenueSource);
   };
   ok.addEventListener("click", (ev) => { ev.stopPropagation(); submit(); });
   input.addEventListener("keydown", (ev) => {
@@ -344,7 +356,12 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
     if (ev.key === "Enter") { ev.preventDefault(); submit(); }
     if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
   });
+  source.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
+  });
   row.appendChild(amount);
+  row.appendChild(source);
   row.appendChild(input);
   row.appendChild(ok);
   row.appendChild(cancel);
@@ -375,6 +392,44 @@ async function vetOpportunity(id) {
     await refreshReview();
     if (state.reviewOnly) renderLedger();
   } catch (e) { toast(`Vet failed: ${e.message}`); }
+}
+
+// One-tap Vet & log starter: vets the row, POSTs a planned starter experiment
+// prefilled from the row (name/hypothesis/metric; every field stays editable
+// via Update), and flips the row to testing — the same three calls the human
+// makes today (Vet PATCH, Log experiment POST, admin status PATCH), composed
+// behind one tap. Token-gated like vetOpportunity; the toast carries a Start
+// shortcut for the created experiment. Human-pressed, one decision.
+async function vetAndLogStarter(id) {
+  if (!state.token) return openAdminModal("Enter the admin token first.");
+  const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
+  if (!o) return;
+  const day = new Date().toISOString().slice(0, 10);
+  const notes = `${cleanUnreviewed(o.notes)}\n[${day} vetted] Human vetted; cap lifted.`.trim().slice(-8000);
+  const starterName = `Starter: ${o.title}`.slice(0, 200);
+  const starterHypothesis = String(o.one_liner || firstStepsFirstLine({ first_steps: o.brief_first_steps }) || `Smallest paid test of ${o.title}`).slice(0, 8000);
+  try {
+    await api(`/api/opportunities/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ notes }),
+    });
+    const created = await api("/api/experiments", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        opportunity_id: id, name: starterName, hypothesis: starterHypothesis,
+        status: "planned", metric: "replies; revenue",
+        target: `First $ toward ${money(o.est_monthly_low, o.est_monthly_high)}/mo`,
+      }),
+    });
+    await api(`/api/opportunities/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status: "testing" }),
+    });
+    toast("Vetted — starter logged, moved to testing", { label: "Start", onClick: () => startExperiment(created.id) });
+    await refresh();
+    await refreshReview();
+    if (state.reviewOnly) renderLedger();
+  } catch (e) { toast(`Starter failed: ${e.message}`); }
 }
 
 async function killOpportunity(id, anchorEl) {
@@ -445,6 +500,18 @@ const stalestOpenExp = (exps) => {
   return open[0] || null;
 };
 
+// Nudge deep-link (read-only): switch to the Experiments tab and
+// highlight/scroll to the stalest card so the next move is one tap away.
+// No auto-transitions — the human still presses Start.
+function focusNudgeCard(nudge) {
+  activateTab("experiments", true);
+  const card = document.querySelector(`#board .card[data-id="${nudge.id}"]`);
+  if (!card) return;
+  card.scrollIntoView({ block: "nearest" });
+  card.style.borderColor = "var(--green)";
+  card.style.borderWidth = "2px";
+}
+
 // One-click Start for planned experiments: a single PATCH to running (the API
 // stamps started_at; won/lost still require result + post-mortem). Token-gated
 // like vetOpportunity; orphaned cards never render the button.
@@ -488,10 +555,10 @@ async function loseExperiment(id, anchorEl) {
   inlinePostMortem(loseContainer, { label: "One-line post-mortem (required to close as lost):", placeholder: "One-line post-mortem (required to close as lost):", confirmText: "Lose", onSubmit: (pm) => doLose(pm), cancelToast: "Close cancelled — post-mortem required." });
 }
 
-// One-click Win for planned/running experiments: one inline $ amount + one
-// inline line, then a single PATCH to won sending that line as both result
-// and post_mortem and the human-entered amount as revenue_cents so the API
-// closure gate holds unchanged (ended_at stamped by the API). Token-gated
+// One-click Win for planned/running experiments: one inline $ amount, one optional
+// source line, one inline line, then a single PATCH to won sending that line as both result
+// and post_mortem, the human-entered amount as revenue_cents, and the source
+// as revenue_source, so the API closure gate holds unchanged (ended_at stamped by the API). Token-gated
 // like loseExperiment; orphaned cards never render the button; an empty
 // inline line cancels with the row untouched; bad/negative $ clamps to 0
 // exactly like the modal. Human-pressed, one decision.
@@ -500,18 +567,18 @@ async function winExperiment(id, anchorEl) {
   // (modal gate above supersedes the toast gate on the next line)
   if (!state.token) return toast("Enter the admin token first.");
   const winContainer = (anchorEl ? (anchorEl.closest(".card") || anchorEl.closest(".review-actions") || anchorEl.parentElement) : null) || document.querySelector("#board") || document.body;
-  const doWin = async (pm, revenueCents) => {
+  const doWin = async (pm, revenueCents, revenueSource) => {
   // (cancel handled by inline row: empty still cancels, row untouched)
   try {
     await api(`/api/experiments/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status: "won", result: pm.trim(), post_mortem: pm.trim(), revenue_cents: revenueCents }),
+      body: JSON.stringify({ status: "won", result: pm.trim(), post_mortem: pm.trim(), revenue_cents: revenueCents, revenue_source: revenueSource }),
     });
     toast("Experiment closed as won");
     await refresh();
   } catch (e) { toast(`Close failed: ${e.message}`); }
   };
-  inlineWinClose(winContainer, { label: "One-line post-mortem (required to close as won):", placeholder: "One-line post-mortem (required to close as won):", confirmText: "Win", onSubmit: (pm, revenueCents) => doWin(pm, revenueCents), cancelToast: "Win cancelled — post-mortem required." });
+  inlineWinClose(winContainer, { label: "One-line post-mortem (required to close as won):", placeholder: "One-line post-mortem (required to close as won):", confirmText: "Win", onSubmit: (pm, revenueCents, revenueSource) => doWin(pm, revenueCents, revenueSource), cancelToast: "Win cancelled — post-mortem required." });
 }
 
 function renderExperiments() {
@@ -542,8 +609,10 @@ function renderExperiments() {
   const nudge = (decisions === 0) ? stalestOpenExp(exps) : null;
   const summaryEl = $("#exp-summary");
   if (nudge) {
-    summaryEl.innerHTML = `${esc(summary)} · <span class="nudge">Nudge: &ldquo;${esc(nudge.name)}&rdquo; has been ${esc(nudge.status)} ${nudge.days_in_status}d <button id="exp-nudge-open" class="btn small ghost" type="button">Open it</button></span>`;
-    $("#exp-nudge-open").addEventListener("click", () => openDrawer(nudge.opportunity_id, nudge.id));
+    const startBtn = nudge.status === "planned" ? ` <button id="exp-nudge-start" class="btn small" type="button">Start it</button>` : "";
+    summaryEl.innerHTML = `${esc(summary)} · <span class="nudge">Nudge: &ldquo;${esc(nudge.name)}&rdquo; has been ${esc(nudge.status)} ${nudge.days_in_status}d <button id="exp-nudge-open" class="btn small ghost" type="button">Show it</button>${startBtn}</span>`;
+    $("#exp-nudge-open").addEventListener("click", () => focusNudgeCard(nudge));
+    if (nudge.status === "planned") $("#exp-nudge-start").addEventListener("click", () => startExperiment(nudge.id));
   } else {
     summaryEl.textContent = summary;
   }
