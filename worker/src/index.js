@@ -248,12 +248,21 @@ async function runResearch(env, trigger) {
     // newest-kept, no status move. Linked rows leave `fresh` in place, so the
     // classify prompt and verdict indices below only see genuinely new signals.
     if (fresh.length) {
-      const oppUrls = await env.DB.prepare(
-        "SELECT id, source_url FROM opportunities WHERE source_url != ''")
-        .all().then((r) => r.results || []).catch(() => []);
-      const linkedUrls = await env.DB.prepare(
-        "SELECT url, opportunity_id FROM signals WHERE opportunity_id IS NOT NULL AND url != ''")
-        .all().then((r) => r.results || []).catch(() => []);
+      // Bounded pre-pass (F4): match only the ≤6 fresh URLs in SQL instead of
+      // loading two full-table URL sets. Empty URLs never match (exactUrlTarget
+      // returns null), so they are filtered before the query.
+      const freshUrls = [...new Set(fresh.map((s) => String(s.url || "")).filter(Boolean))];
+      let oppUrls = [];
+      let linkedUrls = [];
+      if (freshUrls.length) {
+        const placeholders = freshUrls.map(() => "?").join(",");
+        oppUrls = await env.DB.prepare(
+          `SELECT id, source_url FROM opportunities WHERE source_url IN (${placeholders})`)
+          .bind(...freshUrls).all().then((r) => r.results || []).catch(() => []);
+        linkedUrls = await env.DB.prepare(
+          `SELECT url, opportunity_id FROM signals WHERE opportunity_id IS NOT NULL AND url IN (${placeholders})`)
+          .bind(...freshUrls).all().then((r) => r.results || []).catch(() => []);
+      }
       const rest = [];
       for (const sig of fresh) {
         const target = exactUrlTarget(sig.url, oppUrls, linkedUrls);
@@ -271,32 +280,43 @@ async function runResearch(env, trigger) {
     }
 
     // 2. One AI pass: classify signals against the live priority list.
-    const opps = await env.DB.prepare(
-      "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
-      .all().then((r) => r.results || []);
-    const classifyPrompt = [
-      { role: "system", content: "You triage money-making-with-AI leads. Reply with one JSON object per line (NDJSON), no prose, no array, no fences. Keep every value short." },
-      { role: "user", content:
-        `PRIORITY LIST (id | title | status):\n` +
-        opps.map((o) => `${o.id} | ${o.title} | ${o.status}`).join("\n") +
-        `\n\nFRESH SIGNALS (n | source | title | url):\n` +
-        fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
-        `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:
+    // Quiet ticks skip the top-60 fetch and the prompt build entirely (F5):
+    // the guarded block runs only with fresh signals, otherwise verdicts
+    // stay [] and the run continues to the brief pass below.
+    let verdicts = [];
+    if (fresh.length) {
+      const opps = await env.DB.prepare(
+        "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
+        .all().then((r) => r.results || []);
+      const classifyPrompt = [
+        { role: "system", content: "You triage money-making-with-AI leads. Reply with one JSON object per line (NDJSON), no prose, no array, no fences. Keep every value short." },
+        { role: "user", content:
+          `PRIORITY LIST (id | title | status):\n` +
+          opps.map((o) => `${o.id} | ${o.title} | ${o.status}`).join("\n") +
+          `\n\nFRESH SIGNALS (n | source | title | url):\n` +
+          fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
+          `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:
 {"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"est_monthly_low":0,"est_monthly_high":0,"capital_needed":"$0","time_to_first_dollar":"2-4 weeks"}
 Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to earn money (pricing, revenue, customers, or an obvious buyer) that is NOT on the list. A GitHub repo, tool launch, or tutorial with no business model is noise. A variant of a listed method is "supports" with its numeric id. Confidence above 6 requires named revenue/users in the signal, else 5 or less. opportunity_id must be a numeric id from the list or null, never text. For "new", also estimate est_monthly_low/high ($/mo integers, low<=high), capital_needed ("$0" style, <=120 chars) and time_to_first_dollar ("2-4 weeks" style, <=120 chars); omit any you cannot estimate (safe defaults apply).` },
-    ];
-    if (fresh.length) await mark("classify-ai");
-    const isCron = trigger === "cron";
-    const verdicts = !fresh.length ? [] : parseJsonLines(await aiComplete(env, state, {
-      model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
-      messages: classifyPrompt,
-      timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
-    }));
-    await mark(`classified:${verdicts.length}`);
+      ];
+      const isCron = trigger === "cron";
+      verdicts = !fresh.length ? [] : parseJsonLines(await aiComplete(env, state, {
+        model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
+        messages: classifyPrompt,
+        timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
+      }));
+    }
     // Validate: one verdict per signal (first wins), strict action enum,
     // numeric-or-null opportunity_id (the model once emitted repo names).
     const seen = new Set();
     let newInserts = 0; // new rows inserted this run (capped at MAX_NEW_PER_RUN)
+    // Verdict writes batch (F3): signal UPDATEs and notes appends accumulate
+    // here and go out as ONE env.DB.batch after the loop — the collect phase
+    // proved batching cuts ~9s to ~0.5s. New-row INSERTs and the slug-collision
+    // lookup stay inline since they branch. A failed batch loses this tick's
+    // verdict writes (signals stay unprocessed, retried next tick) — the same
+    // tradeoff round 2's health batching already accepted.
+    const verdictWrites = [];
     for (const v of verdicts) {
       if (!v || typeof v !== "object") continue;
       const n = Number(v.n);
@@ -304,7 +324,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
       seen.add(n);
       const sig = fresh[n];
       if (v.action !== "new" && v.action !== "supports" && v.action !== "noise") {
-        await env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id).run();
+        verdictWrites.push(env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id));
         continue;
       }
       if (v.opportunity_id !== null && v.opportunity_id !== undefined && !Number.isInteger(Number(v.opportunity_id))) {
@@ -338,8 +358,8 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
             `Agent proposal from ${sig.source} signal "${sig.title}" (${sig.url}) — UNREVIEWED, scores capped until a human vets it (agent estimates — correct on vet).`.slice(0, 1000)).run();
           state.added++;
           newInserts++;
-          await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
-            .bind(r.meta.last_row_id, sig.id).run();
+          verdictWrites.push(env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
+            .bind(r.meta.last_row_id, sig.id));
         } catch {
           // Slug collision: link as supports, not drop — reversible, notes
           // newest-kept, no status move. The duplicate proposal is free
@@ -347,25 +367,26 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
           const existing = await env.DB.prepare("SELECT id FROM opportunities WHERE slug = ?").bind(slug).first().catch(() => null);
           if (existing && existing.id) {
             state.updated++;
-            await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(existing.id, sig.id).run();
-            await env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, existing.id).run().catch(() => null);
+            verdictWrites.push(env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(existing.id, sig.id));
+            verdictWrites.push(env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, existing.id));
           } else {
-            await env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id).run();
+            verdictWrites.push(env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id));
           }
         }
       } else if (v.action === "supports" && v.opportunity_id) {
         state.updated++;
-        await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
-          .bind(v.opportunity_id, sig.id).run();
-        await env.DB.prepare(
+        verdictWrites.push(env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
+          .bind(v.opportunity_id, sig.id));
+        verdictWrites.push(env.DB.prepare(
           `UPDATE opportunities SET notes = substr(notes || ?, -8000),
            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`)
           .bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`,
-            v.opportunity_id).run().catch(() => null);
+            v.opportunity_id));
       } else {
-        await env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id).run();
+        verdictWrites.push(env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id));
       }
     }
+    if (verdictWrites.length) await env.DB.batch(verdictWrites);
 
     // 3. One AI pass: brief one bare row — top-scored, or oldest-unreviewed-first past 48h —
     // unless the clock is nearly spent (it lands on a later run instead).
@@ -395,7 +416,6 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
       const sigs = await env.DB.prepare(
         "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
         .bind(bare.id).all().then((r) => r.results || []);
-      await mark("brief-ai");
       const text = await aiComplete(env, state, {
         model: AI_BRIEF, fallback: AI_CLASSIFY, maxTokens: BRIEF_TOKENS,
         timeoutMs: 90000, retries: 1,
@@ -443,7 +463,6 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
             const sigs2 = await env.DB.prepare(
               "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
               .bind(extraBare.id).all().then((r) => r.results || []);
-            await mark("brief-ai");
             const text2 = await aiComplete(env, state, {
               model: AI_BRIEF, fallback: AI_CLASSIFY, maxTokens: BRIEF_TOKENS,
               timeoutMs: 90000, retries: 0,
@@ -553,3 +572,4 @@ export default {
     return json({ error: "not found" }, 404);
   },
 };
+

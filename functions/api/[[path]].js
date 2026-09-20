@@ -58,16 +58,29 @@ async function listOpportunities(env, url) {
     sort === "oldest" ? "o.created_at ASC, o.id ASC" :
     sort === "value" ? "o.value DESC, o.score DESC" : "o.score DESC, o.updated_at DESC";
   const rows = await env.DB.prepare(
-    `SELECT o.*,
+    `SELECT o.id, o.slug, o.title, o.one_liner, o.category, o.status, o.value,
+       o.effort, o.confidence, o.fit, o.score, o.est_monthly_low, o.est_monthly_high,
+       o.time_to_first_dollar, o.capital_needed, o.skills_needed, o.source, o.source_url,
+       o.created_at, o.updated_at,
+       (o.notes LIKE '%UNREVIEWED%') AS needs_review,
        (SELECT COUNT(*) FROM briefs b WHERE b.opportunity_id = o.id) AS brief_count,
-       (SELECT b.first_steps FROM briefs b WHERE b.opportunity_id = o.id ORDER BY b.version DESC LIMIT 1) AS brief_first_steps,
+       (SELECT substr(b.first_steps, 1, 300) FROM briefs b WHERE b.opportunity_id = o.id ORDER BY b.version DESC LIMIT 1) AS brief_first_steps,
        (SELECT substr(b.summary, 1, 200) FROM briefs b WHERE b.opportunity_id = o.id ORDER BY b.version DESC LIMIT 1) AS brief_summary,
        (SELECT COUNT(*) FROM experiments e WHERE e.opportunity_id = o.id) AS experiment_count
      FROM opportunities o
      ${where.length ? "WHERE " + where.join(" AND ") : ""}
      ORDER BY ${order} LIMIT ?`
   ).bind(...args, limit).all();
-  const capped = (rows.results || []).map((r) => ({ ...r, score: effectiveScore(r) }));
+  // List rows carry needs_review (0/1) instead of full notes: the 8000-char
+  // bodies are the single largest per-tap waste (F2). Scores still cap via
+  // the bit (falling back to notes when a row still carries them), and the
+  // full body is stripped before responding — writers fetch detail first.
+  const capped = (rows.results || []).map((r) => {
+    const { notes, ...rest } = r;
+    const needsReview = r.needs_review ? true : String(notes || "").includes("UNREVIEWED");
+    const score = effectiveScore({ value: r.value, effort: r.effort, confidence: r.confidence, fit: r.fit, notes: needsReview ? "UNREVIEWED" : "" });
+    return { ...rest, score };
+  });
   if (sort === "score") {
     capped.sort((a, b) => (b.score - a.score) || String(b.updated_at).localeCompare(String(a.updated_at)));
   }

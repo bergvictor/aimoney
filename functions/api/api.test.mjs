@@ -27,7 +27,8 @@ function makeDB(seed = {}) {
     let category = null;
     if (sql.includes("o.status = ?")) status = filterArgs[idx++];
     if (sql.includes("o.category = ?")) category = filterArgs[idx++];
-    const unreviewed = sql.includes("UNREVIEWED");
+    const whereAt = sql.indexOf("WHERE");
+    const unreviewed = whereAt !== -1 && sql.slice(whereAt).includes("UNREVIEWED");
     let rows = data.opportunities.slice();
     if (status) rows = rows.filter((o) => o.status === status);
     if (category) rows = rows.filter((o) => o.category === category);
@@ -44,7 +45,8 @@ function makeDB(seed = {}) {
     rows = rows.slice(0, limit).map((o) => ({
       ...o,
       brief_count: data.briefs.filter((b) => b.opportunity_id === o.id).length,
-      brief_first_steps: (() => { const bl = data.briefs.filter((b) => b.opportunity_id === o.id).sort((a, b) => (b.version || 0) - (a.version || 0)); return bl.length ? bl[0].first_steps : null; })(),
+      needs_review: String(o.notes || "").includes("UNREVIEWED") ? 1 : 0,
+      brief_first_steps: (() => { const bl = data.briefs.filter((b) => b.opportunity_id === o.id).sort((a, b) => (b.version || 0) - (a.version || 0)); return bl.length ? String(bl[0].first_steps ?? "").slice(0, 300) : null; })(),
       brief_summary: (() => { const bl = data.briefs.filter((b) => b.opportunity_id === o.id).sort((a, b) => (b.version || 0) - (a.version || 0)); return bl.length ? String(bl[0].summary ?? "").slice(0, 200) : null; })(),
       experiment_count: data.experiments.filter((e) => e.opportunity_id === o.id).length,
     }));
@@ -1139,6 +1141,42 @@ describe("health batch + rev cache (audit 2026-09-20-round2 Task 2)", () => {
     } finally {
       globalThis.fetch = realFetch;
     }
+  });
+});
+
+describe("list needs_review bit + excerpt cap (audit 2026-09-20-round3 Task 2)", () => {
+  it("list SQL selects the bit and a 300-char excerpt, not full notes", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "[[path]].js"), "utf8");
+    assert.ok(src.includes("(o.notes LIKE '%UNREVIEWED%') AS needs_review"), "list lost the needs_review bit");
+    assert.ok(src.includes("substr(b.first_steps, 1, 300)"), "list lost the 300-char excerpt cap");
+    assert.ok(!src.includes("SELECT o.*,"), "list still selects full rows (notes) per tap");
+  });
+
+  it("list rows carry needs_review and no notes; scores still cap", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities", {}, db);
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.body.opportunities.map((o) => [o.id, o]));
+    assert.equal(byId[2].needs_review, 1);
+    assert.equal(byId[1].needs_review, 0);
+    assert.ok(!("notes" in byId[2]), "list row still ships full notes");
+    assert.equal(byId[2].score, 6000);
+    assert.equal(byId[1].score, 16000);
+    assert.deepEqual(r.body.opportunities.map((o) => o.id), [1, 2, 3]);
+  });
+
+  it("long excerpts arrive capped at 300 chars; detail still serves full notes", async () => {
+    const db = makeDB({
+      opportunities: oppSeed(),
+      briefs: [{ id: 1, opportunity_id: 2, version: 1, first_steps: "x".repeat(2000) }],
+    });
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities?unreviewed=1&sort=oldest", {}, db);
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.body.opportunities.map((o) => [o.id, o]));
+    assert.equal(byId[2].brief_first_steps.length, 300);
+    const d = await callApi(["opportunities", "2"], "http://localhost/api/opportunities/2", {}, db);
+    assert.equal(d.status, 200);
+    assert.ok(String(d.body.opportunity.notes).includes("UNREVIEWED"), "detail lost the full notes writers append to");
   });
 });
 

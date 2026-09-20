@@ -65,8 +65,8 @@ describe("brief on quiet ticks (audit 2026-09-20-round3 Task 2)", () => {
   it("zero fresh signals still reach the brief pass; classify AI stays skipped", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
     assert.ok(src.includes("!fresh.length ? [] : parseJsonLines(await aiComplete"), "classify AI call lost its empty-fresh guard");
-    const briefAt = src.indexOf('mark("brief-ai")');
-    assert.ok(briefAt !== -1, "worker lost the brief-ai pass");
+    const briefAt = src.indexOf('state.briefs++');
+    assert.ok(briefAt !== -1, "worker lost the brief pass");
     const firstFinish = src.indexOf('await finish("ok",');
     assert.ok(firstFinish !== -1 && firstFinish > briefAt, "quiet tick still finishes before the brief pass");
     const noteAt = src.indexOf('note: "no fresh signals"');
@@ -283,6 +283,72 @@ describe("new-proposal inflow cap (audit 2026-09-20-round2 Task 2)", () => {
     assert.ok(readme.includes("inflow"), "README lost the inflow rule");
     assert.ok(readme.includes("reversible"), "README must say reversible");
     assert.ok(readme.includes("no status move"), "README must say no status move");
+  });
+});
+
+describe("bounded pre-pass + skipped classify fetch (audit 2026-09-20-round3 Task 1)", () => {
+  it("quiet ticks skip the top-60 list query and the prompt build", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    // The live-pass fetch sits inside the fresh guard (the /debug-classify
+    // probe keeps its own unconditional copy later in the file).
+    const vStart = src.indexOf("let verdicts = [];");
+    const guardAt = src.indexOf("if (fresh.length) {", vStart);
+    const fetchAt = src.indexOf("SELECT id, slug, title, status, score", vStart);
+    const promptAt = src.indexOf("const classifyPrompt = [", vStart);
+    assert.ok(vStart !== -1, "worker lost the quiet-tick verdicts default");
+    assert.ok(guardAt !== -1 && guardAt < fetchAt && guardAt < promptAt, "top-60 fetch and prompt build must sit inside the fresh guard");
+    assert.ok(src.includes("!fresh.length ? [] : parseJsonLines(await aiComplete"), "classify AI call lost its empty-fresh guard");
+  });
+
+  it("pre-pass matches via bounded IN selects, not full-table URL loads", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("WHERE source_url IN ("), "opportunity pre-pass lost its bounded IN select");
+    assert.ok(src.includes("AND url IN ("), "linked-signal pre-pass lost its bounded IN select");
+    assert.ok(!src.includes("WHERE source_url != ''"), "opportunity pre-pass still loads the full URL table");
+    assert.ok(!src.includes("AND url != ''"), "linked-signal pre-pass still loads the full URL table");
+    assert.ok(src.includes("freshUrls"), "pre-pass lost its fresh-URL set");
+    assert.ok(src.includes("exactUrlTarget(sig.url, oppUrls, linkedUrls)"), "pre-pass must still match via exactUrlTarget");
+    assert.ok(src.includes("fresh.push(...rest)"), "pre-pass must still exclude linked signals from the classify prompt");
+  });
+
+  it("keeps verdicts, links, AI budget, status rules, and manual skip", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+    assert.ok(src.includes("state.updated++"), "pre-pass links must count as updated");
+  });
+});
+
+describe("batched verdict writes + single heartbeat (audit 2026-09-20-round3 Task 3)", () => {
+  it("per-verdict signal/note writes go out as one env.DB.batch", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("const verdictWrites = [];"), "worker lost the verdict-writes accumulator");
+    assert.ok(src.includes("if (verdictWrites.length) await env.DB.batch(verdictWrites);"), "verdict writes must flush as one batch");
+    const loop = src.slice(src.indexOf("for (const v of verdicts)"), src.indexOf("if (verdictWrites.length)"));
+    assert.ok(loop.includes("verdictWrites.push"), "verdict loop must accumulate into the batch");
+    assert.equal(loop.split("await env.DB.prepare").length - 1, 2, "only the new-row INSERT and the slug-collision lookup stay inline");
+    assert.ok(src.includes("SELECT id FROM opportunities WHERE slug = ?"), "slug-collision lookup must stay inline");
+  });
+
+  it("keeps one post-collect heartbeat plus the single finish write", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("await mark(").length - 1, 1, "worker must keep exactly one mid-run heartbeat");
+    assert.ok(src.includes('await mark(state.stale ? `collected stale:${state.stale}` : "collected")'), "the kept heartbeat must be the post-collect one");
+    assert.equal(src.split('await finish("ok"').length - 1, 1, "run must finish the run log exactly once");
+    assert.ok(src.includes('await finish("ok", (briefMode'), "the single finish must carry the brief-mode message");
+  });
+
+  it("verdict outcomes, inflow cap, AI budget, and run-log row unchanged", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes('v.action !== "new" && v.action !== "supports" && v.action !== "noise"'), "verdict validation changed");
+    assert.ok(src.includes("supports without a valid id is noise"), "supports guard changed");
+    assert.ok(src.includes("const MAX_NEW_PER_RUN = 2;"), "worker lost the inflow cap");
+    assert.ok(src.includes("newInserts >= MAX_NEW_PER_RUN"), "worker lost the overflow guard");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("INSERT INTO opportunities (slug, title, one_liner"), "new-row INSERT changed");
   });
 });
 

@@ -303,7 +303,7 @@ describe("experiment money in cents (audit 2026-09-20 Task 4)", () => {
 
 describe("strip Vet/Kill (audit 2026-09-20-round2 Task 1)", () => {
   it("strip shows Vet/Kill when the top pick carries UNREVIEWED, reusing the review handlers", () => {
-    assert.ok(js.includes('String(top.notes || "").includes("UNREVIEWED")'), "strip lost its UNREVIEWED gate");
+    assert.ok(js.includes('isNeedsReview(top)'), "strip lost its needs_review gate");
     assert.ok(js.includes('id="start-here-vet"'), "strip lost its Vet button");
     assert.ok(js.includes('id="start-here-kill"'), "strip lost its Kill button");
     assert.ok(js.includes("vetOpportunity(top.id)"), "strip Vet must reuse vetOpportunity");
@@ -436,7 +436,7 @@ describe("token modal + inline post-mortem (audit 2026-09-20-round3 Task 2)", ()
   it("Vet/Kill/Start/Lose/Win/Starter open the admin modal when the token is missing", () => {
     assert.ok(js.includes("function openAdminModal"), "app.js lost openAdminModal");
     assert.ok(js.includes('openAdminModal("Enter the admin token first.")'), "gated taps must open the admin modal with the toast text as subnote");
-    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 6, "Vet/Kill/Start/Lose/Win/Starter must all open the modal");
+    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 9, "Vet/Kill/Starter wrappers + Vet/Kill/Start/Lose/Win/Starter handlers must all open the modal");
     assert.ok(js.includes("[data-admin-subnote]"), "modal must pin the subnote");
     assert.ok(js.includes('$("#btn-admin").click()'), "openAdminModal must reuse the Admin showModal block");
   });
@@ -727,6 +727,40 @@ describe("start-here list excerpt (audit 2026-09-20-round2 Task 3)", () => {
     assert.ok(!strip.includes("topBriefText"), "strip must not keep the brief-text cache");
     assert.ok(!js.includes("topBriefText"), "topBriefText state must be gone everywhere");
     assert.ok(!strip.includes("Loading next action"), "strip must not show a loading state for data it already has");
+  });
+});
+
+describe("needs_review bit + detail-before-write (audit 2026-09-20-round3 Task 2)", () => {
+  it("deriveReviewList honors the bit, falling back to notes", () => {
+    const deriveStart = js.indexOf("const deriveReviewList");
+    const deriveReviewList = new Function(
+      `${js.slice(deriveStart, js.indexOf(";", deriveStart) + 1)} return deriveReviewList;`)();
+    assert.deepEqual(deriveReviewList([
+      { id: 1, needs_review: 1, created_at: "2026-09-18T00:00:00Z" },
+      { id: 2, needs_review: 0, notes: "UNREVIEWED stale?", created_at: "2026-09-10T00:00:00Z" },
+      { id: 3, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-11T00:00:00Z" },
+    ]).map((o) => o.id), [3, 1]);
+  });
+
+  it("strip gates Vet/Kill on the bit with zero detail fetches", () => {
+    const strip = js.slice(js.indexOf("function renderStartHere"), js.indexOf("/* ---- priority list ---- */"));
+    assert.ok(strip.includes("isNeedsReview(top)"), "strip must gate on the needs_review bit");
+    assert.ok(!strip.includes("api(`/api/opportunities/${top.id}`)"), "strip must not fetch the detail endpoint");
+  });
+
+  it("Vet, Vet-&-starter, and Kill fetch detail first, then append byte-identical tags", () => {
+    for (const [name, start, end] of [
+      ["vet", "async function vetOpportunity", "async function vetOpportunityInner"],
+      ["starter", "async function vetAndLogStarter", "async function vetAndLogStarterInner"],
+      ["kill", "async function killOpportunity", "async function killOpportunityInner"],
+    ]) {
+      const fn = js.slice(js.indexOf(start), js.indexOf(end));
+      assert.ok(fn.includes("api(`/api/opportunities/${id}`)"), `${name} must GET the detail endpoint first`);
+      assert.ok(fn.includes("o.notes = d.opportunity.notes"), `${name} must stash full detail notes for the write`);
+      assert.ok(fn.indexOf("api(`/api/opportunities/${id}`)") < fn.indexOf("Inner(id"), `${name} must fetch before delegating to the write`);
+    }
+    assert.ok(js.includes("[${day} vetted] Human vetted; cap lifted."), "vetted tag changed");
+    assert.ok(js.includes("[${day} killed] ${pm.trim()}"), "killed tag changed");
   });
 });
 

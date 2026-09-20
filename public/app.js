@@ -107,7 +107,7 @@ function renderStartHere() {
   if (!top) { el.classList.add("hidden"); el.innerHTML = ""; return; }
   const excerpt = firstStepsFirstLine({ first_steps: top.brief_first_steps });
   const nextAction = excerpt || "No brief yet — open the drawer for facts.";
-  const needsReview = String(top.notes || "").includes("UNREVIEWED");
+  const needsReview = isNeedsReview(top);
   el.classList.remove("hidden");
   el.innerHTML =
     `<div style="background:var(--green-wash);border:1px solid var(--green);border-radius:8px;padding:10px 12px;margin-bottom:12px">` +
@@ -219,11 +219,19 @@ function renderReview() {
 }
 
 // Review queue derivation (pure): the main list payload already carries every
-// field the chip needs (notes, created_at), so the oldest-first queue is
+// field the chip needs (needs_review, created_at), so the oldest-first queue is
 // filtered + sorted client-side with no second fetch. Rows without a parseable
 // date sort first, matching the server's oldest ASC on empty strings.
+// Review-bit check (F2): list rows carry needs_review (0/1) instead of full
+// notes. The bit wins when present; notes are the fallback for detail rows
+// and pre-change payloads still in flight.
+const isNeedsReview = (o) =>
+  o && o.needs_review !== undefined && o.needs_review !== null
+    ? Number(o.needs_review) === 1
+    : String((o && o.notes) || "").includes("UNREVIEWED");
+
 const deriveReviewList = (opps) =>
-  (opps || []).filter((o) => String(o.notes || "").includes("UNREVIEWED")).sort((a, b) => (Date.parse(a.created_at || "") || 0) - (Date.parse(b.created_at || "") || 0));
+  (opps || []).filter((o) => o && o.needs_review !== undefined && o.needs_review !== null ? Number(o.needs_review) === 1 : String((o && o.notes) || "").includes("UNREVIEWED")).sort((a, b) => (Date.parse(a.created_at || "") || 0) - (Date.parse(b.created_at || "") || 0));
 
 async function refreshReview() {
   // Client-side first: identical rows with no round-trip. The unreviewed
@@ -386,6 +394,19 @@ function cleanUnreviewed(notes) {
 }
 
 async function vetOpportunity(id) {
+  // Detail-before-write (F2): list rows no longer ship notes, so the full
+  // body is fetched first and stashed on the list row for the write below.
+  // Transient write-path cache — the post-write refresh replaces the row.
+  if (!state.token) return openAdminModal("Enter the admin token first.");
+  try {
+    const d = await api(`/api/opportunities/${id}`);
+    const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
+    if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
+  } catch (e) { toast(`Vet failed: ${e.message}`); return; }
+  return vetOpportunityInner(id);
+}
+
+async function vetOpportunityInner(id) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
   // (modal gate above supersedes the toast gate on the next line)
   if (!state.token) return toast("Enter the admin token first.");
@@ -412,6 +433,18 @@ async function vetOpportunity(id) {
 // behind one tap. Token-gated like vetOpportunity; the toast carries a Start
 // shortcut for the created experiment. Human-pressed, one decision.
 async function vetAndLogStarter(id) {
+  // Detail-before-write (F2): see vetOpportunity — the starter's vetted tag
+  // appends to full detail notes, not the bit-only list row.
+  if (!state.token) return openAdminModal("Enter the admin token first.");
+  try {
+    const d = await api(`/api/opportunities/${id}`);
+    const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
+    if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
+  } catch (e) { toast(`Starter failed: ${e.message}`); return; }
+  return vetAndLogStarterInner(id);
+}
+
+async function vetAndLogStarterInner(id) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
   const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
   if (!o) return;
@@ -444,6 +477,18 @@ async function vetAndLogStarter(id) {
 }
 
 async function killOpportunity(id, anchorEl) {
+  // Detail-before-write (F2): see vetOpportunity — the killed tag appends to
+  // full detail notes. Fetched before the post-mortem row opens.
+  if (!state.token) return openAdminModal("Enter the admin token first.");
+  try {
+    const d = await api(`/api/opportunities/${id}`);
+    const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
+    if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
+  } catch (e) { toast(`Kill failed: ${e.message}`); return; }
+  return killOpportunityInner(id, anchorEl);
+}
+
+async function killOpportunityInner(id, anchorEl) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
   // (modal gate above supersedes the toast gate on the next line)
   if (!state.token) return toast("Enter the admin token first.");
