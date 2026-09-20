@@ -180,6 +180,21 @@ async function createBrief(request, env) {
   return json({ id: r.meta.last_row_id, version }, 201);
 }
 
+const daysSince = (iso, now) => {
+  if (!iso) return null;
+  const ms = Date.parse(String(iso));
+  if (!Number.isFinite(ms)) return null;
+  return Math.max(0, Math.floor((now - ms) / 86400000));
+};
+
+// Reference timestamp for "days in status": running counts from started_at,
+// closed rows from ended_at, otherwise from the last row touch. Read-only;
+// the human still owns every status move.
+const statusRefOf = (r) =>
+  r.status === "running" ? (r.started_at || r.updated_at || r.created_at)
+  : (r.status === "won" || r.status === "lost") ? (r.ended_at || r.updated_at || r.created_at)
+  : (r.updated_at || r.created_at);
+
 async function listExperiments(env, url) {
   const status = url.searchParams.get("status") || "";
   const opp = url.searchParams.get("opportunity_id") || "";
@@ -189,11 +204,17 @@ async function listExperiments(env, url) {
   if (opp) { where.push("e.opportunity_id = ?"); args.push(opp); }
   const rows = await env.DB.prepare(
     `SELECT e.*, o.title AS opportunity_title, o.slug AS opportunity_slug
-     FROM experiments e JOIN opportunities o ON o.id = e.opportunity_id
+     FROM experiments e LEFT JOIN opportunities o ON o.id = e.opportunity_id
      ${where.length ? "WHERE " + where.join(" AND ") : ""}
      ORDER BY e.updated_at DESC LIMIT 100`
   ).bind(...args).all();
-  return json({ experiments: rows.results || [] });
+  const now = Date.now();
+  const withAge = (rows.results || []).map((r) => ({
+    ...r,
+    orphaned: r.opportunity_title == null,
+    days_in_status: daysSince(statusRefOf(r), now),
+  }));
+  return json({ experiments: withAge });
 }
 
 async function createExperiment(request, env) {
@@ -268,11 +289,17 @@ export async function onRequest(context) {
       const bareRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL").first().catch(() => null) : null;
       const expRows = env.DB ? await env.DB.prepare("SELECT status, COUNT(*) AS n FROM experiments GROUP BY status").all().catch(() => ({ results: [] })) : { results: [] };
       const lastOk = env.DB ? await env.DB.prepare("SELECT finished_at, started_at FROM agent_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first().catch(() => null) : null;
+      const oldestUnreviewed = env.DB ? await env.DB.prepare("SELECT created_at FROM opportunities WHERE notes LIKE '%UNREVIEWED%' ORDER BY created_at ASC, id ASC LIMIT 1").first().catch(() => null) : null;
+      let oldest_unreviewed_age_h = null;
       let hours_since_last_ok_run = null;
       if (lastOk) {
         const ts = lastOk.finished_at || lastOk.started_at || "";
         const ms = ts ? Date.parse(ts) : NaN;
         if (Number.isFinite(ms)) hours_since_last_ok_run = Math.round(((Date.now() - ms) / 3600000) * 10) / 10;
+      }
+      if (oldestUnreviewed && oldestUnreviewed.created_at) {
+        const oms = Date.parse(oldestUnreviewed.created_at);
+        if (Number.isFinite(oms)) oldest_unreviewed_age_h = Math.round(((Date.now() - oms) / 3600000) * 10) / 10;
       }
       const experiments_by_status = {};
       for (const r of (expRows.results || [])) experiments_by_status[r.status] = r.n;
@@ -281,7 +308,7 @@ export async function onRequest(context) {
         const r = await fetch(new URL("/release.json", url.origin));
         if (r.ok) rev = (await r.json()).revision || rev;
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, time: new Date().toISOString() });
+      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, time: new Date().toISOString() });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

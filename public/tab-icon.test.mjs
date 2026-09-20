@@ -59,6 +59,42 @@ describe("tab icon", () => {
     assert.ok(text.includes('viewBox="0 0 32 32"'), "favicon.svg must use viewBox 0 0 32 32");
   });
 
+  it("served pages ship light mode only (no dark branch or theme toggle)", () => {
+    const css = readFileSync(join(ROOT, "styles.css"), "utf8");
+    const js = readFileSync(join(ROOT, "app.js"), "utf8");
+    assert.ok(
+      /color-scheme\s*:\s*light/.test(css),
+      "styles.css must declare color-scheme: light"
+    );
+    for (const [label, text] of [["styles.css", css], ["app.js", js]]) {
+      assert.ok(!text.includes("prefers-color-scheme"), `${label}: ships a dark-mode media query`);
+      assert.ok(!text.includes("data-theme"), `${label}: ships a theme-switch hook`);
+    }
+    for (const f of servedHtmlFiles()) {
+      const html = readFileSync(join(ROOT, f), "utf8");
+      assert.ok(!html.includes("prefers-color-scheme"), `${f}: ships a dark-mode media query`);
+      assert.ok(!html.includes("data-theme"), `${f}: ships a theme-switch hook`);
+      for (const hook of ["toggleTheme", "setTheme", "useTheme"]) {
+        assert.ok(!html.includes(hook) && !js.includes(hook), `${f}/app.js: ships a theme toggle (${hook})`);
+      }
+    }
+  });
+
+  it("page header repeats the favicon brand mark inline", () => {
+    const favicon = readFileSync(join(ROOT, "favicon.svg"), "utf8");
+    const accent = (favicon.match(/<rect[^>]*fill="([^"]+)"/) || [])[1];
+    assert.ok(accent, "favicon.svg has no accent rect to match");
+    const files = servedHtmlFiles();
+    assert.ok(files.length > 0, "expected at least one served *.html");
+    for (const f of files) {
+      const html = readFileSync(join(ROOT, f), "utf8");
+      assert.ok(html.includes("<svg"), `${f}: header lacks an inline brand SVG`);
+      assert.ok(html.includes('viewBox="0 0 32 32"'), `${f}: brand mark must reuse the favicon geometry`);
+      assert.ok(html.includes(accent), `${f}: brand mark must reuse the favicon accent ${accent}`);
+      assert.ok(html.includes("$</text>"), `${f}: brand mark must reuse the favicon glyph`);
+    }
+  });
+
   it("every served HTML page links /favicon.svg and sets theme-color", () => {
     const files = servedHtmlFiles();
     assert.ok(files.length > 0, "expected at least one served *.html");

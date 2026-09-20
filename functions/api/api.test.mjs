@@ -45,8 +45,31 @@ function makeDB(seed = {}) {
     return { results: rows };
   }
 
+  // Emulates listExperiments: honors the JOIN type in the SQL (inner JOIN
+  // drops dangling rows, LEFT JOIN keeps them with null opp fields),
+  // status/opportunity filters, updated_at DESC order, LIMIT 100.
+  function listExperiments(sql, args) {
+    let idx = 0;
+    let status = null;
+    let opp = null;
+    if (sql.includes("e.status = ?")) status = args[idx++];
+    if (sql.includes("e.opportunity_id = ?")) opp = args[idx++];
+    const leftJoin = sql.includes("LEFT JOIN");
+    let rows = data.experiments.slice();
+    if (status) rows = rows.filter((e) => e.status === status);
+    if (opp) rows = rows.filter((e) => String(e.opportunity_id) === String(opp));
+    rows.sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+    rows = rows.slice(0, 100).map((e) => {
+      const o = data.opportunities.find((x) => String(x.id) === String(e.opportunity_id));
+      return { ...e, opportunity_title: o ? o.title : null, opportunity_slug: o ? o.slug : null };
+    });
+    if (!leftJoin) rows = rows.filter((r) => r.opportunity_title !== null);
+    return { results: rows };
+  }
+
   function handleAll(sql, args) {
     if (sql.includes("FROM opportunities o")) return listOpportunities(sql, args);
+    if (sql.includes("FROM experiments e")) return listExperiments(sql, args);
     if (sql.includes("FROM experiments") && sql.includes("GROUP BY status")) {
       const counts = {};
       for (const e of data.experiments) counts[e.status] = (counts[e.status] || 0) + 1;
@@ -67,6 +90,12 @@ function makeDB(seed = {}) {
     }
     if (sql.includes("UNREVIEWED") && sql.includes("COUNT(*)")) {
       return { n: data.opportunities.filter((o) => String(o.notes || "").includes("UNREVIEWED")).length };
+    }
+    if (sql.includes("UNREVIEWED") && sql.includes("ORDER BY created_at")) {
+      const unrev = data.opportunities
+        .filter((o) => String(o.notes || "").includes("UNREVIEWED"))
+        .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || a.id - b.id);
+      return unrev[0] ? { created_at: unrev[0].created_at } : null;
     }
     if (sql.includes("COUNT(*)") && sql.includes("FROM opportunities") && !sql.includes("WHERE")) {
       return { n: data.opportunities.length };
@@ -218,6 +247,70 @@ describe("experiment closure rules (F5)", () => {
       { method: "PATCH", token: "secret", body: { status: "running" } }, db);
     assert.equal(r2.status, 200);
     assert.equal(db.data.experiments[1].started_at, "2026-01-01T00:00:00Z");
+  });
+});
+
+describe("experiment age + backlog age (round1 Task 1)", () => {
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+
+  it("adds days_in_status from the status reference timestamp", async () => {
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "s", title: "Seed one", status: "backlog", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "", created_at: daysAgo(30), updated_at: daysAgo(30) },
+      ],
+      experiments: [
+        { id: 1, opportunity_id: 1, name: "stale planned", status: "planned", created_at: daysAgo(21), updated_at: daysAgo(21), started_at: "", ended_at: "" },
+        { id: 2, opportunity_id: 1, name: "fresh planned", status: "planned", created_at: daysAgo(1), updated_at: daysAgo(1), started_at: "", ended_at: "" },
+        { id: 3, opportunity_id: 1, name: "running", status: "running", created_at: daysAgo(10), updated_at: daysAgo(1), started_at: daysAgo(5), ended_at: "" },
+        { id: 4, opportunity_id: 1, name: "won", status: "won", created_at: daysAgo(40), updated_at: daysAgo(2), started_at: daysAgo(30), ended_at: daysAgo(2), result: "r", post_mortem: "pm" },
+      ],
+    });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments", {}, db);
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.body.experiments.map((e) => [e.id, e]));
+    assert.equal(byId[1].days_in_status, 21);
+    assert.equal(byId[2].days_in_status, 1);
+    assert.equal(byId[3].days_in_status, 5);
+    assert.equal(byId[4].days_in_status, 2);
+  });
+
+  it("reports oldest_unreviewed_age_h on /api/health, null when queue empty", async () => {
+    const hoursAgo = (n) => new Date(Date.now() - n * 3600000).toISOString();
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "UNREVIEWED", created_at: hoursAgo(50), updated_at: hoursAgo(50) },
+        { id: 2, slug: "b", title: "B", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "UNREVIEWED", created_at: hoursAgo(5), updated_at: hoursAgo(5) },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.unreviewed, 2);
+    assert.ok(Math.abs(r.body.oldest_unreviewed_age_h - 50) < 0.5);
+    const empty = makeDB({ opportunities: [] });
+    const r2 = await callApi(["health"], "http://localhost/api/health", {}, empty);
+    assert.equal(r2.status, 200);
+    assert.equal(r2.body.oldest_unreviewed_age_h, null);
+  });
+});
+
+describe("orphaned experiments (round1 Task 3)", () => {
+  it("keeps dangling rows via LEFT JOIN with orphaned:true", async () => {
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "s", title: "Seed one", status: "backlog", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+      ],
+      experiments: [
+        { id: 9, opportunity_id: 999, name: "Orphan", status: "running", created_at: "2026-01-05T00:00:00Z", updated_at: "2026-01-06T00:00:00Z", started_at: "2026-01-06T00:00:00Z", ended_at: "" },
+        { id: 10, opportunity_id: 1, name: "Linked", status: "planned", created_at: "2026-01-05T00:00:00Z", updated_at: "2026-01-05T00:00:00Z", started_at: "", ended_at: "" },
+      ],
+    });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments", {}, db);
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.body.experiments.map((e) => [e.id, e]));
+    assert.equal(byId[9].orphaned, true);
+    assert.equal(byId[9].opportunity_title, null);
+    assert.equal(byId[10].orphaned, false);
+    assert.equal(byId[10].opportunity_title, "Seed one");
   });
 });
 

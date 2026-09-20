@@ -6,6 +6,7 @@ const $ = (sel, el = document) => el.querySelector(sel);
 const state = {
   opportunities: [], experiments: [], runs: [], meta: {},
   statusFilter: "", detail: null, reviewOnly: false, reviewList: [],
+  health: {},
   token: localStorage.getItem("aimoney_admin") || "",
 };
 
@@ -123,6 +124,22 @@ async function refreshReview() {
   } catch { state.reviewList = []; }
   const el = $("#review-count");
   if (el) el.textContent = state.reviewList.length;
+  const ageEl = $("#review-age");
+  if (ageEl) ageEl.textContent = oldestReviewAge();
+}
+
+const fmtAgeH = (h) =>
+  h < 1 ? " · oldest <1h" : h < 24 ? ` · oldest ${Math.floor(h)}h` : ` · oldest ${Math.floor(h / 24)}d`;
+
+// Oldest unreviewed age for the review chip: prefer /api/health, fall back
+// to the oldest row of the already-fetched oldest-first review list.
+function oldestReviewAge() {
+  if (!state.reviewList.length) return "";
+  const h = state.health && state.health.oldest_unreviewed_age_h;
+  if (typeof h === "number" && Number.isFinite(h)) return fmtAgeH(h);
+  const ms = Date.parse(state.reviewList[0].created_at || "");
+  if (!Number.isFinite(ms)) return "";
+  return fmtAgeH((Date.now() - ms) / 3600000);
 }
 
 function cleanUnreviewed(notes) {
@@ -186,6 +203,11 @@ document.querySelectorAll(".filters .chip").forEach((chip) => {
 /* ---- experiments board ---- */
 const EXP_COLS = [["running", "Running"], ["planned", "Planned"], ["won", "Won"], ["lost", "Lost"], ["paused", "Paused"]];
 
+// Stale-first age chip for open experiments (days_in_status from the API).
+const ageChip = (e) =>
+  (e.status === "planned" || e.status === "running") && Number.isFinite(e.days_in_status)
+    ? ` <span class="age-chip" title="Days in ${esc(e.status)}">${e.days_in_status}d</span>` : "";
+
 function renderExperiments() {
   const exps = state.experiments;
   $("#exp-count").textContent = exps.length || "";
@@ -195,18 +217,22 @@ function renderExperiments() {
     ? `${exps.length} experiments · ${running} running · ${won} won`
     : "No experiments yet.";
   $("#board").innerHTML = EXP_COLS.map(([st, label]) => {
-    const list = exps.filter((e) => e.status === st);
+    const list = exps.filter((e) => e.status === st)
+      .sort((a, b) => (b.days_in_status ?? -1) - (a.days_in_status ?? -1));
     return `<div class="column"><h3>${label} (${list.length})</h3>` +
       (list.map((e) => `
-        <div class="card" data-id="${e.id}" data-opp="${e.opportunity_id}">
+        <div class="card" data-id="${e.id}" data-opp="${e.opportunity_id}"${e.orphaned ? ` data-orphan="1"` : ""}>
           <h4>${esc(e.name)}</h4>
-          <p>${esc(e.opportunity_title || "")}${e.metric ? ` · ${esc(e.metric)}` : ""}</p>
+          <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}</p>
           <div class="meta">${statusPill(e.status)}
             <span class="muted mono">${esc(e.result ? `→ ${e.result.slice(0, 40)}` : (e.target || ""))}</span></div>
         </div>`).join("") || `<p class="muted">—</p>`) + `</div>`;
   }).join("");
   document.querySelectorAll("#board .card").forEach((c) => {
-    c.addEventListener("click", () => openDrawer(Number(c.dataset.opp), Number(c.dataset.id)));
+    c.addEventListener("click", () => {
+      if (c.dataset.orphan === "1") return toast("Orphaned experiment — its opportunity was deleted.");
+      openDrawer(Number(c.dataset.opp), Number(c.dataset.id));
+    });
   });
 }
 
@@ -501,6 +527,7 @@ async function refresh() {
   state.opportunities = opps.opportunities || [];
   state.experiments = exps.experiments || [];
   state.runs = runs.runs || [];
+  state.health = health || {};
   state.meta = await api("/api/meta").catch(() => ({}));
   await refreshReview().catch(() => {});
   $("#rev").textContent = health.rev ? `rev ${health.rev}` : "";

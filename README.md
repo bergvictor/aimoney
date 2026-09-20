@@ -66,9 +66,10 @@ Agent proposals enter as `researching` with an `UNREVIEWED` marker in notes and 
 
 ## Review flow (who vets, what moves)
 
-- The Priority tab's "Needs review (N)" chip lists agent proposals oldest-first (`GET /api/opportunities?unreviewed=1&sort=oldest`).
+- The Priority tab's "Needs review (N · oldest 3d)" chip lists agent proposals oldest-first (`GET /api/opportunities?unreviewed=1&sort=oldest`); the age comes from `oldest_unreviewed_age_h` in `/api/health`.
 - A human admin vets each row: "Vet" clears the `UNREVIEWED` marker (keeps status, lifts the 6000 cap); "Kill" sets `killed` and requires a one-line post-mortem in notes.
 - `researching → testing` is a human decision: flip to `testing` when you start a real experiment (log it on the Experiments tab, move it `planned → running`). The agent never moves status.
+- The Experiments tab sorts each column stale-first with `Nd` age chips on `planned`/`running` cards (`days_in_status` from `/api/experiments`); an experiment whose opportunity was deleted keeps its card with an `orphaned` pill instead of vanishing.
 - Closing an experiment as `won`/`lost` requires `result` + `post_mortem`; `ended_at` stamps automatically. `running` stamps `started_at` when empty.
 
 ## Seed vs live counts
