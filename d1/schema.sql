@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS experiments (
   post_mortem     TEXT NOT NULL DEFAULT '',
   revenue_cents   INTEGER NOT NULL DEFAULT 0,
   spent_cents     INTEGER NOT NULL DEFAULT 0,
+  revenue_source  TEXT NOT NULL DEFAULT '',
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );

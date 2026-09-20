@@ -13,6 +13,7 @@ const AI_CLASSIFY = "@cf/mistral/mistral-7b-instruct-v0.1"; // fast triage
 const AI_BRIEF = "@cf/meta/llama-3.1-8b-instruct";          // quality writing
 const MAX_SIGNALS_PER_SOURCE = 8;
 const MAX_AI_SIGNALS = 6;
+const MAX_NEW_PER_RUN = 2; // inflow cap: at most 2 new proposals per run (brief capacity is 1+1 per cron tick)
 const MAX_AI_CALLS = 4;
 const FETCH_TIMEOUT_MS = 6000;
 const CLASSIFY_TOKENS = 1200;
@@ -295,6 +296,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
     // Validate: one verdict per signal (first wins), strict action enum,
     // numeric-or-null opportunity_id (the model once emitted repo names).
     const seen = new Set();
+    let newInserts = 0; // new rows inserted this run (capped at MAX_NEW_PER_RUN)
     for (const v of verdicts) {
       if (!v || typeof v !== "object") continue;
       const n = Number(v.n);
@@ -312,6 +314,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
         v.action = "noise"; // supports without a valid id is noise, not new
       }
       if (v.action === "new" && v.title) {
+        if (newInserts >= MAX_NEW_PER_RUN) continue; // overflow new-verdict signals stay processed = 0 for a later tick
         const slug = slugify(v.title) || `agent-${sig.id}`;
         // Code-enforced humility: live runs proved model calibration is
         // fiction (confidence 10 for a random GitHub repo, outranking the
@@ -334,6 +337,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
             "agent", String(sig.url || "").slice(0, 500),
             `Agent proposal from ${sig.source} signal "${sig.title}" (${sig.url}) — UNREVIEWED, scores capped until a human vets it (agent estimates — correct on vet).`.slice(0, 1000)).run();
           state.added++;
+          newInserts++;
           await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
             .bind(r.meta.last_row_id, sig.id).run();
         } catch {

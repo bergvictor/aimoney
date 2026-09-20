@@ -176,10 +176,10 @@ function makeDB(seed = {}) {
 
   function handleRun(sql, args) {
     if (sql.includes("INSERT INTO experiments")) {
-      const [opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents] = args;
+      const [opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, revenue_source] = args;
       const id = data.experiments.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0) + 1;
       const now = new Date().toISOString();
-      data.experiments.push({ id, opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents: revenue_cents || 0, spent_cents: spent_cents || 0, created_at: now, updated_at: now });
+      data.experiments.push({ id, opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents: revenue_cents || 0, spent_cents: spent_cents || 0, revenue_source: revenue_source || "", created_at: now, updated_at: now });
       return { success: true, meta: { last_row_id: id } };
     }
     if (sql.includes("INSERT INTO opportunities")) {
@@ -193,10 +193,10 @@ function makeDB(seed = {}) {
       return { success: true, meta: { last_row_id: row.id } };
     }
     if (sql.includes("UPDATE experiments SET")) {
-      const [name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, id] = args;
+      const [name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, revenue_source, id] = args;
       const row = data.experiments.find((e) => String(e.id) === String(id));
       if (row) {
-        Object.assign(row, { name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents });
+        Object.assign(row, { name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, revenue_source });
       }
       return { success: true };
     }
@@ -968,6 +968,80 @@ describe("lifetime revenue/spend totals (audit 2026-09-20-round1 Task 3)", () =>
     }
     assert.equal(r.body.revenue_total, 0);
     assert.equal(r.body.spent_total, 0);
+  });
+});
+
+describe("experiment revenue source (audit 2026-09-20-round2 Task 3)", () => {
+  it("POST /experiments stores revenue_source, defaulting '' and truncating to 120", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Paid pilot", revenue_cents: 50000, revenue_source: "Stripe" } }, db);
+    assert.equal(r.status, 201);
+    assert.equal(db.data.experiments.find((e) => e.id === r.body.id).revenue_source, "Stripe");
+    const dflt = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "No source yet" } }, db);
+    assert.equal(dflt.status, 201);
+    assert.equal(db.data.experiments.find((e) => e.id === dflt.body.id).revenue_source, "");
+    const long = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Long source", revenue_source: "x".repeat(200) } }, db);
+    assert.equal(long.status, 201);
+    assert.equal(db.data.experiments.find((e) => e.id === long.body.id).revenue_source, "x".repeat(120));
+  });
+
+  it("PATCH /experiments updates revenue_source, truncates, and defaults '' on legacy rows", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { revenue_source: "Gumroad" } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(db.data.experiments[0].revenue_source, "Gumroad");
+    const long = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { revenue_source: "y".repeat(200) } }, db);
+    assert.equal(long.status, 200);
+    assert.equal(db.data.experiments[0].revenue_source, "y".repeat(120));
+    // Legacy row without the key (pre-migration read): an unrelated PATCH defaults it to ''.
+    const db2 = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const untouched = await callApi(["experiments", "2"], "http://localhost/api/experiments/2",
+      { method: "PATCH", token: "secret", body: { target: "10 replies" } }, db2);
+    assert.equal(untouched.status, 200);
+    assert.equal(db2.data.experiments[1].revenue_source, "");
+  });
+
+  it("POST close carries via {source} in the ledger; empty source renders unchanged", async () => {
+    const db = makeDB({ opportunities: [{ id: 1, slug: "a", title: "A", status: "testing", value: 7, effort: 3, confidence: 5, fit: 8, score: 7000, notes: "seed notes", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "W", status: "won", result: "made cash", post_mortem: "worked", revenue_cents: 50000, spent_cents: 1250, revenue_source: "Stripe" } }, db);
+    assert.equal(r.status, 201);
+    assert.ok(db.data.opportunities[0].notes.includes('outcome] Experiment "W" won: made cash ($500.00 rev / $12.50 spent via Stripe)'));
+    const db2 = makeDB({ opportunities: [{ id: 1, slug: "a", title: "A", status: "testing", value: 7, effort: 3, confidence: 5, fit: 8, score: 7000, notes: "seed notes", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] });
+    const r2 = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Z", status: "lost", result: "no sales", post_mortem: "wrong channel" } }, db2);
+    assert.equal(r2.status, 201);
+    assert.ok(db2.data.opportunities[0].notes.includes('outcome] Experiment "Z" lost: no sales ($0.00 rev / $0.00 spent)'));
+    assert.ok(!db2.data.opportunities[0].notes.includes("via "), "empty source must leave the ledger line unchanged");
+  });
+
+  it("PATCH close carries via {source}; editing a closed row still appends nothing", async () => {
+    const db = makeDB({
+      opportunities: [{ id: 1, slug: "a", title: "A", status: "testing", value: 7, effort: 3, confidence: 5, fit: 8, score: 7000, notes: "seed notes", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }],
+      experiments: [{ id: 1, opportunity_id: 1, name: "Landing test", hypothesis: "", status: "running", budget_cap: "", spent: "", metric: "", target: "", result: "", started_at: "2026-09-01T00:00:00Z", ended_at: "", post_mortem: "", revenue_cents: 0, spent_cents: 0 }],
+    });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "won", result: "12 signups in 7d", post_mortem: "headline worked", revenue_cents: 1050, revenue_source: "PayPal" } }, db);
+    assert.equal(r.status, 200);
+    assert.ok(db.data.opportunities[0].notes.includes('outcome] Experiment "Landing test" won: 12 signups in 7d ($10.50 rev / $0.00 spent via PayPal)'));
+    const before = db.data.opportunities[0].notes;
+    const edit = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { result: "updated" } }, db);
+    assert.equal(edit.status, 200);
+    assert.equal(db.data.opportunities[0].notes, before);
+  });
+
+  it("closure gate unchanged: won/lost still require result + post-mortem", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "won", result: "made $", revenue_source: "Stripe" } }, db);
+    assert.equal(r.status, 400);
+    assert.ok(r.body.fields && r.body.fields.post_mortem);
   });
 });
 

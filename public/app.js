@@ -297,6 +297,62 @@ function inlinePostMortem(container, { label, placeholder, confirmText, onSubmit
   input.focus();
   return true;
 }
+// Inline $ + one-line close-as-won row: mirrors inlinePostMortem with an added
+// human-entered revenue input, so a win costs the same single click as a loss.
+// Empty lines cancel with the row untouched; bad/negative $ clamps to 0
+// exactly like the modal. Returns false when a row is already open.
+function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, cancelToast }) {
+  if (!container) return false;
+  if (container.querySelector("[data-pm-input]")) return false;
+  const row = document.createElement("div");
+  row.className = "pm-inline";
+  const amount = document.createElement("input");
+  amount.type = "text";
+  amount.dataset.winAmount = "1";
+  amount.placeholder = "Revenue $ (human-entered, e.g. 500)";
+  amount.setAttribute("aria-label", "Revenue in dollars");
+  amount.inputMode = "decimal";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.dataset.pmInput = "1";
+  input.placeholder = placeholder || label || "One-line post-mortem";
+  input.setAttribute("aria-label", label || "One-line post-mortem");
+  input.maxLength = 200;
+  const ok = document.createElement("button");
+  ok.type = "button";
+  ok.className = "btn small";
+  ok.textContent = confirmText || "Confirm";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn small ghost";
+  cancel.textContent = "Cancel";
+  const cleanup = () => row.remove();
+  cancel.addEventListener("click", (ev) => { ev.stopPropagation(); cleanup(); toast(cancelToast); });
+  const submit = () => {
+    const pm = input.value;
+    if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }
+    const revenueCents = Math.max(0, Math.round(Number(amount.value.trim()) * 100) || 0);
+    cleanup();
+    onSubmit(pm, revenueCents);
+  };
+  ok.addEventListener("click", (ev) => { ev.stopPropagation(); submit(); });
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
+  });
+  amount.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
+  });
+  row.appendChild(amount);
+  row.appendChild(input);
+  row.appendChild(ok);
+  row.appendChild(cancel);
+  container.appendChild(row);
+  amount.focus();
+  return true;
+}
+
 function cleanUnreviewed(notes) {
   return String(notes || "").replace(/UNREVIEWED,?\s*/g, "").replace(/UNREVIEWED/g, "").trim();
 }
@@ -432,6 +488,32 @@ async function loseExperiment(id, anchorEl) {
   inlinePostMortem(loseContainer, { label: "One-line post-mortem (required to close as lost):", placeholder: "One-line post-mortem (required to close as lost):", confirmText: "Lose", onSubmit: (pm) => doLose(pm), cancelToast: "Close cancelled — post-mortem required." });
 }
 
+// One-click Win for planned/running experiments: one inline $ amount + one
+// inline line, then a single PATCH to won sending that line as both result
+// and post_mortem and the human-entered amount as revenue_cents so the API
+// closure gate holds unchanged (ended_at stamped by the API). Token-gated
+// like loseExperiment; orphaned cards never render the button; an empty
+// inline line cancels with the row untouched; bad/negative $ clamps to 0
+// exactly like the modal. Human-pressed, one decision.
+async function winExperiment(id, anchorEl) {
+  if (!state.token) return openAdminModal("Enter the admin token first.");
+  // (modal gate above supersedes the toast gate on the next line)
+  if (!state.token) return toast("Enter the admin token first.");
+  const winContainer = (anchorEl ? (anchorEl.closest(".card") || anchorEl.closest(".review-actions") || anchorEl.parentElement) : null) || document.querySelector("#board") || document.body;
+  const doWin = async (pm, revenueCents) => {
+  // (cancel handled by inline row: empty still cancels, row untouched)
+  try {
+    await api(`/api/experiments/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status: "won", result: pm.trim(), post_mortem: pm.trim(), revenue_cents: revenueCents }),
+    });
+    toast("Experiment closed as won");
+    await refresh();
+  } catch (e) { toast(`Close failed: ${e.message}`); }
+  };
+  inlineWinClose(winContainer, { label: "One-line post-mortem (required to close as won):", placeholder: "One-line post-mortem (required to close as won):", confirmText: "Win", onSubmit: (pm, revenueCents) => doWin(pm, revenueCents), cancelToast: "Win cancelled — post-mortem required." });
+}
+
 function renderExperiments() {
   const exps = state.experiments;
   $("#exp-count").textContent = exps.length || "";
@@ -472,17 +554,18 @@ function renderExperiments() {
       (list.map((e) => `
         <div class="card" data-id="${e.id}" data-opp="${e.opportunity_id}"${e.orphaned ? ` data-orphan="1"` : ""}>
           <h4>${esc(e.name)}</h4>
-          <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}${runningMismatchBadge(e)}${e.revenue_cents > 0 ? ` · <span class="mono">${moneyCents(e.revenue_cents)} rev</span>` : ""}${e.spent_cents > 0 ? ` · <span class="mono">${moneyCents(e.spent_cents)} spent</span>` : ""}</p>
+          <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}${runningMismatchBadge(e)}${e.revenue_cents > 0 ? ` · <span class="mono">${moneyCents(e.revenue_cents)} rev</span>${e.revenue_source ? ` via ${esc(e.revenue_source)}` : ""}` : ""}${e.spent_cents > 0 ? ` · <span class="mono">${moneyCents(e.spent_cents)} spent</span>` : ""}</p>
           <div class="meta">${statusPill(e.status)}
             <span class="muted mono">${esc(e.result ? `→ ${e.result.slice(0, 40)}` : (e.target || ""))}</span></div>
           ${e.status === "planned" && !e.orphaned ? `<p style="margin:6px 0 0"><button class="btn small" data-start-exp="${e.id}" type="button">Start</button></p>` : ""}
-          ${(e.status === "planned" || e.status === "running") && !e.orphaned ? `<p style="margin:6px 0 0"><button class="btn small ghost danger" data-lose-exp="${e.id}" type="button">Lose</button></p>` : ""}
+          ${(e.status === "planned" || e.status === "running") && !e.orphaned ? `<p style="margin:6px 0 0"><button class="btn small" data-win-exp="${e.id}" type="button">Win</button> <button class="btn small ghost danger" data-lose-exp="${e.id}" type="button">Lose</button></p>` : ""}
         </div>`).join("") || `<p class="muted">—</p>`) + `</div>`;
   }).join("");
   document.querySelectorAll("#board .card").forEach((c) => {
     c.addEventListener("click", (ev) => {
       if (ev.target.closest("[data-start-exp]")) return;
       if (ev.target.closest("[data-lose-exp]")) return;
+      if (ev.target.closest("[data-win-exp]")) return;
       if (c.dataset.orphan === "1") return toast("Orphaned experiment — its opportunity was deleted.");
       openDrawer(Number(c.dataset.opp), Number(c.dataset.id));
     });
@@ -582,7 +665,7 @@ async function openDrawer(id, focusExp = null) {
         <div class="card" data-exp="${e.id}" ${focusExp === e.id ? `style="border-color:var(--green)"` : ""}>
           <h4>${esc(e.name)}</h4>
           <p>${esc(e.hypothesis || "")}</p>
-          <div class="meta">${statusPill(e.status)}<span class="muted mono">${esc(e.result || e.target || "")}</span> <span class="muted mono">${moneyCents(e.revenue_cents || 0)} rev / ${moneyCents(e.spent_cents || 0)} spent${e.ended_at ? ` · ended ${esc(String(e.ended_at).slice(0, 10))}` : ""}</span></div>
+          <div class="meta">${statusPill(e.status)}<span class="muted mono">${esc(e.result || e.target || "")}</span> <span class="muted mono">${moneyCents(e.revenue_cents || 0)} rev / ${moneyCents(e.spent_cents || 0)} spent${e.revenue_source ? ` via ${esc(e.revenue_source)}` : ""}${e.ended_at ? ` · ended ${esc(String(e.ended_at).slice(0, 10))}` : ""}</span></div>
           ${e.post_mortem ? `<p><b>Post-mortem:</b> ${esc(e.post_mortem)}</p>` : ""}
           <p style="margin-top:6px"><button class="btn small ghost" data-edit-exp="${e.id}" type="button">Update</button></p>
         </div>`).join("") : `<p class="muted">None yet.</p>`}
@@ -842,6 +925,7 @@ function openExperimentModal(exp, defaultOpp = null) {
       <label>Spent<input id="m-spent" value="${esc(exp?.spent || "")}"></label>
       <label>Revenue ($)<input id="m-revenue" inputmode="decimal" value="${esc(exp?.revenue_cents ? (exp.revenue_cents / 100) : "")}"></label>
       <label>Precise spend ($)<input id="m-spend" inputmode="decimal" value="${esc(exp?.spent_cents ? (exp.spent_cents / 100) : "")}"></label>
+      <label>Revenue source<input id="m-source" maxlength="120" value="${esc(exp?.revenue_source || "")}"></label>
       <label>Result<input id="m-result" value="${esc(exp?.result || "")}"></label>
     </div>
     <label>Post-mortem (required when won/lost)<textarea id="m-pm">${esc(exp?.post_mortem || "")}</textarea></label>
@@ -860,6 +944,7 @@ function openExperimentModal(exp, defaultOpp = null) {
       result: $("#m-result").value.trim(), post_mortem: $("#m-pm").value.trim(),
       revenue_cents: Math.max(0, Math.round(Number($("#m-revenue").value.trim()) * 100) || 0),
       spent_cents: Math.max(0, Math.round(Number($("#m-spend").value.trim()) * 100) || 0),
+      revenue_source: $("#m-source").value.trim().slice(0, 120),
     };
     try {
       if (isNew) await api("/api/experiments", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
@@ -889,6 +974,15 @@ $("#board").addEventListener("click", (ev) => {
   if (!b) return;
   ev.stopPropagation();
   loseExperiment(Number(b.dataset.loseExp), b);
+});
+
+// Delegated one-click Win: mirrors the Lose listener above (cards re-render
+// on every refresh, so delegation covers all Win buttons the same way).
+$("#board").addEventListener("click", (ev) => {
+  const b = ev.target.closest("[data-win-exp]");
+  if (!b) return;
+  ev.stopPropagation();
+  winExperiment(Number(b.dataset.winExp), b);
 });
 
 /* ---- manual research trigger ---- */

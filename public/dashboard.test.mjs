@@ -335,9 +335,76 @@ describe("one-click Lose (audit 2026-09-20-round2 Task 2)", () => {
   });
 
   it("Lose delegates off #board like Start and stays token-gated", () => {
-    assert.equal(js.split('$("#board").addEventListener').length - 1, 2, "board must delegate both Start and Lose clicks");
+    assert.equal(js.split('$("#board").addEventListener').length - 1, 3, "board must delegate Start, Lose, and Win clicks");
     assert.ok(js.includes("b.dataset.loseExp"), "Lose delegation must read the card id from data-lose-exp");
     assert.ok(js.includes("Human-pressed, one decision"), "Lose must stay a human decision");
+  });
+});
+
+describe("one-click Win (audit 2026-09-20-round2 Task 1)", () => {
+  it("planned/running cards show Win beside Lose; orphaned cards never do", () => {
+    assert.ok(js.includes("data-win-exp"), "board lost the Win button");
+    assert.ok(js.includes('(e.status === "planned" || e.status === "running") && !e.orphaned'), "Win must show only on planned/running, non-orphaned cards");
+    assert.ok(js.includes(">Win</button>"), "Win button lost its label");
+    const winLine = js.split("\n").find((l) => l.includes("data-win-exp"));
+    assert.ok(winLine && winLine.includes("data-lose-exp"), "Win must sit beside Lose on the same row");
+  });
+
+  it("one click + $ + one inline line PATCHes won with that line as result and post-mortem", () => {
+    assert.ok(js.includes("winExperiment"), "app.js lost the winExperiment handler");
+    assert.ok(js.includes("winExperiment(Number("), "Win click must call winExperiment with the card id");
+    assert.ok(js.includes("inlineWinClose"), "app.js lost the inlineWinClose helper");
+    assert.ok(js.includes("One-line post-mortem (required to close as won):"), "Win lost its post-mortem prompt");
+    assert.ok(js.includes("Win cancelled — post-mortem required."), "Win lost its empty-line cancel toast");
+    assert.ok(js.includes('JSON.stringify({ status: "won"'), "Win must PATCH status=won");
+    assert.ok(js.includes("result: pm.trim(), post_mortem: pm.trim()"), "Win must send the prompt line as both result and post_mortem");
+    assert.ok(js.includes("revenue_cents: revenueCents"), "Win must send the human-entered amount as revenue_cents");
+    assert.ok(js.includes("Experiment closed as won"), "Win lost its success toast");
+    assert.ok(js.includes('if (ev.target.closest("[data-win-exp]")) return;'), "card clicks must ignore the Win button");
+  });
+
+  it("empty line cancels with the row untouched", () => {
+    const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
+    assert.ok(winRow.includes("[data-pm-input]"), "Win row lacks its one-line input");
+    assert.ok(winRow.includes("if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }"), "Win empty line must cancel with the row untouched");
+  });
+
+  it("bad/negative $ amounts clamp to 0 exactly like the modal", () => {
+    assert.ok(js.includes('Math.max(0, Math.round(Number($("#m-revenue").value.trim()) * 100) || 0)'), "modal lost its revenue clamp");
+    assert.ok(js.includes("Math.max(0, Math.round(Number(amount.value.trim()) * 100) || 0)"), "Win must clamp the inline $ amount exactly like the modal");
+  });
+
+  it("Win delegates off #board like Start/Lose and stays token-gated", () => {
+    assert.equal(js.split('$("#board").addEventListener').length - 1, 3, "board must delegate Start, Lose, and Win clicks");
+    assert.ok(js.includes("b.dataset.winExp"), "Win delegation must read the card id from data-win-exp");
+    assert.ok(js.includes("Human-pressed, one decision"), "Win must stay a human decision");
+    const winFn = js.slice(js.indexOf("async function winExperiment"), js.indexOf("async function winExperiment") + 2000);
+    assert.ok(winFn.includes('openAdminModal("Enter the admin token first.")'), "Win must open the admin modal without a token");
+  });
+});
+
+describe("revenue source (audit 2026-09-20-round2 Task 3)", () => {
+  it("experiment modal owns a revenue-source input and sends ≤120 chars", () => {
+    assert.ok(js.includes('<input id="m-source" maxlength="120"'), "experiment modal lost the revenue-source input");
+    assert.ok(js.includes('revenue_source: $("#m-source").value.trim().slice(0, 120)'), "experiment save must send revenue_source truncated to 120");
+    assert.ok(js.includes('exp?.revenue_source || ""'), "modal must prefill the source on update");
+  });
+
+  it("board shows the amount with its source; old rows render unchanged", () => {
+    assert.ok(js.includes("moneyCents(e.revenue_cents)"), "board lost its revenue figure");
+    assert.ok(js.includes("} rev</span>"), "board lost the revenue figure copy");
+    assert.ok(js.includes("e.revenue_source"), "board never reads revenue_source");
+    assert.ok(js.includes("via ${esc(e.revenue_source)}"), "board lost the via-source copy");
+    const boardLine = js.split("\n").find((l) => l.includes("} rev</span>"));
+    assert.ok(boardLine && boardLine.includes("e.revenue_cents > 0 ?"), "board must gate revenue display on stored cents");
+    assert.ok(boardLine && boardLine.includes("e.revenue_source ?"), "via-source must render only when a source exists");
+  });
+
+  it("drawer shows the amount with its source plus the ended date", () => {
+    assert.ok(js.includes("moneyCents(e.revenue_cents || 0)"), "drawer lost its revenue figure");
+    assert.ok(js.includes("rev /"), "drawer lost the '$X rev / $Y spent' copy");
+    assert.ok(js.includes("via ${esc(e.revenue_source)}"), "drawer lost the via-source copy");
+    assert.ok(js.includes("e.ended_at"), "drawer lost the ended_at date");
   });
 });
 
@@ -359,10 +426,10 @@ describe("closed-experiment money in drawer (audit 2026-09-20-round3 Task 1)", (
 });
 
 describe("token modal + inline post-mortem (audit 2026-09-20-round3 Task 2)", () => {
-  it("Vet/Kill/Start/Lose open the admin modal when the token is missing", () => {
+  it("Vet/Kill/Start/Lose/Win open the admin modal when the token is missing", () => {
     assert.ok(js.includes("function openAdminModal"), "app.js lost openAdminModal");
     assert.ok(js.includes('openAdminModal("Enter the admin token first.")'), "gated taps must open the admin modal with the toast text as subnote");
-    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 4, "Vet/Kill/Start/Lose must all open the modal");
+    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 5, "Vet/Kill/Start/Lose/Win must all open the modal");
     assert.ok(js.includes("[data-admin-subnote]"), "modal must pin the subnote");
     assert.ok(js.includes('$("#btn-admin").click()'), "openAdminModal must reuse the Admin showModal block");
   });

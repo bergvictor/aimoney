@@ -258,22 +258,24 @@ async function createExperiment(request, env) {
   const cents = (v) => Math.max(0, Math.floor(Number(v) || 0));
   const revenue_cents = cents(b.revenue_cents);
   const spent_cents = cents(b.spent_cents);
+  const revenue_source = String(b.revenue_source || "").slice(0, 120);
   const str = (v) => String(v || "");
   const r = await env.DB.prepare(
     `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
      spent, metric, target, result, started_at, ended_at, post_mortem,
-     revenue_cents, spent_cents)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+     revenue_cents, spent_cents, revenue_source)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(b.opportunity_id, str(b.name).slice(0, 200), str(b.hypothesis).slice(0, 8000),
     status,
     str(b.budget_cap).slice(0, 120), str(b.spent).slice(0, 120),
     str(b.metric).slice(0, 300), str(b.target).slice(0, 300),
     str(b.result).slice(0, 8000), started_at.slice(0, 30),
-    ended_at.slice(0, 30), str(b.post_mortem).slice(0, 8000), revenue_cents, spent_cents).run();
+    ended_at.slice(0, 30), str(b.post_mortem).slice(0, 8000), revenue_cents, spent_cents, revenue_source).run();
   if (status === "won" || status === "lost") {
     const day = nowIso.slice(0, 10);
     const oneLine = String(b.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
-    const moneyBit = " (" + centsDollars(revenue_cents) + " rev / " + centsDollars(spent_cents) + " spent)";
+    const viaBit = revenue_source ? " via " + revenue_source : "";
+    const moneyBit = " (" + centsDollars(revenue_cents) + " rev / " + centsDollars(spent_cents) + " spent" + viaBit + ")";
     const line = "[" + day + " outcome] Experiment " + String.fromCharCode(34) + String(b.name || "").slice(0, 120) + String.fromCharCode(34) + " " + status + ": " + oneLine + moneyBit;
     await env.DB.prepare(
       "UPDATE opportunities SET notes = substr(notes || ?, -8000) WHERE id = ?"
@@ -302,6 +304,8 @@ async function updateExperiment(request, env, id) {
     else if (next[f] === undefined || next[f] === null) next[f] = 0;
   }
   const nowIso = new Date().toISOString();
+  if (b.revenue_source !== undefined) next.revenue_source = String(b.revenue_source).slice(0, 120);
+  else if (next.revenue_source === undefined || next.revenue_source === null) next.revenue_source = "";
   if (next.status === "running" && !String(next.started_at || "").trim()) next.started_at = nowIso;
   if (next.status === "won" || next.status === "lost") {
     const fields = {};
@@ -316,7 +320,8 @@ async function updateExperiment(request, env, id) {
     if (cur.status !== "won" && cur.status !== "lost" && cur.opportunity_id) {
       const day = nowIso.slice(0, 10);
       const oneLine = String(next.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
-      const moneyBit = ` (${centsDollars(next.revenue_cents)} rev / ${centsDollars(next.spent_cents)} spent)`;
+      const viaBit = next.revenue_source ? ` via ${next.revenue_source}` : "";
+      const moneyBit = ` (${centsDollars(next.revenue_cents)} rev / ${centsDollars(next.spent_cents)} spent${viaBit})`;
       const line = `[${day} outcome] Experiment "${String(next.name || "").slice(0, 120)}" ${next.status}: ${oneLine}${moneyBit}`;
       await env.DB.prepare(
         "UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?"
@@ -326,11 +331,11 @@ async function updateExperiment(request, env, id) {
   await env.DB.prepare(
     `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
      metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
-     revenue_cents=?, spent_cents=?,
+     revenue_cents=?, spent_cents=?, revenue_source=?,
      updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
   ).bind(next.name, next.hypothesis, next.status, next.budget_cap, next.spent,
     next.metric, next.target, next.result, next.started_at, next.ended_at,
-    next.post_mortem, next.revenue_cents, next.spent_cents, id).run();
+    next.post_mortem, next.revenue_cents, next.spent_cents, next.revenue_source, id).run();
   return json({ id: Number(id), status: next.status });
 }
 

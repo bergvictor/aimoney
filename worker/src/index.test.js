@@ -240,6 +240,36 @@ describe("extra brief on old backlog (static guard)", () => {
   });
 });
 
+describe("new-proposal inflow cap (audit 2026-09-20-round2 Task 2)", () => {
+  it("caps new inserts at 2 per run; overflow stays unprocessed for a later tick", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("const MAX_NEW_PER_RUN = 2;"), "worker lost the inflow cap");
+    assert.ok(src.includes("newInserts >= MAX_NEW_PER_RUN"), "worker lost the overflow guard");
+    assert.ok(src.includes("stay processed = 0"), "overflow must stay processed = 0 for a later tick");
+    assert.ok(src.includes("newInserts++"), "worker lost the new-insert count");
+  });
+
+  it("noise/supports paths, verdict validation, and manual disclosure untouched", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes('v.action !== "new" && v.action !== "supports" && v.action !== "noise"'), "verdict validation changed");
+    assert.ok(src.includes("supports without a valid id is noise"), "supports guard changed");
+    assert.ok(src.includes("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?"), "supports path changed");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+    assert.ok(src.includes("-30 days"), "worker lost the 30-day staleness bound");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+  });
+
+  it("README states the inflow rule", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("at most 2 new proposals"), "README lost the inflow cap");
+    assert.ok(readme.includes("stay unprocessed for a later tick"), "README lost the retake rule");
+    assert.ok(readme.includes("inflow"), "README lost the inflow rule");
+    assert.ok(readme.includes("reversible"), "README must say reversible");
+    assert.ok(readme.includes("no status move"), "README must say no status move");
+  });
+});
+
 describe("agentMoneyEstimates zero-spend normalization (audit 2026-09-20-round2 Task 3)", () => {
   it("prefixes bare 0/free/none phrasings with $0, raw phrasing preserved", () => {
     assert.equal(agentMoneyEstimates({ capital_needed: "Free" }).capital_needed, "$0 Free");
