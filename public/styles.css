@@ -81,6 +81,10 @@ body {
   border: 1px solid var(--line); border-radius: 20px; padding: 4px 12px; color: var(--muted);
 }
 .chip.active { background: var(--ink); border-color: var(--ink); color: #fff; }
+.chip.review { border-color: var(--amber); color: var(--amber); font-weight: 650; }
+.chip.review.active { background: var(--amber); border-color: var(--amber); color: #fff; }
+.review-actions { display: flex; gap: 6px; margin-top: 6px; }
+.btn.ghost.danger { color: var(--red); border-color: var(--red); }
 
 /* Layout */
 main { max-width: 1180px; margin: 0 auto; padding: 18px 20px 60px; }

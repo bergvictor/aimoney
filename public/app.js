@@ -5,7 +5,7 @@
 const $ = (sel, el = document) => el.querySelector(sel);
 const state = {
   opportunities: [], experiments: [], runs: [], meta: {},
-  statusFilter: "", detail: null,
+  statusFilter: "", detail: null, reviewOnly: false, reviewList: [],
   token: localStorage.getItem("aimoney_admin") || "",
 };
 
@@ -61,6 +61,7 @@ activateTab(new URLSearchParams(location.search).get("tab") || "priority", false
 
 /* ---- priority list ---- */
 function renderLedger() {
+  if (state.reviewOnly) return renderReview();
   const rows = state.opportunities.filter((o) =>
     !state.statusFilter || o.status === state.statusFilter);
   const max = Math.max(1, ...state.opportunities.map((o) => o.score || 0));
@@ -83,10 +84,100 @@ function renderLedger() {
   });
 }
 
+function renderReview() {
+  const rows = state.reviewList;
+  const max = Math.max(1, ...rows.map((o) => o.score || 0));
+  $("#ledger-body").innerHTML = rows.length ? rows.map((o, i) => `
+    <tr class="row" data-id="${o.id}">
+      <td class="num rank">${i + 1}</td>
+      <td><div class="opp-title">${esc(o.title)} <span class="cat muted">· ${esc(o.category)}</span></div>
+        <div class="opp-sub">${esc(o.one_liner || "")}</div>
+        <div class="review-actions">
+          <button class="btn small" data-vet="${o.id}" type="button">Vet</button>
+          <button class="btn small ghost danger" data-kill="${o.id}" type="button">Kill</button>
+        </div></td>
+      <td>${statusPill(o.status)}</td>
+      <td class="score-cell"><span class="score-num">${esc(o.score)}</span>
+        <div class="score-bar"><i style="width:${Math.round(100 * (o.score || 0) / max)}%"></i></div></td>
+      <td>${meter(o.value)}</td><td>${meter(o.effort)}</td>
+      <td>${meter(o.confidence)}</td><td>${meter(o.fit)}</td>
+      <td class="num money">${money(o.est_monthly_low, o.est_monthly_high)}</td>
+      <td class="muted">${esc(o.time_to_first_dollar || "—")}</td>
+    </tr>`).join("")
+    : `<tr><td colspan="10" class="muted">Review queue empty — every agent proposal has been vetted or killed.</td></tr>`;
+  document.querySelectorAll("#ledger-body tr.row").forEach((tr) => {
+    tr.addEventListener("click", () => openDrawer(Number(tr.dataset.id)));
+  });
+  document.querySelectorAll("[data-vet]").forEach((b) => {
+    b.addEventListener("click", (ev) => { ev.stopPropagation(); vetOpportunity(Number(b.dataset.vet)); });
+  });
+  document.querySelectorAll("[data-kill]").forEach((b) => {
+    b.addEventListener("click", (ev) => { ev.stopPropagation(); killOpportunity(Number(b.dataset.kill)); });
+  });
+}
+
+async function refreshReview() {
+  try {
+    const r = await api("/api/opportunities?unreviewed=1&sort=oldest&limit=200");
+    state.reviewList = r.opportunities || [];
+  } catch { state.reviewList = []; }
+  const el = $("#review-count");
+  if (el) el.textContent = state.reviewList.length;
+}
+
+function cleanUnreviewed(notes) {
+  return String(notes || "").replace(/UNREVIEWED,?\s*/g, "").replace(/UNREVIEWED/g, "").trim();
+}
+
+async function vetOpportunity(id) {
+  if (!state.token) return toast("Enter the admin token first.");
+  const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
+  if (!o) return;
+  const day = new Date().toISOString().slice(0, 10);
+  const notes = `${cleanUnreviewed(o.notes)}\n[${day} vetted] Human vetted; cap lifted.`.trim().slice(-8000);
+  try {
+    await api(`/api/opportunities/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ notes }),
+    });
+    toast("Vetted — cap lifted");
+    await refresh();
+    await refreshReview();
+    if (state.reviewOnly) renderLedger();
+  } catch (e) { toast(`Vet failed: ${e.message}`); }
+}
+
+async function killOpportunity(id) {
+  if (!state.token) return toast("Enter the admin token first.");
+  const pm = prompt("One-line post-mortem (required to kill):");
+  if (!pm || !pm.trim()) return toast("Kill cancelled — post-mortem required.");
+  const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
+  if (!o) return;
+  const day = new Date().toISOString().slice(0, 10);
+  const notes = `${cleanUnreviewed(o.notes)}\n[${day} killed] ${pm.trim()}`.trim().slice(-8000);
+  try {
+    await api(`/api/opportunities/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status: "killed", notes }),
+    });
+    toast("Killed with post-mortem");
+    await refresh();
+    await refreshReview();
+    if (state.reviewOnly) renderLedger();
+  } catch (e) { toast(`Kill failed: ${e.message}`); }
+}
+
 document.querySelectorAll(".filters .chip").forEach((chip) => {
   chip.addEventListener("click", () => {
     document.querySelectorAll(".filters .chip").forEach((c) => c.classList.remove("active"));
     chip.classList.add("active");
+    if (chip.dataset.review) {
+      state.reviewOnly = true;
+      state.statusFilter = "";
+      refreshReview().then(renderLedger);
+      return;
+    }
+    state.reviewOnly = false;
     state.statusFilter = chip.dataset.status;
     renderLedger();
   });
@@ -183,6 +274,7 @@ async function openDrawer(id, focusExp = null) {
       ${o.notes ? `<h3>Notes</h3><p class="prose">${esc(o.notes)}</p>` : ""}
       <h3>Research brief</h3>${briefHtml(d.briefs[0])}
       <h3>Experiments (${d.experiments.length})</h3>
+      <p class="muted" style="font-size:12.5px">Closing as won/lost requires result + post-mortem; ended_at stamps automatically. Running stamps started_at when empty.</p>
       ${d.experiments.length ? d.experiments.map((e) => `
         <div class="card" data-exp="${e.id}" ${focusExp === e.id ? `style="border-color:var(--green)"` : ""}>
           <h4>${esc(e.name)}</h4>
@@ -410,6 +502,7 @@ async function refresh() {
   state.experiments = exps.experiments || [];
   state.runs = runs.runs || [];
   state.meta = await api("/api/meta").catch(() => ({}));
+  await refreshReview().catch(() => {});
   $("#rev").textContent = health.rev ? `rev ${health.rev}` : "";
   renderLedger();
   renderExperiments();

@@ -15,6 +15,29 @@ export const slugify = (s) =>
 export const scoreOf = (o) =>
   Math.round(100 * ((o.value * o.confidence * o.fit) / (o.effort + 1)) * 10) / 10;
 
+// Honest agent cap (F3): while a row carries the UNREVIEWED marker its
+// EFFECTIVE score is clamped below the human seeds that matter. Single
+// shared implementation used by both the worker and the API.
+export const UNREVIEWED_MARKER = "UNREVIEWED";
+export const UNREVIEWED_SCORE_CAP = 6000;
+
+export function isUnreviewed(opp) {
+  const notes = typeof opp === "string" ? opp : (opp && opp.notes) || "";
+  return String(notes).includes(UNREVIEWED_MARKER);
+}
+
+export function effectiveScore(o) {
+  const s = scoreOf(o);
+  return isUnreviewed(o) ? Math.min(s, UNREVIEWED_SCORE_CAP) : s;
+}
+
+// Evidence append (F4): keep the NEWEST max chars, not the oldest.
+// Mirrors the SQL fix `substr(notes || ?, -8000)` in worker/src/index.js.
+export function appendKeepNewest(notes, addition, max = 8000) {
+  const combined = String(notes || "") + String(addition || "");
+  return combined.length <= max ? combined : combined.slice(-max);
+}
+
 // The triage model replies with one JSON object per line (NDJSON). A hard
 // token cap truncates ARRAY output into unparseable garbage (proven live:
 // every verdict lost); with NDJSON a cut tail only loses the last lines.

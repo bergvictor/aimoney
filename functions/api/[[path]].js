@@ -7,14 +7,16 @@ const json = (data, status = 200) =>
     headers: { "content-type": "application/json; charset=utf-8" },
   });
 
+import { effectiveScore } from "../../worker/src/lib.js";
+
 const clamp10 = (v, dflt) => {
   const n = Number(v);
   if (!Number.isFinite(n)) return dflt;
   return Math.min(10, Math.max(1, Math.round(n)));
 };
 
-const scoreOf = (o) =>
-  Math.round(100 * ((o.value * o.confidence * o.fit) / (o.effort + 1)) * 10) / 10;
+// effectiveScore shared via worker/src/lib.js (F3); scoreOf deduped (F6).
+// (local duplicate removed; see import above)
 
 function authed(request, env) {
   const want = (env.ADMIN_TOKEN || "").trim();
@@ -38,12 +40,15 @@ async function listOpportunities(env, url) {
   const status = url.searchParams.get("status") || "";
   const category = url.searchParams.get("category") || "";
   const sort = url.searchParams.get("sort") || "score";
+  const unreviewedOnly = url.searchParams.get("unreviewed") === "1";
   const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 100));
   const where = [];
   const args = [];
   if (status && OPP_STATUSES.has(status)) { where.push("o.status = ?"); args.push(status); }
   if (category) { where.push("o.category = ?"); args.push(category); }
+  if (unreviewedOnly) { where.push("o.notes LIKE '%UNREVIEWED%'"); }
   const order = sort === "updated" ? "o.updated_at DESC" :
+    sort === "oldest" ? "o.created_at ASC, o.id ASC" :
     sort === "value" ? "o.value DESC, o.score DESC" : "o.score DESC, o.updated_at DESC";
   const rows = await env.DB.prepare(
     `SELECT o.*,
@@ -53,7 +58,11 @@ async function listOpportunities(env, url) {
      ${where.length ? "WHERE " + where.join(" AND ") : ""}
      ORDER BY ${order} LIMIT ?`
   ).bind(...args, limit).all();
-  return json({ opportunities: rows.results || [] });
+  const capped = (rows.results || []).map((r) => ({ ...r, score: effectiveScore(r) }));
+  if (sort === "score") {
+    capped.sort((a, b) => (b.score - a.score) || String(b.updated_at).localeCompare(String(a.updated_at)));
+  }
+  return json({ opportunities: capped });
 }
 
 async function getOpportunity(env, id) {
@@ -91,7 +100,7 @@ async function createOpportunity(request, env) {
     source_url: String(b.source_url || "").slice(0, 500),
     notes: String(b.notes || "").slice(0, 8000),
   };
-  o.score = scoreOf(o);
+  o.score = effectiveScore(o);
   try {
     const r = await env.DB.prepare(
       `INSERT INTO opportunities (${OPP_FIELDS.join(",")}, score)
@@ -122,7 +131,7 @@ async function updateOpportunity(request, env, id) {
     if (b[f] !== undefined) next[f] = Math.max(0, Number(b[f]) || 0);
   }
   if (Array.isArray(b.skills_needed)) next.skills_needed = JSON.stringify(b.skills_needed);
-  next.score = scoreOf(next);
+  next.score = effectiveScore(next);
   await env.DB.prepare(
     `UPDATE opportunities SET title=?, one_liner=?, category=?, status=?, value=?,
      effort=?, confidence=?, fit=?, score=?, est_monthly_low=?, est_monthly_high=?,
@@ -217,7 +226,19 @@ async function updateExperiment(request, env, id) {
       "target", "result", "started_at", "ended_at", "post_mortem"]) {
     if (b[f] !== undefined) next[f] = String(b[f]);
   }
+  if (b.status !== undefined && !EXP_STATUSES.has(b.status)) {
+    return json({ error: `invalid status: ${String(b.status).slice(0, 40)}`, field: "status" }, 400);
+  }
   if (b.status !== undefined && EXP_STATUSES.has(b.status)) next.status = b.status;
+  const nowIso = new Date().toISOString();
+  if (next.status === "running" && !String(next.started_at || "").trim()) next.started_at = nowIso;
+  if (next.status === "won" || next.status === "lost") {
+    const fields = {};
+    if (!String(next.result || "").trim()) fields.result = "result is required to close as won/lost";
+    if (!String(next.post_mortem || "").trim()) fields.post_mortem = "post_mortem is required to close as won/lost";
+    if (Object.keys(fields).length) return json({ error: "result and post_mortem are required to close as won/lost", fields }, 400);
+    if (!String(next.ended_at || "").trim()) next.ended_at = nowIso;
+  }
   await env.DB.prepare(
     `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
      metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
@@ -243,12 +264,24 @@ export async function onRequest(context) {
   try {
     if (parts.length === 1 && parts[0] === "health" && method === "GET") {
       const db = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities").first().catch(() => null) : null;
+      const unreviewedRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%UNREVIEWED%'").first().catch(() => null) : null;
+      const bareRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL").first().catch(() => null) : null;
+      const expRows = env.DB ? await env.DB.prepare("SELECT status, COUNT(*) AS n FROM experiments GROUP BY status").all().catch(() => ({ results: [] })) : { results: [] };
+      const lastOk = env.DB ? await env.DB.prepare("SELECT finished_at, started_at FROM agent_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first().catch(() => null) : null;
+      let hours_since_last_ok_run = null;
+      if (lastOk) {
+        const ts = lastOk.finished_at || lastOk.started_at || "";
+        const ms = ts ? Date.parse(ts) : NaN;
+        if (Number.isFinite(ms)) hours_since_last_ok_run = Math.round(((Date.now() - ms) / 3600000) * 10) / 10;
+      }
+      const experiments_by_status = {};
+      for (const r of (expRows.results || [])) experiments_by_status[r.status] = r.n;
       let rev = "unknown";
       try {
         const r = await fetch(new URL("/release.json", url.origin));
         if (r.ok) rev = (await r.json()).revision || rev;
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, time: new Date().toISOString() });
+      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, time: new Date().toISOString() });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

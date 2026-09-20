@@ -47,6 +47,16 @@ else
   echo "FAIL priority-list-nonempty: D1 has no opportunities (seed not applied?)"; FAIL=1
 fi
 
+# Fresh agent runs: fail when the last ok run is older than 2x cron (12h).
+HOURS="$(curl -fsSL --max-time 25 "$PAGES/api/health?$CB" 2>/dev/null | python3 -c "import json,sys; v=json.load(sys.stdin).get('hours_since_last_ok_run'); print('' if v is None else v)" 2>/dev/null || echo '')"
+if [ -z "$HOURS" ]; then
+  echo "FAIL agent-freshness: hours_since_last_ok_run missing (no ok run yet?)"; FAIL=1
+elif awk "BEGIN{exit !( $HOURS > 12 )}"; then
+  echo "FAIL agent-freshness: last ok run ${HOURS}h ago (>12h)"; FAIL=1
+else
+  echo "ok   agent-freshness (${HOURS}h since last ok run)"
+fi
+
 if [ "$FAIL" -ne 0 ]; then
   echo "==> VERIFY FAILED — rollout incomplete"; exit 1
 fi

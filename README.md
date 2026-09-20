@@ -10,7 +10,7 @@ money with AI:
 - **Experiments** — strategies under test: hypothesis, cost, metric, result.
   Kill or scale based on data, then re-optimize the list.
 - **Research agents** — a scheduled Cloudflare Worker (cron) that continuously
-  scans public sources (HN, Reddit, arXiv, GitHub), proposes new
+  scans public sources (HN, Reddit, GitHub), proposes new
   opportunities, refreshes briefs, and re-scores the list with Workers AI.
   Every agent run is logged and visible on the dashboard.
 
@@ -62,6 +62,23 @@ then enter it once in the dashboard — it is kept in `localStorage` only.
 
 Status flow: `backlog → researching → testing → scaling | paused | killed`.
 Killed strategies stay on the board with their post-mortem — that is the point.
+Agent proposals enter as `researching` with an `UNREVIEWED` marker in notes and an effective score capped to ≤6000 until a human vets them (shared `effectiveScore` in `worker/src/lib.js`, used by both worker and API).
+
+## Review flow (who vets, what moves)
+
+- The Priority tab's "Needs review (N)" chip lists agent proposals oldest-first (`GET /api/opportunities?unreviewed=1&sort=oldest`).
+- A human admin vets each row: "Vet" clears the `UNREVIEWED` marker (keeps status, lifts the 6000 cap); "Kill" sets `killed` and requires a one-line post-mortem in notes.
+- `researching → testing` is a human decision: flip to `testing` when you start a real experiment (log it on the Experiments tab, move it `planned → running`). The agent never moves status.
+- Closing an experiment as `won`/`lost` requires `result` + `post_mortem`; `ended_at` stamps automatically. `running` stamps `started_at` when empty.
+
+## Seed vs live counts
+
+- `d1/seed.sql` inserts 12 researched opportunities. Live boards show more (e.g. 40) because the research agent appends proposals every 6h and humans add rows. Seed runs once on an empty table; live count = 12 seeds + agent proposals + manual adds. Killed rows stay listed, so the count only grows.
+
+## Token rotation
+
+- `ADMIN_TOKEN` lives in two places: the Pages env var and the worker secret (`wrangler secret put ADMIN_TOKEN --config worker/wrangler.toml`). The dashboard keeps a copy in `localStorage` (`aimoney_admin`).
+- To rotate: set the new value in the Pages env + worker secret, redeploy both, then re-enter it in the dashboard via the Admin button. Old browsers keep the old token until replaced. No expiry; rotate manually when shared or leaked.
 
 ## Repo layout
 

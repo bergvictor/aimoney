@@ -136,7 +136,7 @@ async function aiComplete(env, state, { model, fallback, maxTokens, messages, ti
   throw lastErr || new Error("AI failed");
 }
 
-import { clamp10, slugify, scoreOf, parseJsonLines, repairJson } from "./lib.js";
+import { clamp10, slugify, scoreOf, effectiveScore, parseJsonLines, repairJson } from "./lib.js";
 
 async function runResearch(env, trigger) {
   const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0 };
@@ -243,7 +243,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
         const slug = slugify(v.title) || `agent-${sig.id}`;
         // Code-enforced humility: live runs proved model calibration is
         // fiction (confidence 10 for a random GitHub repo, outranking the
-        // human top pick). Agent proposals enter mid-list until reviewed.
+        // human top pick). Agent proposals are capped to ≤6000 until reviewed.
         const o = { value: Math.min(7, clamp10(v.value)), effort: clamp10(v.effort),
           confidence: Math.min(5, clamp10(v.confidence, 3)), fit: clamp10(v.fit) };
         const oneLiner = String(v.one_liner || "").trim()
@@ -255,7 +255,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
           ).bind(slug, String(v.title).slice(0, 200), oneLiner.slice(0, 500),
             String(v.category || "other").slice(0, 40), "researching",
-            o.value, o.effort, o.confidence, o.fit, scoreOf(o),
+            o.value, o.effort, o.confidence, o.fit, effectiveScore({ ...o, notes: "UNREVIEWED" }),
             "agent", String(sig.url || "").slice(0, 500),
             `Agent proposal from ${sig.source} signal "${sig.title}" (${sig.url}) — UNREVIEWED, scores capped until a human vets it.`.slice(0, 1000)).run();
           state.added++;
@@ -269,7 +269,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
         await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?")
           .bind(v.opportunity_id, sig.id).run();
         await env.DB.prepare(
-          `UPDATE opportunities SET notes = substr(notes || ?, 1, 8000),
+          `UPDATE opportunities SET notes = substr(notes || ?, -8000),
            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`)
           .bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`,
             v.opportunity_id).run().catch(() => null);

@@ -2,7 +2,7 @@
 // Run: npm test  (node --test, no framework)
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { clamp10, slugify, scoreOf, parseJsonLines, repairJson } from "./lib.js";
+import { clamp10, slugify, scoreOf, parseJsonLines, repairJson, effectiveScore, isUnreviewed, appendKeepNewest, UNREVIEWED_SCORE_CAP } from "./lib.js";
 
 describe("scoreOf", () => {
   it("matches the documented formula", () => {
@@ -61,5 +61,42 @@ describe("repairJson", () => {
     const out = parseJsonLines('0:{"n":0,"action":"new","opportunity\\_id":null,"one\\_liner":"x"}');
     assert.deepEqual(out, [{ n: 0, action: "new", opportunity_id: null, one_liner: "x" }]);
     assert.equal(repairJson("a\\_b"), "a_b");
+  });
+});
+
+describe("effectiveScore (F3 honest cap)", () => {
+  it("clamps UNREVIEWED rows to at most 6000", () => {
+    // Capped-max inputs from the audit: 100*7*5*10/2 = 17500 uncapped.
+    const uncapped = scoreOf({ value: 7, effort: 1, confidence: 5, fit: 10 });
+    assert.equal(uncapped, 17500);
+    const capped = effectiveScore({ value: 7, effort: 1, confidence: 5, fit: 10, notes: "x UNREVIEWED y" });
+    assert.equal(capped, UNREVIEWED_SCORE_CAP);
+    assert.equal(capped, 6000);
+    assert.ok(capped < uncapped);
+  });
+  it("leaves reviewed rows untouched", () => {
+    assert.equal(effectiveScore({ value: 8, effort: 3, confidence: 8, fit: 10, notes: "seed" }), 16000);
+    assert.equal(effectiveScore({ value: 6, effort: 5, confidence: 5, fit: 8, notes: "" }), 4000);
+  });
+  it("detects the marker in notes or raw strings", () => {
+    assert.equal(isUnreviewed({ notes: "a UNREVIEWED b" }), true);
+    assert.equal(isUnreviewed("UNREVIEWED"), true);
+    assert.equal(isUnreviewed({ notes: "vetted" }), false);
+    assert.equal(isUnreviewed({}), false);
+  });
+});
+
+describe("appendKeepNewest (F4)", () => {
+  it("keeps the newest 8000 chars", () => {
+    const old = "o".repeat(8000);
+    const fresh = "n".repeat(100);
+    const out = appendKeepNewest(old, fresh);
+    assert.equal(out.length, 8000);
+    assert.ok(out.endsWith(fresh));
+    assert.equal(out, "o".repeat(7900) + "n".repeat(100));
+  });
+  it("returns the whole string when short", () => {
+    assert.equal(appendKeepNewest("a", "b"), "ab");
+    assert.equal(appendKeepNewest("", ""), "");
   });
 });
