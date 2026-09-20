@@ -291,12 +291,26 @@ function renderRuns() {
     pill.classList.add("bad");
     pill.title = "Database unreachable (health.db != up)";
   } else if (last) {
-    pill.title = "Latest research run";
+    const noise = state.health && typeof state.health.noise_24h === "number" ? state.health.noise_24h : null;
+    pill.title = noise !== null ? "Latest research run: +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise" : "Latest research run";
     const when = last.finished_at || last.started_at || "";
     $("#agent-text").textContent =
       `agent: ${last.status} · +${last.added}/${last.updated}/${last.briefs} · ${when.slice(0, 16).replace("T", " ")}`;
+    if (noise !== null) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + noise + " noise";
     pill.classList.toggle("ok", last.status === "ok");
     pill.classList.toggle("bad", last.status === "error");
+    const runsTab = document.querySelector("#tab-research");
+    let runsSummary = document.querySelector("#runs-summary");
+    if (!runsSummary && runsTab) {
+      runsSummary = document.createElement("p");
+      runsSummary.id = "runs-summary";
+      runsSummary.className = "muted";
+      const wrap = runsTab.querySelector(".table-wrap");
+      if (wrap) runsTab.insertBefore(runsSummary, wrap);
+    }
+    if (runsSummary) {
+      runsSummary.textContent = noise !== null ? "Last run +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise in 24h" : "";
+    }
   }
   $("#runs-body").innerHTML = runs.length ? runs.map((r) => `
     <tr><td class="mono">#${r.id} ${esc(r.agent)}</td><td>${esc(r.trigger)}</td>

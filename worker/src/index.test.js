@@ -33,6 +33,19 @@ describe("manual run disclosure (/run)", () => {
   });
 });
 
+describe("main brief oldest-first on old backlog (static guard)", () => {
+  it("flips the main brief past 48h with mode disclosure", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("briefMode"), "worker lost the briefMode flag");
+    assert.ok(src.includes("oldest-first"), "worker lost the oldest-first mode");
+    assert.ok(src.includes("top-scored"), "worker lost the top-scored default");
+    assert.ok(src.includes("oldestForBrief"), "main brief lost the backlog age check");
+    assert.ok(src.includes("ORDER BY o.created_at ASC LIMIT 1"), "main brief lost the oldest-first query");
+    assert.ok(src.includes("ORDER BY o.score DESC LIMIT 1"), "main brief lost the top-scored query");
+    assert.ok(src.includes("brief:"), "run log lost the brief mode disclosure");
+  });
+});
+
 describe("extra brief on old backlog (static guard)", () => {
   it("cron path briefs one extra oldest-unreviewed row past 48h within budget", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");

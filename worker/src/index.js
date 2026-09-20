@@ -278,11 +278,25 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
       }
     }
 
-    // 3. One AI pass: brief the highest-scored opportunity that has no brief —
+    // 3. One AI pass: brief one bare row — top-scored, or oldest-unreviewed-first past 48h —
     // unless the clock is nearly spent (it lands on a later run instead).
-    const bare = (Date.now() - t0 < briefDeadline) ? await env.DB.prepare(
+    let briefMode = "skipped";
+    let bare = null;
+    if (Date.now() - t0 < briefDeadline) {
+      briefMode = "top-scored";
+      if (trigger === "cron") {
+        const oldestForBrief = await env.DB.prepare("SELECT created_at FROM opportunities WHERE notes LIKE ? ORDER BY created_at ASC LIMIT 1").bind(String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)).first().catch(() => null);
+        const ageMsForBrief = oldestForBrief && oldestForBrief.created_at ? Date.now() - Date.parse(oldestForBrief.created_at) : NaN;
+        if (Number.isFinite(ageMsForBrief) && ageMsForBrief > 48 * 3600000) {
+          briefMode = "oldest-first";
+        }
+      }
+      if (briefMode === "oldest-first") {
+        bare = await env.DB.prepare("SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL AND o.notes LIKE ? ORDER BY o.created_at ASC LIMIT 1").bind(String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)).first().catch(() => null);
+      } else {
+        bare = await env.DB.prepare(
       `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
-       WHERE b.id IS NULL ORDER BY o.score DESC LIMIT 1`).first() : null;
+       WHERE b.id IS NULL ORDER BY o.score DESC LIMIT 1`).first().catch(() => null); } }
     if (bare) {
       const sigs = await env.DB.prepare(
         "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
@@ -369,6 +383,7 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
       }
     }
     await finish("ok");
+    await finish("ok", briefMode === "skipped" ? "" : "brief:" + briefMode);
     return { status: "ok", ...state };
   } catch (e) {
     await finish("error", e && e.message || e);

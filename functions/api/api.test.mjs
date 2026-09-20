@@ -13,6 +13,7 @@ function makeDB(seed = {}) {
     briefs: (seed.briefs || []).map((b) => ({ ...b })),
     experiments: (seed.experiments || []).map((e) => ({ ...e })),
     runs: (seed.runs || []).map((r) => ({ ...r })),
+    signals: (seed.signals || []).map((s) => ({ ...s })),
   };
 
   function listOpportunities(sql, args) {
@@ -116,6 +117,18 @@ function makeDB(seed = {}) {
       for (const e of data.experiments) {
         if (e.status !== "won" && e.status !== "lost") continue;
         const ms = Date.parse(e.ended_at || "");
+        if (Number.isFinite(ms) && ms >= cutoff) n++;
+      }
+      return { n };
+    }
+    if (sql.includes("FROM signals") && sql.includes("COUNT(*)")) {
+      const cutoffArg = Date.parse(args[0] || "");
+      const cutoff = Number.isFinite(cutoffArg) ? cutoffArg : Date.now() - 86400000;
+      let n = 0;
+      for (const s of data.signals) {
+        if (Number(s.processed) !== 1) continue;
+        if (s.opportunity_id !== null && s.opportunity_id !== undefined) continue;
+        const ms = Date.parse(s.created_at || "");
         if (Number.isFinite(ms) && ms >= cutoff) n++;
       }
       return { n };
@@ -550,6 +563,64 @@ describe("decisions/week + vetted rate (round2 Task 1)", () => {
     }
     assert.equal(typeof r.body.decisions_last_7d, "number");
     assert.equal(typeof r.body.vetted_last_7d, "number");
+  });
+});
+
+describe("create-update-gaps", () => {
+  it("patch range guard works", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1", { method: "PATCH", token: "secret", body: { est_monthly_low: 5000, est_monthly_high: 500 } }, db);
+    assert.equal(r.status, 400);
+    assert.equal(r.body.field, "est_monthly_low");
+  });
+  it("patch status guard works", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1", { method: "PATCH", token: "secret", body: { status: "bogus" } }, db);
+    assert.equal(r.status, 400);
+    assert.equal(r.body.field, "status");
+  });
+  it("brief parent guard works", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["briefs"], "http://localhost/api/briefs", { method: "POST", token: "secret", body: { opportunity_id: 999, summary: "x" } }, db);
+    assert.equal(r.status, 404);
+    assert.equal(r.body.field, "opportunity_id");
+  });
+  it("ledger on create works", async () => {
+    const db = makeDB({ opportunities: [{ id: 1, slug: "a", title: "A", status: "testing", value: 7, effort: 3, confidence: 5, fit: 8, score: 7000, notes: "seed notes", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments", { method: "POST", token: "secret", body: { opportunity_id: 1, name: "W", status: "won", result: "made cash", post_mortem: "worked" } }, db);
+    assert.equal(r.status, 201);
+    const row = db.data.opportunities[0];
+    assert.equal(row.score, 7000);
+    assert.ok(row.notes.includes("outcome] Experiment"));
+    assert.ok(row.notes.includes("W"));
+    assert.ok(row.notes.includes("won: made cash"));
+  });
+});
+
+describe("triage noise (Task 3)", () => {
+  it("reports noise_24h from processed signals with no parent in 24h", async () => {
+    const hoursAgo = (n) => new Date(Date.now() - n * 3600000).toISOString();
+    const db = makeDB({
+      opportunities: oppSeed(),
+      signals: [
+        { id: 1, processed: 1, opportunity_id: null, created_at: hoursAgo(2) },
+        { id: 2, processed: 1, opportunity_id: null, created_at: hoursAgo(20) },
+        { id: 3, processed: 1, opportunity_id: null, created_at: hoursAgo(30) },
+        { id: 4, processed: 1, opportunity_id: 1, created_at: hoursAgo(2) },
+        { id: 5, processed: 0, opportunity_id: null, created_at: hoursAgo(2) },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.noise_24h, 2);
+  });
+  it("keeps every existing health key alongside noise_24h", async () => {
+    const db = makeDB({ opportunities: oppSeed(), signals: [] });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "time"]) {
+      assert.ok(k in r.body, "health missing " + k);
+    }
   });
 });
 

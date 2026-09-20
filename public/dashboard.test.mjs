@@ -46,6 +46,15 @@ describe("outcome rescore suggestion (round3 Task 3)", () => {
   });
 });
 
+describe("triage noise pill (Task 3)", () => {
+  it("agent pill and runs tab show added/updated with 24h noise", () => {
+    assert.ok(js.includes("noise_24h"), "app.js never reads health.noise_24h");
+    assert.ok(js.includes("runs-summary"), "runs tab lost the noise summary element");
+    assert.ok(js.includes("noise in 24h"), "runs summary lost the 24h noise copy");
+    assert.ok(js.includes("Latest research run: +"), "pill title lost the added/updated noise format");
+  });
+});
+
 describe("decisions/week header (Task 1)", () => {
   it("experiments summary renders decisions and vetted conversion", () => {
     assert.ok(js.includes("decisions_last_7d"), "app.js never reads health.decisions_last_7d");

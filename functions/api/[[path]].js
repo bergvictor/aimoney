@@ -126,12 +126,18 @@ async function updateOpportunity(request, env, id) {
       "capital_needed", "source", "source_url", "notes"]) {
     if (b[f] !== undefined) next[f] = String(b[f]);
   }
+  if (b.status !== undefined && !OPP_STATUSES.has(b.status)) {
+    return json({ error: "invalid status: " + String(b.status).slice(0, 40), field: "status" }, 400);
+  }
   if (b.status !== undefined && OPP_STATUSES.has(b.status)) next.status = b.status;
   for (const f of ["value", "effort", "confidence", "fit"]) {
     if (b[f] !== undefined) next[f] = clamp10(b[f], cur[f]);
   }
   for (const f of ["est_monthly_low", "est_monthly_high"]) {
     if (b[f] !== undefined) next[f] = Math.max(0, Number(b[f]) || 0);
+  }
+  if (next.est_monthly_low > next.est_monthly_high) {
+    return json({ error: "est_monthly_low must be <= est_monthly_high", field: "est_monthly_low" }, 400);
   }
   if (Array.isArray(b.skills_needed)) next.skills_needed = JSON.stringify(b.skills_needed);
   next.score = effectiveScore(next);
@@ -162,6 +168,8 @@ async function createBrief(request, env) {
   if (!a.ok) return json({ error: a.reason }, a.reason.startsWith("writes") ? 503 : 401);
   const b = await request.json().catch(() => ({}));
   if (!b.opportunity_id) return json({ error: "opportunity_id required" }, 400);
+  const briefParent = await env.DB.prepare("SELECT id FROM opportunities WHERE id = ?").bind(b.opportunity_id).first();
+  if (!briefParent) return json({ error: "opportunity not found", field: "opportunity_id" }, 404);
   const cur = await env.DB.prepare(
     "SELECT COALESCE(MAX(version),0) AS v FROM briefs WHERE opportunity_id = ?")
     .bind(b.opportunity_id).first();
@@ -253,6 +261,14 @@ async function createExperiment(request, env) {
     str(b.metric).slice(0, 300), str(b.target).slice(0, 300),
     str(b.result).slice(0, 8000), started_at.slice(0, 30),
     ended_at.slice(0, 30), str(b.post_mortem).slice(0, 8000)).run();
+  if (status === "won" || status === "lost") {
+    const day = nowIso.slice(0, 10);
+    const oneLine = String(b.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
+    const line = "[" + day + " outcome] Experiment " + String.fromCharCode(34) + String(b.name || "").slice(0, 120) + String.fromCharCode(34) + " " + status + ": " + oneLine;
+    await env.DB.prepare(
+      "UPDATE opportunities SET notes = substr(notes || ?, -8000) WHERE id = ?"
+    ).bind(String.fromCharCode(10) + line, b.opportunity_id).run();
+  }
   return json({ id: r.meta.last_row_id }, 201);
 }
 
@@ -328,6 +344,8 @@ export async function onRequest(context) {
       const decisionsRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
       const vettedRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%vetted]%' AND updated_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
       const vettedNoExpRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)").first().catch(() => null) : null;
+      const dayAgoIso = new Date(Date.now() - 86400000).toISOString();
+      const noiseRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso).first().catch(() => null) : null;
       let oldest_unreviewed_age_h = null;
       let hours_since_last_ok_run = null;
       if (lastOk) {
@@ -346,7 +364,7 @@ export async function onRequest(context) {
         const r = await fetch(new URL("/release.json", url.origin));
         if (r.ok) rev = (await r.json()).revision || rev;
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, vetted_no_experiment: vettedNoExpRow ? vettedNoExpRow.n : 0, time: new Date().toISOString() });
+      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, vetted_no_experiment: vettedNoExpRow ? vettedNoExpRow.n : 0, noise_24h: noiseRow ? noiseRow.n : 0, time: new Date().toISOString() });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({
