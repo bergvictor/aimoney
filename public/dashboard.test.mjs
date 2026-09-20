@@ -118,10 +118,10 @@ describe("failure banner and mismatch badges (Task 3)", () => {
   });
 
   it("refresh tracks failures and renders a named banner with retry", () => {
-    assert.ok(js.includes("state.apiFailures.push(\"/api/opportunities\")"), "opps failure untracked");
-    assert.ok(js.includes("state.apiFailures.push(\"/api/experiments\")"), "experiments failure untracked");
-    assert.ok(js.includes("state.apiFailures.push(\"/api/runs\")"), "runs failure untracked");
-    assert.ok(js.includes("state.apiFailures.push(\"/api/health\")"), "health failure untracked");
+    assert.ok(js.includes('state.apiFailures.push("/api/opportunities")'), "opps failure untracked");
+    assert.ok(js.includes('state.apiFailures.push("/api/experiments")'), "experiments failure untracked");
+    assert.ok(js.includes('state.apiFailures.push("/api/runs")'), "runs failure untracked");
+    assert.ok(js.includes('state.apiFailures.push("/api/health")'), "health failure untracked");
     assert.ok(js.includes("renderApiErrors()"), "refresh never renders the banner");
     assert.ok(js.includes("api-retry") && js.includes("Retry"), "banner lacks a Retry button");
     assert.ok(js.includes("Could not load the priority list"), "ledger still claims Nothing here on failure");
@@ -163,5 +163,65 @@ describe("honest drawer + no-brief pill (Task 2)", () => {
     assert.ok(js.includes("updateReviewChipTitle"), "app.js lost updateReviewChipTitle");
     assert.ok(js.includes("bare_without_brief"), "chip title must reuse health.bare_without_brief");
     assert.ok(js.includes("without briefs"), "chip title lost the 'without briefs' copy");
+  });
+});
+
+describe("add-modal money fields (audit 2026-09-20 Task 2)", () => {
+  it("Add modal owns $/mo, capital, and time-to-first-$ inputs", () => {
+    assert.ok(js.includes('id="m-money"'), "Add modal lost the $/mo low-high input");
+    assert.ok(js.includes('id="m-capital"'), "Add modal lost the capital_needed input");
+    assert.ok(js.includes('id="m-first"'), "Add modal lost the time_to_first_dollar input");
+  });
+
+  it("Add submit parses $/mo like the drawer and sends money keys", () => {
+    assert.ok(js.includes('$("#m-money").value.split(",")'), "Add submit must split the $/mo input on comma");
+    assert.ok(js.includes("Number(x.trim()) || 0"), "Add submit must reuse the drawer $/mo parsing");
+    assert.ok(js.includes("est_monthly_low: lo"), "Add POST lost est_monthly_low");
+    assert.ok(js.includes("est_monthly_high: hi"), "Add POST lost est_monthly_high");
+    assert.ok(js.includes('capital_needed: $("#m-capital")'), "Add POST lost capital_needed");
+    assert.ok(js.includes('time_to_first_dollar: $("#m-first")'), "Add POST lost time_to_first_dollar");
+  });
+
+  it("a manual $0 add flows to the Zero spend filter", () => {
+    assert.ok(js.includes("isZeroSpend"), "app.js lost the isZeroSpend helper");
+    assert.ok(js.includes('startsWith("$0")'), "zero-spend must match capital_needed starting with $0");
+    assert.ok(js.includes('capital_needed: $("#m-capital").value.trim()'), "manual adds must POST capital_needed so $0 rows match the chip");
+  });
+});
+
+describe("drawer Vet/Kill with post-mortem parity (audit 2026-09-20 Task 3)", () => {
+  it("drawer shows Vet/Kill for UNREVIEWED rows reusing the review handlers", () => {
+    assert.ok(js.includes('id="drawer-vet"'), "drawer lost its Vet button");
+    assert.ok(js.includes('id="drawer-kill"'), "drawer lost its Kill button");
+    assert.ok(js.includes("vetOpportunity(o.id)"), "drawer Vet must reuse vetOpportunity");
+    assert.ok(js.includes("killOpportunity(o.id)"), "drawer Kill must reuse killOpportunity");
+  });
+
+  it("drawer admin status-to-killed routes through the same post-mortem prompt", () => {
+    assert.ok(js.includes('azStatus === "killed"'), "admin save must gate the killed transition");
+    assert.ok(js.includes("One-line post-mortem (required to kill):"), "killed gate lost the post-mortem prompt");
+    assert.ok(js.includes("Kill cancelled — post-mortem required."), "killed gate lost the cancel toast");
+    assert.ok(js.includes("cleanUnreviewed(o.notes)"), "killed gate must strip UNREVIEWED like killOpportunity");
+    assert.ok(js.includes("killed] ${pm.trim()}"), "killed gate must append the prompted post-mortem");
+  });
+});
+
+describe("experiment money in cents (audit 2026-09-20 Task 4)", () => {
+  it("experiment modal owns revenue and precise-spend inputs", () => {
+    assert.ok(js.includes('id="m-revenue"'), "experiment modal lost the revenue input");
+    assert.ok(js.includes('id="m-spend"'), "experiment modal lost the precise-spend input");
+  });
+
+  it("experiment save converts dollars to integer cents", () => {
+    assert.ok(js.includes("revenue_cents:"), "experiment POST lost revenue_cents");
+    assert.ok(js.includes("spent_cents:"), "experiment POST lost spent_cents");
+    assert.ok(js.includes('* 100) || 0'), "experiment save must convert dollars to cents");
+  });
+
+  it("board cards show revenue/spend $ figures", () => {
+    assert.ok(js.includes("e.revenue_cents/100"), "board must format revenue_cents as $");
+    assert.ok(js.includes("e.spent_cents/100"), "board must format spent_cents as $");
+    assert.ok(js.includes("} rev</span>"), "board lost the revenue figure copy");
+    assert.ok(js.includes("} spent</span>"), "board lost the spend figure copy");
   });
 });

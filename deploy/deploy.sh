@@ -31,6 +31,11 @@ echo "==> aimoney deploy rev=${REV}"
 # human rows are never overwritten by a redeploy).
 echo "==> D1: schema"
 $WRANGLER d1 execute aimoney --file=d1/schema.sql --remote
+for f in d1/migrate-*.sql; do
+  [ -e "$f" ] || continue
+  echo "==> D1: migration $f"
+  $WRANGLER d1 execute aimoney --file="$f" --remote || echo "==> D1: $f already applied (continuing)"
+done
 COUNT="$($WRANGLER d1 execute aimoney --remote --json \
   --command "SELECT COUNT(*) AS n FROM opportunities" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['results'][0]['n'])" 2>/dev/null || echo 0)"

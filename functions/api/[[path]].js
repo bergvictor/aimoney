@@ -250,17 +250,21 @@ async function createExperiment(request, env) {
   let ended_at = String(b.ended_at || "");
   if (status === "running" && !started_at.trim()) started_at = nowIso;
   if ((status === "won" || status === "lost") && !ended_at.trim()) ended_at = nowIso;
+  const cents = (v) => Math.max(0, Math.floor(Number(v) || 0));
+  const revenue_cents = cents(b.revenue_cents);
+  const spent_cents = cents(b.spent_cents);
   const str = (v) => String(v || "");
   const r = await env.DB.prepare(
     `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
-     spent, metric, target, result, started_at, ended_at, post_mortem)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+     spent, metric, target, result, started_at, ended_at, post_mortem,
+     revenue_cents, spent_cents)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(b.opportunity_id, str(b.name).slice(0, 200), str(b.hypothesis).slice(0, 8000),
     status,
     str(b.budget_cap).slice(0, 120), str(b.spent).slice(0, 120),
     str(b.metric).slice(0, 300), str(b.target).slice(0, 300),
     str(b.result).slice(0, 8000), started_at.slice(0, 30),
-    ended_at.slice(0, 30), str(b.post_mortem).slice(0, 8000)).run();
+    ended_at.slice(0, 30), str(b.post_mortem).slice(0, 8000), revenue_cents, spent_cents).run();
   if (status === "won" || status === "lost") {
     const day = nowIso.slice(0, 10);
     const oneLine = String(b.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
@@ -287,6 +291,10 @@ async function updateExperiment(request, env, id) {
     return json({ error: `invalid status: ${String(b.status).slice(0, 40)}`, field: "status" }, 400);
   }
   if (b.status !== undefined && EXP_STATUSES.has(b.status)) next.status = b.status;
+  for (const f of ["revenue_cents", "spent_cents"]) {
+    if (b[f] !== undefined) next[f] = Math.max(0, Math.floor(Number(b[f]) || 0));
+    else if (next[f] === undefined || next[f] === null) next[f] = 0;
+  }
   const nowIso = new Date().toISOString();
   if (next.status === "running" && !String(next.started_at || "").trim()) next.started_at = nowIso;
   if (next.status === "won" || next.status === "lost") {
@@ -311,10 +319,11 @@ async function updateExperiment(request, env, id) {
   await env.DB.prepare(
     `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
      metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
+     revenue_cents=?, spent_cents=?,
      updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
   ).bind(next.name, next.hypothesis, next.status, next.budget_cap, next.spent,
     next.metric, next.target, next.result, next.started_at, next.ended_at,
-    next.post_mortem, id).run();
+    next.post_mortem, next.revenue_cents, next.spent_cents, id).run();
   return json({ id: Number(id), status: next.status });
 }
 
@@ -342,6 +351,7 @@ export async function onRequest(context) {
       // are won/lost rows closed in the window; vetted counts rows carrying
       // the "[YYYY-MM-DD vetted]" tag (see vetOpportunity) touched in 7d.
       const decisionsRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
+      const revenueRow = env.DB ? await env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
       const vettedRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%vetted]%' AND updated_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')").first().catch(() => null) : null;
       const vettedNoExpRow = env.DB ? await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)").first().catch(() => null) : null;
       const dayAgoIso = new Date(Date.now() - 86400000).toISOString();
@@ -364,7 +374,7 @@ export async function onRequest(context) {
         const r = await fetch(new URL("/release.json", url.origin));
         if (r.ok) rev = (await r.json()).revision || rev;
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, vetted_no_experiment: vettedNoExpRow ? vettedNoExpRow.n : 0, noise_24h: noiseRow ? noiseRow.n : 0, time: new Date().toISOString() });
+      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, revenue_last_7d: revenueRow ? (revenueRow.total || 0) : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, vetted_no_experiment: vettedNoExpRow ? vettedNoExpRow.n : 0, noise_24h: noiseRow ? noiseRow.n : 0, time: new Date().toISOString() });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

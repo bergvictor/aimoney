@@ -333,7 +333,7 @@ function renderExperiments() {
       (list.map((e) => `
         <div class="card" data-id="${e.id}" data-opp="${e.opportunity_id}"${e.orphaned ? ` data-orphan="1"` : ""}>
           <h4>${esc(e.name)}</h4>
-          <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}${runningMismatchBadge(e)}</p>
+          <p>${e.orphaned ? `<span class="pill st-killed">orphaned</span> ` : ""}${esc(e.opportunity_title || "(opportunity deleted)")}${e.metric ? ` · ${esc(e.metric)}` : ""}${ageChip(e)}${runningMismatchBadge(e)}${e.revenue_cents > 0 ? ` · <span class="mono">${money(e.revenue_cents/100, e.revenue_cents/100)} rev</span>` : ""}${e.spent_cents > 0 ? ` · <span class="mono">${money(e.spent_cents/100, e.spent_cents/100)} spent</span>` : ""}</p>
           <div class="meta">${statusPill(e.status)}
             <span class="muted mono">${esc(e.result ? `→ ${e.result.slice(0, 40)}` : (e.target || ""))}</span></div>
         </div>`).join("") || `<p class="muted">—</p>`) + `</div>`;
@@ -419,6 +419,7 @@ async function openDrawer(id, focusExp = null) {
     $("#drawer-slug").textContent = o.slug;
     $("#drawer-body").innerHTML = `
       <p>${statusPill(o.status)} <span class="muted">· ${esc(o.category)} · score </span><b class="mono">${esc(o.score)}</b>${String(o.notes || "").includes("UNREVIEWED") ? ' <span class="muted">(capped — unreviewed)</span>' : ""}</p>
+      ${String(o.notes || "").includes("UNREVIEWED") ? '<div class="review-actions"><button class="btn small" id="drawer-vet" type="button">Vet</button> <button class="btn small ghost danger" id="drawer-kill" type="button">Kill</button></div>' : ""}
       <h2>${esc(o.title)}</h2>
       <p class="muted">${esc(o.one_liner || "")}</p>
       <h3>Facts</h3>
@@ -449,6 +450,10 @@ async function openDrawer(id, focusExp = null) {
         openExperimentModal(d.experiments.find((e) => e.id === Number(btn.dataset.editExp)));
       });
     });
+    const drawerVet = $("#drawer-vet");
+    if (drawerVet) drawerVet.addEventListener("click", (ev) => { ev.stopPropagation(); vetOpportunity(o.id).then(() => { if (state.detail) openDrawer(o.id); }); });
+    const drawerKill = $("#drawer-kill");
+    if (drawerKill) drawerKill.addEventListener("click", (ev) => { ev.stopPropagation(); killOpportunity(o.id).then(() => { if (state.detail) openDrawer(o.id); }); });
     renderAdminZone();
     $("#drawer").classList.remove("hidden");
     $("#drawer-scrim").classList.remove("hidden");
@@ -514,6 +519,29 @@ function renderAdminZone() {
     try {
       const [lo, hi] = $("#az-money").value.split(",").map((x) => Number(x.trim()) || 0);
       const note = $("#az-note").value.trim();
+      const azStatus = $("#az-status").value;
+      if (azStatus === "killed" && o.status !== "killed") {
+        const pm = prompt("One-line post-mortem (required to kill):");
+        if (!pm || !pm.trim()) return toast("Kill cancelled — post-mortem required.");
+        const day = new Date().toISOString().slice(0, 10);
+        const killedNotes = `${cleanUnreviewed(o.notes)}\n[${day} killed] ${pm.trim()}${note ? `\n[${day} you] ${note}` : ""}`.trim().slice(-8000);
+        try {
+          const r = await api(`/api/opportunities/${o.id}`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              status: "killed",
+              value: Number($("#az-value").value), effort: Number($("#az-effort").value),
+              confidence: Number($("#az-conf").value), fit: Number($("#az-fit").value),
+              est_monthly_low: lo, est_monthly_high: hi, notes: killedNotes,
+            }),
+          });
+          toast(`Saved — new score ${r.score}`);
+          await refresh();
+          openDrawer(o.id);
+        } catch (e) { toast(`Save failed: ${e.message}`); }
+        return;
+      }
       const r = await api(`/api/opportunities/${o.id}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
@@ -593,6 +621,9 @@ $("#btn-add").addEventListener("click", () => {
       <label>Effort 1–10<input id="m-e" type="number" min="1" max="10" value="5"></label>
       <label>Confidence 1–10<input id="m-c" type="number" min="1" max="10" value="3"></label>
       <label>Fit 1–10<input id="m-f" type="number" min="1" max="10" value="5"></label>
+      <label>$/mo low–high<input id="m-money" placeholder="500,5000"></label>
+      <label>Capital needed<input id="m-capital" maxlength="120" placeholder="$0"></label>
+      <label>Time to first $<input id="m-first" maxlength="120" placeholder="1-2 weeks"></label>
     </div>
     <div class="actions">
       <button class="btn ghost" value="cancel" formnovalidate type="submit">Cancel</button>
@@ -603,6 +634,7 @@ $("#btn-add").addEventListener("click", () => {
     ev.preventDefault();
     try {
       const title = $("#m-title").value.trim();
+      const [lo, hi] = $("#m-money").value.split(",").map((x) => Number(x.trim()) || 0);
       await api("/api/opportunities", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -611,6 +643,9 @@ $("#btn-add").addEventListener("click", () => {
           status: $("#m-status").value, value: Number($("#m-v").value),
           effort: Number($("#m-e").value), confidence: Number($("#m-c").value),
           fit: Number($("#m-f").value), source: "manual",
+          est_monthly_low: lo, est_monthly_high: hi,
+          capital_needed: $("#m-capital").value.trim(),
+          time_to_first_dollar: $("#m-first").value.trim(),
         }),
       });
       $("#modal").close();
@@ -639,6 +674,8 @@ function openExperimentModal(exp, defaultOpp = null) {
       <label>Metric<input id="m-metric" value="${esc(exp?.metric || "")}"></label>
       <label>Target<input id="m-target" value="${esc(exp?.target || "")}"></label>
       <label>Spent<input id="m-spent" value="${esc(exp?.spent || "")}"></label>
+      <label>Revenue ($)<input id="m-revenue" inputmode="decimal" value="${esc(exp?.revenue_cents ? (exp.revenue_cents / 100) : "")}"></label>
+      <label>Precise spend ($)<input id="m-spend" inputmode="decimal" value="${esc(exp?.spent_cents ? (exp.spent_cents / 100) : "")}"></label>
       <label>Result<input id="m-result" value="${esc(exp?.result || "")}"></label>
     </div>
     <label>Post-mortem (required when won/lost)<textarea id="m-pm">${esc(exp?.post_mortem || "")}</textarea></label>
@@ -655,6 +692,8 @@ function openExperimentModal(exp, defaultOpp = null) {
       budget_cap: $("#m-budget").value.trim(), metric: $("#m-metric").value.trim(),
       target: $("#m-target").value.trim(), spent: $("#m-spent").value.trim(),
       result: $("#m-result").value.trim(), post_mortem: $("#m-pm").value.trim(),
+      revenue_cents: Math.max(0, Math.round(Number($("#m-revenue").value.trim()) * 100) || 0),
+      spent_cents: Math.max(0, Math.round(Number($("#m-spend").value.trim()) * 100) || 0),
     };
     try {
       if (isNew) await api("/api/experiments", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });

@@ -111,6 +111,16 @@ function makeDB(seed = {}) {
       const oks = data.runs.filter((r) => r.status === "ok").sort((a, b) => b.id - a.id);
       return oks[0] || null;
     }
+    if (sql.includes("FROM experiments") && sql.includes("SUM(revenue_cents)")) {
+      const cutoff = Date.now() - 7 * 86400000;
+      let total = 0;
+      for (const e of data.experiments) {
+        if (e.status !== "won" && e.status !== "lost") continue;
+        const ms = Date.parse(e.ended_at || "");
+        if (Number.isFinite(ms) && ms >= cutoff) total += (Number(e.revenue_cents) || 0);
+      }
+      return { total };
+    }
     if (sql.includes("FROM experiments") && sql.includes("ended_at") && sql.includes("COUNT(*)")) {
       const cutoff = Date.now() - 7 * 86400000;
       let n = 0;
@@ -152,10 +162,10 @@ function makeDB(seed = {}) {
 
   function handleRun(sql, args) {
     if (sql.includes("INSERT INTO experiments")) {
-      const [opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem] = args;
+      const [opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents] = args;
       const id = data.experiments.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0) + 1;
       const now = new Date().toISOString();
-      data.experiments.push({ id, opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, created_at: now, updated_at: now });
+      data.experiments.push({ id, opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents: revenue_cents || 0, spent_cents: spent_cents || 0, created_at: now, updated_at: now });
       return { success: true, meta: { last_row_id: id } };
     }
     if (sql.includes("INSERT INTO opportunities")) {
@@ -169,10 +179,10 @@ function makeDB(seed = {}) {
       return { success: true, meta: { last_row_id: row.id } };
     }
     if (sql.includes("UPDATE experiments SET")) {
-      const [name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, id] = args;
+      const [name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, id] = args;
       const row = data.experiments.find((e) => String(e.id) === String(id));
       if (row) {
-        Object.assign(row, { name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem });
+        Object.assign(row, { name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents });
       }
       return { success: true };
     }
@@ -647,6 +657,76 @@ describe("detail-view cap agreement (Task 2)", () => {
     const db = makeDB({ opportunities: oppSeed() });
     const r = await callApi(["opportunities", "999"], "http://localhost/api/opportunities/999", {}, db);
     assert.equal(r.status, 404);
+  });
+});
+
+describe("experiment revenue/spend cents (audit 2026-09-20 Task 4)", () => {
+  it("POST /experiments stores revenue_cents/spent_cents, defaulting 0", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Paid pilot", revenue_cents: 50000, spent_cents: 1200 } }, db);
+    assert.equal(r.status, 201);
+    const row = db.data.experiments.find((e) => e.id === r.body.id);
+    assert.equal(row.revenue_cents, 50000);
+    assert.equal(row.spent_cents, 1200);
+    const dflt = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "No money yet" } }, db);
+    assert.equal(dflt.status, 201);
+    const row2 = db.data.experiments.find((e) => e.id === dflt.body.id);
+    assert.equal(row2.revenue_cents, 0);
+    assert.equal(row2.spent_cents, 0);
+  });
+
+  it("POST /experiments clamps bad cents to 0 instead of storing NaN/negatives", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Bad cents", revenue_cents: -500, spent_cents: "bogus" } }, db);
+    assert.equal(r.status, 201);
+    const row = db.data.experiments.find((e) => e.id === r.body.id);
+    assert.equal(row.revenue_cents, 0);
+    assert.equal(row.spent_cents, 0);
+  });
+
+  it("PATCH /experiments updates cents and clamps like create", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { revenue_cents: 9999, spent_cents: 100 } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(db.data.experiments[0].revenue_cents, 9999);
+    assert.equal(db.data.experiments[0].spent_cents, 100);
+    const bad = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { revenue_cents: -1, spent_cents: "x" } }, db);
+    assert.equal(bad.status, 200);
+    assert.equal(db.data.experiments[0].revenue_cents, 0);
+    assert.equal(db.data.experiments[0].spent_cents, 0);
+  });
+
+  it("reports revenue_last_7d summed from won/lost closed in 7d", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: daysAgo(2), revenue_cents: 50000 },
+        { id: 2, opportunity_id: 1, status: "lost", ended_at: daysAgo(6), revenue_cents: 700 },
+        { id: 3, opportunity_id: 1, status: "won", ended_at: daysAgo(10), revenue_cents: 99999 },
+        { id: 4, opportunity_id: 1, status: "running", ended_at: "", revenue_cents: 12345 },
+        { id: 5, opportunity_id: 1, status: "lost", ended_at: "", revenue_cents: 111 },
+        { id: 6, opportunity_id: 1, status: "won", ended_at: daysAgo(1) },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.revenue_last_7d, 50700);
+  });
+
+  it("keeps revenue_last_7d alongside every existing health key", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "revenue_last_7d", "time"]) {
+      assert.ok(k in r.body, "health missing " + k);
+    }
+    assert.equal(r.body.revenue_last_7d, 0);
   });
 });
 
