@@ -871,7 +871,7 @@ async function loseExperiment(id, anchorEl) {
 // in `dropped` — the success toast then says so instead of smiling.
 const droppedSourceOf = (saved) =>
   !!(saved && Array.isArray(saved.dropped) && saved.dropped.includes("revenue_source"));
-const droppedSourceSuffix = " — revenue source dropped (old table schema; re-enter it after migration)";
+const droppedSourceSuffix = " — revenue source dropped (needs the revenue_source migration: Cloudflare secrets + redeploy, then re-enter it)";
 
 async function winExperiment(id, anchorEl) {
   if (!state.token) return openAdminModal("Enter the admin token first.");

@@ -1558,3 +1558,138 @@ describe("partial source failures (audit 2026-09-20-round7 Task 4)", () => {
     assert.ok(readme.includes("src_partial:hn:1/4"), "README lost the partial-source marker");
   });
 });
+
+describe("main-brief AI failure degrades to brief:failed (audit 2026-09-20-round2B Task 1)", () => {
+  // Drives the real runResearch on the cron trigger against a stubbed D1:
+  // two unprocessed signals, a classify reply carrying two "new" verdicts,
+  // one bare row for the brief pass, a fresh backlog (top-scored mode, no
+  // extra pass), and an AI router that throws on one pass by prompt bytes
+  // (FRESH SIGNALS only appears in the classify prompt).
+  const verdictLine = (n, title) => JSON.stringify({
+    n, action: "new", opportunity_id: null, title,
+    one_liner: "repeatable buyer-paid test service", category: "services",
+    value: 6, effort: 3, confidence: 4, fit: 5,
+    est_monthly_low: 100, est_monthly_high: 500,
+    capital_needed: "$0", time_to_first_dollar: "1-2 weeks",
+  });
+  const CLASSIFY_REPLY = verdictLine(0, "Testable Widget Service") + "\n" + verdictLine(1, "Auditable Prompt Pack") + "\n";
+  const BRIEF_JSON = JSON.stringify({
+    summary: "Terse summary of the opportunity.", what_works: "Do X.",
+    numbers: [], risks: "Low.", first_steps: "1. Ship the smallest test.",
+  });
+
+  function stubEnv(throwOn) {
+    const now = new Date().toISOString();
+    const signals = [
+      { id: 101, source: "hn", title: "Signal A", url: "https://example.com/a", snippet: "s", processed: 0, opportunity_id: null },
+      { id: 102, source: "hn", title: "Signal B", url: "https://example.com/b", snippet: "s", processed: 0, opportunity_id: null },
+    ];
+    const bareRow = { id: 7, title: "Bare row", one_liner: "needs evidence", score: 9000, notes: "UNREVIEWED", created_at: now };
+    const inserted = [];
+    let nextId = 1000;
+    let runError = "";
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("SELECT o.* FROM opportunities o LEFT JOIN briefs")) return bareRow;
+            if (sql.includes("SELECT created_at FROM opportunities")) return { created_at: now };
+            if (sql.includes("LEFT JOIN briefs")) return { n: 0 };
+            if (sql.includes("FROM opportunities WHERE notes LIKE")) return { n: 0 };
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) {
+              const limit = Number(stmt.params[0]) || signals.length;
+              return { results: signals.filter((s) => s.processed === 0).slice(0, limit) };
+            }
+            if (sql.includes("SELECT title, url, snippet FROM signals")) return { results: [] };
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("INSERT INTO opportunities")) {
+              inserted.push({ sql, params: stmt.params });
+              return { meta: { last_row_id: nextId++ } };
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1, opportunity_id")) {
+              const [oppId, sigId] = stmt.params;
+              const s = signals.find((x) => x.id === sigId);
+              if (s) { s.processed = 1; s.opportunity_id = oppId; }
+              return {};
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1 WHERE id")) {
+              const s = signals.find((x) => x.id === stmt.params[0]);
+              if (s) s.processed = 1;
+              return {};
+            }
+            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) {
+              return { meta: { changes: 0 } };
+            }
+            if (sql.includes("UPDATE agent_runs SET finished_at")) {
+              runError = String(stmt.params[6] || "");
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = {
+      run: async (_model, opts) => {
+        const text = JSON.stringify((opts && opts.messages) || []);
+        const isClassify = text.includes("FRESH SIGNALS");
+        if (throwOn === "classify" && isClassify) throw new Error("classify model down");
+        if (throwOn === "brief" && !isClassify) throw new Error("brief model down");
+        return { response: isClassify ? CLASSIFY_REPLY : BRIEF_JSON };
+      },
+    };
+    return { env: { DB, AI }, signals, inserted, runError: () => runError };
+  }
+
+  async function runTick(throwOn) {
+    _resetBriefSkippedForTests();
+    const t = stubEnv(throwOn);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    try {
+      const result = await runResearch(t.env, "cron");
+      return { result, signals: t.signals, inserted: t.inserted, runError: t.runError() };
+    } finally {
+      globalThis.fetch = realFetch;
+      _resetBriefSkippedForTests();
+    }
+  }
+
+  it("a brief-model throw finishes ok with brief:failed and verdict writes flushed", async () => {
+    const t = await runTick("brief");
+    assert.equal(t.result.status, "ok", `brief throw must not fail the tick: ${t.result.error || "(no error)"}`);
+    assert.ok(t.runError.includes("brief:failed"), `run log must name the failed brief: ${t.runError}`);
+    assert.equal(t.inserted.length, 2, "triage verdicts must still flush when the brief model throws");
+    assert.deepEqual(t.signals.map((s) => s.processed), [1, 1]);
+    assert.equal(t.result.added, 2);
+  });
+
+  it("a classify-model throw still fails the tick and leaves signals unprocessed", async () => {
+    const t = await runTick("classify");
+    assert.equal(t.result.status, "error", "classify is the tick's core job: its throw must stay fatal");
+    assert.equal(t.inserted.length, 0);
+    assert.deepEqual(t.signals.map((s) => s.processed), [0, 0], "untriaged signals must wait for the next tick");
+  });
+
+  it("the main-brief AI call sits inside the try, like the extra pass", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    const window = src.slice(src.indexOf("if (bare) {"), src.indexOf("briefFailed = true"));
+    const tryAt = window.indexOf("try {");
+    const aiAt = window.indexOf("await aiComplete(env, state");
+    assert.ok(tryAt !== -1 && aiAt !== -1 && tryAt < aiAt, "main-brief aiComplete must sit inside the try so a model throw degrades to brief:failed");
+  });
+});

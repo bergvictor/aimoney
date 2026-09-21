@@ -2233,6 +2233,56 @@ describe("vetting path Vet-PATCH-health (audit 2026-09-20-round2 Task 1)", () =>
   });
 });
 
+describe("killed-clear post-mortem guard (audit 2026-09-20-round2B Task 3)", () => {
+  const unreviewedOpp = (id) => ({ id, slug: `s${id}`, title: `T${id}`, status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" });
+
+  it("a killed UNREVIEWED clear without post-mortem text 400s naming it, row stays queued", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const db = makeDB({ opportunities: [unreviewedOpp(1)] });
+    for (const bad of [`[${today} killed]`, `[${today} killed]   `]) {
+      const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+        { method: "PATCH", token: "secret", body: { status: "killed", notes: `Agent proposal\n${bad}` } }, db);
+      assert.equal(patch.status, 400, `bare killed tag must 400: ${bad}`);
+      assert.equal(patch.body.field, "notes");
+      assert.ok(String(patch.body.error).includes("post-mortem"), `400 must name the post-mortem, got: ${patch.body.error}`);
+    }
+    const detail = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1", {}, db);
+    assert.ok(String(detail.body.opportunity.notes).includes("UNREVIEWED"), "rejected clears must leave the row in the queue");
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.body.unreviewed, 1);
+  });
+
+  it("a killed clear with tag + text passes and dates the verdict", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const db = makeDB({ opportunities: [unreviewedOpp(1)] });
+    const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      { method: "PATCH", token: "secret", body: { status: "killed", notes: `Agent proposal\n[${today} killed] no demand` } }, db);
+    assert.equal(patch.status, 200);
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.body.unreviewed, 0);
+    assert.equal(health.body.last_verdict, today);
+    assert.equal(health.body.vetted_last_7d, 0, "kill must not fake the vetted count");
+  });
+
+  it("reviewed-row kills without post-mortem text pass unchanged", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const reviewed = { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "x [2026-09-01 vetted] Human vetted; cap lifted.", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" };
+    const db = makeDB({ opportunities: [reviewed] });
+    const tagged = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      { method: "PATCH", token: "secret", body: { status: "killed", notes: `x [2026-09-01 vetted] Human vetted; cap lifted.\n[${today} killed]` } }, db);
+    assert.equal(tagged.status, 200, "a bare killed tag on a reviewed row must keep its old shape");
+    const db2 = makeDB({ opportunities: [{ ...reviewed, id: 2, slug: "b" }] });
+    const statusOnly = await callApi(["opportunities", "2"], "http://localhost/api/opportunities/2",
+      { method: "PATCH", token: "secret", body: { status: "killed" } }, db2);
+    assert.equal(statusOnly.status, 200, "a status-only kill of a reviewed row must keep its old shape");
+  });
+
+  it("README documents the killed-clear post-mortem 400 beside the update guards", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("without post-mortem text after the tag"), "README lost the killed-clear post-mortem guard");
+  });
+});
+
 describe("impossible verdict-tag dates (audit 2026-09-20-round4 Task 2)", () => {
   const unreviewedOpp = (id) => ({ id, slug: `s${id}`, title: `T${id}`, status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" });
 

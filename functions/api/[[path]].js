@@ -89,6 +89,11 @@ async function ensureMoneyColumns(env) {
 // never wins the string-max in last_vetted/last_verdict.
 const VERDICT_TAG = /\[\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]) (vetted|killed)\]/;
 
+// Killed-tag tail (audit 2026-09-20-round2B Task 3): the greedy prefix makes
+// group 1 everything after the LAST valid killed tag — verdict writers always
+// append, so the newest verdict is the one that must carry the post-mortem.
+const KILLED_TAG_TAIL = /^[\s\S]*\[\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]) killed\]([\s\S]*)$/;
+
 // Ledger money: integer cents to fixed-2dp dollars ($10.50, never $10.5).
 // Mirrors public/app.js moneyCents so drawer and ledger agree.
 const centsDollars = (cents) => "$" + (Number(cents) / 100).toFixed(2);
@@ -267,6 +272,19 @@ async function updateOpportunity(request, env, id) {
       !String(next.notes || "").includes("UNREVIEWED") &&
       !VERDICT_TAG.test(String(next.notes || ""))) {
     return json({ error: "clearing UNREVIEWED requires a [YYYY-MM-DD vetted] or [YYYY-MM-DD killed] verdict tag", field: "notes" }, 400);
+  }
+  // Killed-clear post-mortem guard (audit 2026-09-20-round2B Task 3): killed
+  // rows stay on the board for their post-mortem, so a PATCH that clears
+  // UNREVIEWED with a killed verdict tag must carry non-space text after the
+  // tag — a bare tag 400s and the row stays queued. Reviewed-row kills and
+  // every other shape pass through byte-identical (the dashboard already
+  // sends tag + text on every kill, empty cancelling client-side).
+  if (String(cur.notes || "").includes("UNREVIEWED") &&
+      !String(next.notes || "").includes("UNREVIEWED")) {
+    const killedTail = KILLED_TAG_TAIL.exec(String(next.notes || ""));
+    if (killedTail && !/\S/.test(killedTail[1])) {
+      return json({ error: "a [YYYY-MM-DD killed] verdict needs its one-line post-mortem after the tag", field: "notes" }, 400);
+    }
   }
   if (Array.isArray(b.skills_needed)) next.skills_needed = JSON.stringify(b.skills_needed);
   next.score = effectiveScore(next);

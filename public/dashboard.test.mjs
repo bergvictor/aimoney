@@ -430,6 +430,22 @@ describe("dropped revenue_source toast (audit 2026-09-20-round7 Task 2)", () => 
     assert.ok(js.includes("revenue source dropped"), "success toasts lost the dropped-source disclosure");
     assert.ok(js.includes("Experiment closed as won"), "Win lost its success toast");
   });
+
+  it("dropped-source toast points at the revenue_source second track (audit 2026-09-20-round2B Task 2)", () => {
+    const suffixAt = js.indexOf("const droppedSourceSuffix = ");
+    assert.ok(suffixAt !== -1, "app.js lost the dropped-source suffix");
+    const suffixLine = js.slice(suffixAt, js.indexOf("\n", suffixAt));
+    assert.ok(suffixLine.includes("revenue_source"), "toast must name the missing column, not a bare migration");
+    assert.ok(suffixLine.includes("redeploy"), "toast must point at the secrets + redeploy unblock");
+    assert.ok(suffixLine.includes("re-enter"), "toast must keep the re-enter instruction");
+    const owner = readFileSync(join(ROOT, "..", "docs", "OWNER-ACTIONS.md"), "utf8");
+    const section2 = owner.slice(owner.indexOf("## 2."));
+    assert.ok(section2.includes("revenue_source"), "Owner actions §2 must name the revenue_source second track");
+    assert.ok(section2.includes("CF_API_TOKEN") && section2.includes("CF_ACCOUNT_ID"), "Owner actions §2 must name the repo secrets");
+    assert.ok(section2.includes("redeploy"), "Owner actions §2 must name the redeploy");
+    const readme = readFileSync(join(ROOT, "..", "README.md"), "utf8");
+    assert.ok(readme.includes("cannot be re-entered until then"), "README lost the dropped-via second-track clause");
+  });
 });
 
 describe("closed-experiment money in drawer (audit 2026-09-20-round3 Task 1)", () => {

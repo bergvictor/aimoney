@@ -575,12 +575,15 @@ export async function runResearch(env, trigger) {
       const sigs = await env.DB.prepare(
         "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
         .bind(bare.id).all().then((r) => r.results || []);
-      const text = await aiComplete(env, state, {
-        model: AI_BRIEF, fallback: AI_CLASSIFY, maxTokens: BRIEF_TOKENS,
-        timeoutMs: 90000, retries: 1,
-        messages: buildBriefPrompt(bare.title, bare.one_liner, sigs),
-      });
       try {
+        // The brief-model call sits inside the try, like the extra pass
+        // below: a transient AI throw degrades to brief:failed + ok, never
+        // an error tick for triage that already flushed.
+        const text = await aiComplete(env, state, {
+          model: AI_BRIEF, fallback: AI_CLASSIFY, maxTokens: BRIEF_TOKENS,
+          timeoutMs: 90000, retries: 1,
+          messages: buildBriefPrompt(bare.title, bare.one_liner, sigs),
+        });
         const b = parseBriefJson(text);
         if (await insertBrief(env, bare.id, b, sigs)) {
           state.briefs++;

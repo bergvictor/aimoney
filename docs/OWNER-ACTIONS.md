@@ -32,6 +32,14 @@ numbers instead of null, and `schema_missing_columns` plus the
 `schema_migration: disabled …` line disappear. Until then every revenue/spend
 figure is honestly unknown (null), never $0.
 
+Second track: the switch adds only the two money columns (`revenue_cents`,
+`spent_cents`). The `via {source}` column (`revenue_source`) arrives via the
+CI/manual migration instead — add the `CF_API_TOKEN` + `CF_ACCOUNT_ID` repo
+secrets (Settings → Secrets → Actions) and redeploy, or run
+`deploy/deploy.sh` locally, so `d1/migrate-2026-09-20-revenue-source.sql`
+applies. Until that redeploy, every Win keeps its $ but drops its `via` with
+a toast naming the loss; re-entering it cannot stick before the redeploy.
+
 ## 3. Start one $0 experiment and drive it to a decision
 
 Action: click the `Zero spend` chip, pick the cheapest row, press
