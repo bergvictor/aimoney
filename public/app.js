@@ -625,6 +625,7 @@ async function vetAndLogStarterInner(id) {
   const notes = vettedNotes(o.notes);
   const starterName = `Starter: ${o.title}`.slice(0, 200);
   const starterHypothesis = String(o.one_liner || firstStepsFirstLine({ first_steps: o.brief_first_steps }) || `Smallest paid test of ${o.title}`).slice(0, 8000);
+  const orderBefore = state.reviewList.map((x) => x.id);
   try {
     await api(`/api/opportunities/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
@@ -649,6 +650,7 @@ async function vetAndLogStarterInner(id) {
     await refreshTargets({ runs: false });
     await refreshReview();
     if (state.reviewOnly) renderLedger();
+    advanceReviewFocus(id, orderBefore);
   } catch (e) { toast(`Starter failed: ${e.message}`); }
 }
 
@@ -864,17 +866,24 @@ async function loseExperiment(id, anchorEl) {
 // to 0 exactly like the modal. An empty spend sends no spent_cents key so the
 // API keeps the row's existing value — a modal-entered spend is never
 // clobbered with 0. Human-pressed, one decision.
+// Old-schema honesty (audit 2026-09-20-round7 Task 2): experiment writes
+// against a table missing revenue_source retry without it and name the loss
+// in `dropped` — the success toast then says so instead of smiling.
+const droppedSourceOf = (saved) =>
+  !!(saved && Array.isArray(saved.dropped) && saved.dropped.includes("revenue_source"));
+const droppedSourceSuffix = " — revenue source dropped (old table schema; re-enter it after migration)";
+
 async function winExperiment(id, anchorEl) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
   const winContainer = (anchorEl ? (anchorEl.closest(".card") || anchorEl.closest(".review-actions") || anchorEl.parentElement) : null) || document.querySelector("#board") || document.body;
   const doWin = async (pm, revenueCents, revenueSource, spentCents) => {
   // (cancel handled by inline row: empty still cancels, row untouched)
   try {
-    await api(`/api/experiments/${id}`, {
+    const saved = await api(`/api/experiments/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
       body: JSON.stringify({ status: "won", result: pm.trim(), post_mortem: pm.trim(), revenue_cents: revenueCents, revenue_source: revenueSource, ...(spentCents === null || spentCents === undefined ? {} : { spent_cents: spentCents }) }),
     });
-    toast("Experiment closed as won");
+    toast("Experiment closed as won" + (droppedSourceOf(saved) ? droppedSourceSuffix : ""));
     await refreshTargets({ runs: false });
   } catch (e) { toast(`Close failed: ${e.message}`); }
   };
@@ -1369,10 +1378,11 @@ function openExperimentModal(exp, defaultOpp = null) {
       revenue_source: $("#m-source").value.trim().slice(0, 120),
     };
     try {
-      if (isNew) await api("/api/experiments", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
-      else await api(`/api/experiments/${exp.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+      const saved = isNew
+        ? await api("/api/experiments", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) })
+        : await api(`/api/experiments/${exp.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
       $("#modal").close();
-      toast(isNew ? "Experiment logged" : "Experiment updated");
+      toast((isNew ? "Experiment logged" : "Experiment updated") + (droppedSourceOf(saved) ? droppedSourceSuffix : ""));
       await refreshTargets({ runs: false });
       if (state.detail) openDrawer(state.detail.opportunity.id);
     } catch (e) { toast(`Save failed: ${e.message}`); }

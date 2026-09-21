@@ -108,7 +108,9 @@ export const outcomeLedgerLine = ({ day, name, status, result, revenue_cents, sp
 // live D1 that predates 2026-09-20 lacks revenue_source, which the
 // self-migration deliberately does not cover (probe-read cents only). Each
 // experiment write path retries once without that column when the write
-// fails naming exactly it (identical to its DEFAULT ''); any other narrow
+// fails naming exactly it (identical to its DEFAULT ''); when a non-empty
+// source is actually dropped the 200/201 names it in `dropped` so the
+// dashboard can toast the loss instead of smiling. Any other narrow
 // "no such column" failure answers 503 naming only the column — never SQL
 // or driver text (same regex as health detail). The router awaits exactly
 // these two write paths so their rejections land here.
@@ -389,6 +391,7 @@ async function createExperiment(request, env) {
     str(b.result).slice(0, 8000), started_at.slice(0, 30),
     ended_at.slice(0, 30), str(b.post_mortem).slice(0, 8000), revenue_cents, spent_cents, revenue_source];
   let r;
+  let dropped = null;
   try {
     r = await env.DB.prepare(
       `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
@@ -405,6 +408,7 @@ async function createExperiment(request, env) {
        revenue_cents, spent_cents)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(...insertArgs.slice(0, 14)).run();
+    if (revenue_source) dropped = ["revenue_source"];
   }
   if (status === "won" || status === "lost") {
     const day = nowIso.slice(0, 10);
@@ -413,7 +417,7 @@ async function createExperiment(request, env) {
       "UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?"
     ).bind("\n" + line, b.opportunity_id).run();
   }
-  return json({ id: r.meta.last_row_id }, 201);
+  return json({ id: r.meta.last_row_id, ...(dropped ? { dropped } : {}) }, 201);
 }
 
 async function updateExperiment(request, env, id) {
@@ -464,6 +468,7 @@ async function updateExperiment(request, env, id) {
   const updateArgs = [next.name, next.hypothesis, next.status, next.budget_cap, next.spent,
     next.metric, next.target, next.result, next.started_at, next.ended_at,
     next.post_mortem, next.revenue_cents, next.spent_cents, next.revenue_source, id];
+  let dropped = null;
   try {
     await env.DB.prepare(
       `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
@@ -480,8 +485,11 @@ async function updateExperiment(request, env, id) {
        revenue_cents=?, spent_cents=?,
        updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
     ).bind(...updateArgs.slice(0, 13), id).run();
+    // Flag only what this write actually lost: a source the request carried.
+    // A PATCH without the key (or with "") intended '' and stored ''.
+    if (b.revenue_source !== undefined && next.revenue_source) dropped = ["revenue_source"];
   }
-  return json({ id: Number(id), status: next.status });
+  return json({ id: Number(id), status: next.status, ...(dropped ? { dropped } : {}) });
 }
 
 async function listRuns(env, url) {

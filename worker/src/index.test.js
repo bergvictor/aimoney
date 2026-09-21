@@ -1462,3 +1462,99 @@ describe("best-effort pre-pass link (audit 2026-09-20-round4 Task 4)", () => {
     assert.ok(readme.includes("prepass:N_failed"), "README lost the prepass:N_failed marker");
   });
 });
+
+describe("partial source failures (audit 2026-09-20-round7 Task 4)", () => {
+  // Drives the real runResearch against a stubbed D1 with a URL-selective
+  // fetch stub. Empty results keep the pass quiet (manual trigger skips
+  // briefs, no fresh signals skip classify), so the run log carries only the
+  // source markers under test.
+  function stubEnv() {
+    let runError = "";
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("LEFT JOIN briefs")) return { n: 0 };
+            if (sql.includes("FROM opportunities WHERE notes LIKE")) return { n: 0 };
+            return null;
+          },
+          async all() {
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) {
+              return { meta: { changes: 0 } };
+            }
+            if (sql.includes("UPDATE agent_runs SET finished_at")) {
+              runError = String(stmt.params[6] || "");
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = { run: async () => ({ response: "" }) };
+    return { env: { DB, AI }, runError: () => runError };
+  }
+
+  // failUrls: substring match — any fetch whose URL contains one entry throws.
+  async function runTick(failUrls) {
+    const t = stubEnv();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (failUrls.some((s) => String(url).includes(s))) throw new Error("source down");
+      return { ok: true, json: async () => ({ hits: [], data: { children: [] }, items: [] }) };
+    };
+    try {
+      const result = await runResearch(t.env, "manual");
+      return { result, runError: t.runError() };
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("3-of-4 failed HN queries finish ok with src_partial:hn:1/4 and no src_fail", async () => {
+    const t = await runTick(["AI%20passive%20income", "AI%20SaaS%20revenue", "AI%20automation%20agency"]);
+    assert.equal(t.result.status, "ok", `run failed: ${t.result.error || "(no error)"}`);
+    assert.ok(t.runError.includes("src_partial:hn:1/4"), `run log must name the partial source ok/total: ${t.runError}`);
+    assert.ok(!t.runError.includes("src_fail"), `partial outage must not read as total: ${t.runError}`);
+    assert.deepEqual(t.result.src_partial, ["hn:1/4"]);
+    assert.deepEqual(t.result.src_fail, []);
+    assert.equal(t.result.added, 0);
+    assert.equal(t.result.updated, 0);
+    assert.equal(t.result.briefs, 0);
+  });
+
+  it("all queries failed still names src_fail with no src_partial (naming unchanged)", async () => {
+    const t = await runTick(["hn.algolia.com"]);
+    assert.equal(t.result.status, "ok", `run failed: ${t.result.error || "(no error)"}`);
+    assert.ok(t.runError.includes("src_fail:hn"), `run log must name the dead source: ${t.runError}`);
+    assert.ok(!t.runError.includes("src_partial"), `total outage must not also read as partial: ${t.runError}`);
+    assert.deepEqual(t.result.src_fail, ["hn"]);
+    assert.deepEqual(t.result.src_partial, []);
+  });
+
+  it("quiet tick carries neither marker", async () => {
+    const t = await runTick([]);
+    assert.equal(t.result.status, "ok", `run failed: ${t.result.error || "(no error)"}`);
+    assert.ok(!t.runError.includes("src_fail"), `quiet tick must carry no src_fail: ${t.runError}`);
+    assert.ok(!t.runError.includes("src_partial"), `quiet tick must carry no src_partial: ${t.runError}`);
+    assert.deepEqual(t.result.src_fail, []);
+    assert.deepEqual(t.result.src_partial, []);
+  });
+
+  it("README documents the partial marker beside src_fail", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("src_partial:hn:1/4"), "README lost the partial-source marker");
+  });
+});

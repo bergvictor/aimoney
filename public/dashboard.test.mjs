@@ -417,6 +417,21 @@ describe("revenue source (audit 2026-09-20-round2 Task 3)", () => {
   });
 });
 
+describe("dropped revenue_source toast (audit 2026-09-20-round7 Task 2)", () => {
+  it("Win close and experiment-modal save toast the dropped source by name", () => {
+    assert.ok(js.includes("const droppedSourceOf = (saved) =>"), "app.js lost the dropped-source helper");
+    assert.ok(js.includes('saved.dropped') && js.includes('includes("revenue_source")'), "helper must read the dropped flag by field name");
+    const doWin = js.slice(js.indexOf("const doWin = async"), js.indexOf("inlineWinClose(winContainer"));
+    assert.ok(doWin.includes("const saved = await api(`/api/experiments/${id}`"), "Win close must keep the PATCH body to read the flag");
+    assert.ok(doWin.includes("droppedSourceOf(saved)"), "Win close must check the dropped flag");
+    const modal = js.slice(js.indexOf('revenue_source: $("#m-source")'), js.indexOf('$("#btn-add-exp")'));
+    assert.ok(modal.includes("const saved = isNew"), "modal save must keep the write body to read the flag");
+    assert.ok(modal.includes("droppedSourceOf(saved)"), "modal save must check the dropped flag");
+    assert.ok(js.includes("revenue source dropped"), "success toasts lost the dropped-source disclosure");
+    assert.ok(js.includes("Experiment closed as won"), "Win lost its success toast");
+  });
+});
+
 describe("closed-experiment money in drawer (audit 2026-09-20-round3 Task 1)", () => {
   it("drawer cards show fixed-2dp revenue/spend plus ended date", () => {
     assert.ok(js.includes("moneyCents(e.revenue_cents || 0)"), "drawer lost its revenue figure");
@@ -1178,6 +1193,15 @@ describe("review triage mode V/K + auto-advance (audit 2026-09-20-round4 Task 1)
     assert.ok(focus.includes("tr.focus()"), "next row must take focus");
     const advance = js.slice(js.indexOf("function advanceReviewFocus"), js.indexOf("function handleReviewKey"));
     assert.ok(advance.includes("if (!state.reviewOnly) return;"), "advance must not steal focus outside the review filter");
+  });
+
+  it("starter tap advances focus like Vet and Kill, keeping its three writes", () => {
+    const starter = js.slice(js.indexOf("async function vetAndLogStarterInner"), js.indexOf("async function killOpportunity"));
+    assert.ok(starter.includes("const orderBefore = state.reviewList.map((x) => x.id);"), "starter must snapshot the pre-verdict order");
+    assert.ok(starter.includes("advanceReviewFocus(id, orderBefore);"), "starter must advance focus after the verdict");
+    assert.equal(starter.split("api(`/api/opportunities/${id}`").length - 1, 2, "starter must keep its two opportunity PATCHes (vet + testing)");
+    assert.ok(starter.includes('api("/api/experiments"'), "starter must keep its experiment POST");
+    assert.ok(starter.includes("findStarterForResume(id, starterName)"), "starter must keep its planned-starter resume");
   });
 
   it("nextReviewIdAfter prefers the row after the verdict, else first remaining, else null", () => {

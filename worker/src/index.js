@@ -49,6 +49,8 @@ async function timedJson(url, opts = {}) {
 async function hnSignals(state) {
   // A query that throws marks this source failed; a source whose queries ALL
   // fail is named in the run log, so a total outage never reads as a quiet tick.
+  // A source whose queries only PARTLY fail reports ok/total instead (round7
+  // Task 4), so a half-dead source degrades visibly rather than silently.
   let failed = 0;
   // Queries run in parallel: sequential fetches + one hanging source blew the
   // fetch-handler wall clock on the first live run (stuck "running" forever).
@@ -72,6 +74,7 @@ async function hnSignals(state) {
   };
   const rows = (await Promise.all(HN_QUERIES.map(one))).flat();
   if (failed === HN_QUERIES.length) state.src_fail.push("hn");
+  else if (failed > 0) state.src_partial.push(`hn:${HN_QUERIES.length - failed}/${HN_QUERIES.length}`);
   return rows;
 }
 
@@ -100,6 +103,7 @@ async function redditSignals(state) {
   };
   const rows = (await Promise.all(REDDIT_QUERIES.map(one))).flat();
   if (failed === REDDIT_QUERIES.length) state.src_fail.push("reddit");
+  else if (failed > 0) state.src_partial.push(`reddit:${REDDIT_QUERIES.length - failed}/${REDDIT_QUERIES.length}`);
   return rows;
 }
 
@@ -128,6 +132,7 @@ async function githubSignals(state) {
   const queries = GITHUB_QUERIES;
   const rows = (await Promise.all(queries.map(one))).flat();
   if (failed === queries.length) state.src_fail.push("github");
+  else if (failed > 0) state.src_partial.push(`github:${queries.length - failed}/${queries.length}`);
   return rows;
 }
 
@@ -306,7 +311,7 @@ export async function flushVerdictWrites(env, verdictWrites) {
   }
 }
 export async function runResearch(env, trigger) {
-  const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0, stale: 0, src_fail: [] };
+  const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0, stale: 0, src_fail: [], src_partial: [] };
   // Reap runs a killed worker left behind: a "running" row older than the
   // cutoff is dead by definition (a live run finishes in minutes).
   await env.DB.prepare(
@@ -631,7 +636,7 @@ export async function runResearch(env, trigger) {
     }
     // Single run-log write carrying the brief mode (a bare finish used to run
     // first and be overwritten here).
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : "") + (prepassFailed ? ` prepass:${prepassFailed}_failed` : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (state.src_partial.length ? ` src_partial:${state.src_partial.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : "") + (prepassFailed ? ` prepass:${prepassFailed}_failed` : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);

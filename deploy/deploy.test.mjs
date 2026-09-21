@@ -253,3 +253,12 @@ describe("full-SHA revision plus package release (audit 2026-09-20-round1 Task 4
     assert.ok(exactAt !== -1 && fwdAt > exactAt && revAt > fwdAt && staleAt > revAt, "prefix passes must sit after exact match and before the stale fail");
   });
 });
+
+describe("gitignore covers local secrets (audit 2026-09-20-round7 Task 3)", () => {
+  it(".gitignore lists .env and .env.* so one broad add cannot stage credentials", () => {
+    const ignored = lines(read(".gitignore")).map((l) => l.trim());
+    assert.ok(ignored.includes(".env"), ".gitignore lost the .env line");
+    assert.ok(ignored.includes(".env.*"), ".gitignore lost the .env.* line");
+    assert.ok(ignored.includes(".dev.vars"), ".gitignore lost the pre-existing .dev.vars line");
+  });
+});

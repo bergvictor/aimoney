@@ -1948,6 +1948,37 @@ describe("experiment-write revenue_source tolerance (audit 2026-09-20-round3 Tas
       { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, writeFailDB(new Error("D1 down")));
     assert.equal(r.status, 500);
   });
+
+  it("retry path names the dropped source (audit 2026-09-20-round7 Task 2)", async () => {
+    const post = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter", revenue_cents: 500, revenue_source: "Stripe" } }, oldWriteDB());
+    assert.equal(post.status, 201);
+    assert.deepEqual(post.body.dropped, ["revenue_source"]);
+    const patch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running", revenue_source: "Stripe" } }, oldWriteDB());
+    assert.equal(patch.status, 200);
+    assert.deepEqual(patch.body.dropped, ["revenue_source"]);
+  });
+
+  it("no flag when nothing was lost: empty source on old tables, any write on migrated tables", async () => {
+    const emptyPost = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "No source" } }, oldWriteDB());
+    assert.equal(emptyPost.status, 201);
+    assert.ok(!("dropped" in emptyPost.body), "retry that dropped nothing must not flag");
+    const emptyPatch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running" } }, oldWriteDB());
+    assert.equal(emptyPatch.status, 200);
+    assert.ok(!("dropped" in emptyPatch.body), "retry that dropped nothing must not flag");
+    const okDB = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const keptPost = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Kept", revenue_source: "Stripe" } }, okDB);
+    assert.equal(keptPost.status, 201);
+    assert.ok(!("dropped" in keptPost.body), "migrated table must never flag");
+    const keptPatch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { revenue_source: "Stripe" } }, okDB);
+    assert.equal(keptPatch.status, 200);
+    assert.ok(!("dropped" in keptPatch.body), "migrated table must never flag");
+  });
 });
 
 describe("decisions COUNT split from revenue SUM (audit 2026-09-20-round4 Task 1)", () => {
