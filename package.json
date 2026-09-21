@@ -2,6 +2,7 @@
   "name": "aimoney",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "description": "AIMoney Lab — ranked AI money-making opportunities, research briefs, experiments, and a cron research agent (Cloudflare Pages + Worker + D1).",
   "scripts": {
     "test": "node --test worker/src/lib.test.js worker/src/index.test.js functions/api/api.test.mjs d1/migrations.test.mjs deploy/deploy.test.mjs public/tab-icon.test.mjs public/dashboard.test.mjs",

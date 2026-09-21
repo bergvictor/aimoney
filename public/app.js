@@ -275,7 +275,7 @@ const isNeedsReview = (o) =>
     : String((o && o.notes) || "").includes("UNREVIEWED");
 
 const deriveReviewList = (opps) =>
-  (opps || []).filter((o) => o && o.needs_review !== undefined && o.needs_review !== null ? Number(o.needs_review) === 1 : String((o && o.notes) || "").includes("UNREVIEWED")).sort((a, b) => (Date.parse(a.created_at || "") || 0) - (Date.parse(b.created_at || "") || 0));
+  (opps || []).filter(isNeedsReview).sort((a, b) => (Date.parse(a.created_at || "") || 0) - (Date.parse(b.created_at || "") || 0));
 
 async function refreshReview() {
   // Client-side first: identical rows with no round-trip. The unreviewed
@@ -452,7 +452,7 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
 }
 
 function cleanUnreviewed(notes) {
-  return String(notes || "").replace(/UNREVIEWED,?\s*/g, "").replace(/UNREVIEWED/g, "").trim();
+  return String(notes || "").replace(/UNREVIEWED,?\s*/g, "").trim();
 }
 
 // Shared vetted tag (finding 6): the [YYYY-MM-DD vetted] tag is the health

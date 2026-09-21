@@ -622,10 +622,12 @@ describe("tolerant zero-spend match (audit 2026-09-20-round2 Task 3)", () => {
 describe("client-side review list (audit 2026-09-20-round1 Task 1)", () => {
   // The derivation is extracted from the shipped source (not copied) so these
   // cases fail if app.js regresses to a second list fetch or drops the sort.
+  const isStart = js.indexOf("const isNeedsReview");
+  assert.ok(isStart !== -1, "app.js lost the isNeedsReview helper");
   const deriveStart = js.indexOf("const deriveReviewList");
   assert.ok(deriveStart !== -1, "app.js lost the deriveReviewList helper");
   const deriveReviewList = new Function(
-    `${js.slice(deriveStart, js.indexOf(";", deriveStart) + 1)} return deriveReviewList;`)();
+    `${js.slice(isStart, js.indexOf(";", isStart) + 1)} ${js.slice(deriveStart, js.indexOf(";", deriveStart) + 1)} return deriveReviewList;`)();
 
   it("keeps UNREVIEWED rows only", () => {
     const rows = [
@@ -649,6 +651,12 @@ describe("client-side review list (audit 2026-09-20-round1 Task 1)", () => {
     assert.deepEqual(deriveReviewList(null), []);
     assert.deepEqual(deriveReviewList([]), []);
     assert.deepEqual(deriveReviewList([{ id: 9 }]).map((o) => o.id), []);
+  });
+
+  it("deriveReviewList reuses isNeedsReview instead of inlining the predicate (audit 2026-09-20-round6 Task 3)", () => {
+    const src = js.slice(deriveStart, js.indexOf(";", deriveStart) + 1);
+    assert.ok(src.includes("isNeedsReview"), "deriveReviewList must call isNeedsReview");
+    assert.ok(!src.includes("needs_review"), "deriveReviewList must not inline the review-bit predicate");
   });
 
   it("refreshReview derives first and keeps the endpoint only as a truncation fallback", () => {
@@ -753,9 +761,11 @@ describe("start-here list excerpt (audit 2026-09-20-round2 Task 3)", () => {
 
 describe("needs_review bit + detail-before-write (audit 2026-09-20-round3 Task 2)", () => {
   it("deriveReviewList honors the bit, falling back to notes", () => {
+    const isStart = js.indexOf("const isNeedsReview");
+    assert.ok(isStart !== -1, "app.js lost the isNeedsReview helper");
     const deriveStart = js.indexOf("const deriveReviewList");
     const deriveReviewList = new Function(
-      `${js.slice(deriveStart, js.indexOf(";", deriveStart) + 1)} return deriveReviewList;`)();
+      `${js.slice(isStart, js.indexOf(";", isStart) + 1)} ${js.slice(deriveStart, js.indexOf(";", deriveStart) + 1)} return deriveReviewList;`)();
     assert.deepEqual(deriveReviewList([
       { id: 1, needs_review: 1, created_at: "2026-09-18T00:00:00Z" },
       { id: 2, needs_review: 0, notes: "UNREVIEWED stale?", created_at: "2026-09-10T00:00:00Z" },
@@ -1222,6 +1232,18 @@ describe("vetting path contract (audit 2026-09-20-round2 Task 1)", () => {
     assert.ok(out.includes("Human vetted; cap lifted."), "must keep the human-vetted copy");
     assert.ok(out.length <= 8000, "must respect the 8000-char cap");
     assert.ok(/\[\d{4}-\d{2}-\d{2} vetted\]/.test(out), "tag must stay greppable as [YYYY-MM-DD vetted]");
+  });
+
+  it("cleanUnreviewed strips every marker shape with a single replace (audit 2026-09-20-round6 Task 3)", () => {
+    const cleanStart = js.indexOf("function cleanUnreviewed");
+    const src = js.slice(cleanStart, js.indexOf("\n}\n", cleanStart) + 3);
+    assert.equal(src.split(".replace(").length - 1, 1, "cleanUnreviewed must be a single replace (the bare-marker pass already covers every shape)");
+    const { cleanUnreviewed } = shippedVetted();
+    assert.equal(cleanUnreviewed("a UNREVIEWED b"), "a b");
+    assert.equal(cleanUnreviewed("a UNREVIEWED, b"), "a b");
+    assert.equal(cleanUnreviewed("UNREVIEWED x UNREVIEWED"), "x");
+    assert.equal(cleanUnreviewed("plain notes"), "plain notes");
+    assert.equal(cleanUnreviewed(null), "");
   });
 
   it("vet path is the only unreviewed-to-vetted route: vettedNotes then PATCH notes", () => {
