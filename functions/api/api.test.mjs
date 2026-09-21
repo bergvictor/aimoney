@@ -2288,6 +2288,14 @@ describe("vetting path Vet-PATCH-health (audit 2026-09-20-round2 Task 1)", () =>
     assert.ok(readme.includes("missing verdict tag"), "README lost the verdict-tag marker");
   });
 
+  it("the worker never vets: zero vetted/clear paths in worker/src/index.js (audit 2026-09-20-round6 Task 1)", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "worker", "src", "index.js"), "utf8");
+    assert.ok(!/vetted/i.test(src), "worker must never write a vetted tag (the human owns every verdict)");
+    assert.ok(!src.includes("cleanUnreviewed"), "worker must never strip the UNREVIEWED marker");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("UNREVIEWED"), "control: worker still creates the UNREVIEWED marker it must never clear");
+  });
+
   it("Vet without the admin token 401s and leaves health unchanged", async () => {
     const vettedNotes = shippedVettedNotes();
     const db = makeDB({

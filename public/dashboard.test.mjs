@@ -2167,6 +2167,49 @@ describe("inflow-paused pill mirror (audit 2026-09-20-round4 Task 2)", () => {
   });
 });
 
+describe("last-verdict pill mirror (audit 2026-09-20-round6 Task 2)", () => {
+  function shippedVerdictBit() {
+    const start = js.indexOf("const verdictRecencyBit");
+    assert.ok(start !== -1, "app.js lost the verdictRecencyBit helper");
+    return new Function(
+      `${js.slice(start, js.indexOf("\n};", start) + 3)} return verdictRecencyBit;`)();
+  }
+
+  it("verdictRecencyBit renders the stall age, today, or never vetted (pure, live-shaped payload)", () => {
+    const bit = shippedVerdictBit();
+    const now = Date.parse("2026-09-21T12:00:00Z");
+    assert.equal(bit({ last_verdict: "2026-09-13", last_vetted: "2026-09-13" }, now), "last verdict 8d ago");
+    assert.equal(bit({ last_verdict: "2026-09-20" }, now), "last verdict 1d ago");
+    assert.equal(bit({ last_verdict: "2026-09-21", last_vetted: null }, now), "last verdict today");
+    assert.equal(bit({ last_verdict: null, last_vetted: "2026-09-10" }, now), "last verdict 11d ago", "must fall back to last_vetted");
+    assert.equal(bit({ last_verdict: null, last_vetted: null }, now), "never vetted");
+    assert.equal(bit({}, now), "", "old backends without the keys must keep today's pill");
+    assert.equal(bit(null, now), "");
+    assert.equal(bit({ last_verdict: "2026-09-13", health_probe_failures: ["last_vetted"] }, now), "", "a failed verdict probe stays unknown, never never-vetted");
+    assert.equal(bit({ last_verdict: "not-a-date" }, now), "", "an unparseable date stays unknown");
+  });
+
+  it("live pill appends the verdict bit to text + title from the fetched health, no new fetch", () => {
+    const live = js.slice(js.indexOf("} else if (last) {"), js.indexOf('$("#runs-body").innerHTML'));
+    assert.ok(live.includes("verdictRecencyBit(state.health"), "live pill must derive the verdict bit from the health snapshot");
+    assert.ok(live.includes('if (verdictBit) pill.title += " · " + verdictBit;'), "pill title lost the verdict bit");
+    assert.ok(live.includes('if (verdictBit) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + verdictBit;'), "pill text lost the verdict bit");
+    assert.ok(live.indexOf('pill.title += " · " + backlogBit') < live.indexOf('pill.title += " · " + verdictBit'), "verdict bit must sit next to the backlog bit");
+    assert.ok(!live.includes('api("/api/health")'), "pill mirror must reuse the fetched health, no new fetch");
+  });
+
+  it("cache persists the verdict keys and paints them stale-marked before the live refresh lands", () => {
+    const save = js.slice(js.indexOf("function saveLastGood"), js.indexOf("function paintLastGood"));
+    assert.ok(save.includes("snap.health.last_verdict = (typeof h.last_verdict"), "snapshot lost last_verdict");
+    assert.ok(save.includes("snap.health.last_vetted = (typeof h.last_vetted"), "snapshot lost last_vetted");
+    assert.ok(save.includes('health_probe_failures) && h.health_probe_failures.includes("last_vetted")'), "snapshot must skip the verdict keys when the verdict probe failed");
+    const paint = js.slice(js.indexOf("function paintLastGood"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(paint.includes("verdictRecencyBit(snap.health"), "cache paint must derive the verdict bit from the snapshot");
+    assert.ok(paint.includes("(cachedVerdict ? ` · ${cachedVerdict}` : \"\")"), "cached pill text lost the verdict bit");
+    assert.ok(paint.includes("LAST_GOOD_STALE_MARK"), "cached pill lost its stale mark");
+  });
+});
+
 describe("focus re-arms the focused row (audit 2026-09-20-round5 Task 1)", () => {
   // Cache + prefetch + fetchDetailForWrite + focusReviewRow extracted from the
   // shipped source (not copied) with a counted stub api, so these cases fail

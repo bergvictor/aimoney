@@ -348,6 +348,29 @@ const reviewBacklogBit = (health) => {
   return `${n} to review${age}`;
 };
 
+// Last-verdict pill bit (pure, self-contained for tests): "last verdict Xd
+// ago" from a health-shaped object, preferring last_verdict and falling back
+// to last_vetted so a kill-heavy clearing still dates its verdict. "never
+// vetted" when the backend explicitly reports null (the stall shows its
+// verdict age); "" when the backend never reported the keys (old backends
+// keep today's pill), when the verdict probe failed (unknown stays unknown —
+// the pill tooltip already names failing probes), or when the date is
+// unparseable. Day buckets: today / 1d / Nd.
+const verdictRecencyBit = (health, now) => {
+  if (!health || typeof health !== "object") return "";
+  if (Array.isArray(health.health_probe_failures) && health.health_probe_failures.includes("last_vetted")) return "";
+  const hasVerdict = Object.prototype.hasOwnProperty.call(health, "last_verdict");
+  const hasVetted = Object.prototype.hasOwnProperty.call(health, "last_vetted");
+  if (!hasVerdict && !hasVetted) return "";
+  const date = health.last_verdict || health.last_vetted || null;
+  if (date === null || date === undefined) return "never vetted";
+  const ms = Date.parse(`${date}T00:00:00Z`);
+  if (!Number.isFinite(ms)) return "";
+  const days = Math.floor((Number(now ?? Date.now()) - ms) / 86400000);
+  if (days <= 0) return "last verdict today";
+  return `last verdict ${days}d ago`;
+};
+
 // Inline one-line post-mortem row: replaces blocking prompt() with an in-page
 // input + Confirm/Cancel so a phone keeps context. Empty confirms cancel with
 // the row untouched; the API closure gate (result + post_mortem required)
@@ -998,17 +1021,20 @@ function renderRuns() {
   } else if (last) {
     const noise = state.health && typeof state.health.noise_24h === "number" ? state.health.noise_24h : null;
     const backlogBit = reviewBacklogBit(state.health);
+    const verdictBit = verdictRecencyBit(state.health, Date.now());
     const inflowPaused = state.health && state.health.inflow_paused === true;
     pill.title = noise !== null ? "Latest research run: +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise" : "Latest research run";
     const probeFails = probeFailures();
     if (probeFails.length) pill.title += " · failing probes: " + probeFails.map((p) => probeLabel(p, probeDetailMap())).join(", ");
     if (backlogBit) pill.title += " · " + backlogBit;
+    if (verdictBit) pill.title += " · " + verdictBit;
     if (inflowPaused) pill.title += " · inflow paused";
     const when = last.finished_at || last.started_at || "";
     $("#agent-text").textContent =
       `agent: ${last.status} · +${last.added}/${last.updated}/${last.briefs} · ${when.slice(0, 16).replace("T", " ")}`;
     if (noise !== null) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + noise + " noise";
     if (backlogBit) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + backlogBit;
+    if (verdictBit) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + verdictBit;
     if (inflowPaused) $("#agent-text").textContent += " " + String.fromCharCode(183) + " inflow paused";
     pill.classList.toggle("ok", last.status === "ok");
     pill.classList.toggle("bad", last.status === "error");
@@ -1584,6 +1610,14 @@ function saveLastGood(fresh) {
       inflow_paused: (typeof h.inflow_paused === "boolean" ? h.inflow_paused : null),
       savedAt: now,
     };
+    // Verdict keys ride only when the verdict probe answered: a failed probe
+    // leaves the keys absent so the cached pill paints "" (unknown), never a
+    // stale "never vetted".
+    const verdictProbeFailed = Array.isArray(h.health_probe_failures) && h.health_probe_failures.includes("last_vetted");
+    if (!verdictProbeFailed) {
+      snap.health.last_verdict = (typeof h.last_verdict === "string" ? h.last_verdict : null);
+      snap.health.last_vetted = (typeof h.last_vetted === "string" ? h.last_vetted : null);
+    }
   }
   if (fresh.opps) {
     const top = topOpportunity(state.opportunities);
@@ -1614,16 +1648,19 @@ function paintLastGood() {
     const when = String(run.finished_at || run.started_at || "").slice(0, 16).replace("T", " ");
     const noise = snap.health && typeof snap.health.noise_24h === "number" ? snap.health.noise_24h : null;
     const cachedBacklog = reviewBacklogBit(snap.health || {});
+    const cachedVerdict = verdictRecencyBit(snap.health || {}, Date.now());
     const cachedPaused = snap.health && snap.health.inflow_paused === true;
     $("#agent-text").textContent =
       `agent: ${run.status} · +${run.added}/${run.updated}/${run.briefs} · ${when}` +
       (noise !== null ? ` · ${noise} noise` : "") +
       (cachedBacklog ? ` · ${cachedBacklog}` : "") +
+      (cachedVerdict ? ` · ${cachedVerdict}` : "") +
       (cachedPaused ? " · inflow paused" : "") +
       (isSnapshotStale(run.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "");
     const pill = $("#agent-pill");
     if (pill) pill.title = (noise !== null ? `Latest research run: +${run.added}/${run.updated} · ${noise} noise` : "Latest research run") +
       (cachedBacklog ? ` · ${cachedBacklog}` : "") +
+      (cachedVerdict ? ` · ${cachedVerdict}` : "") +
       (cachedPaused ? " · inflow paused" : "") +
       (isSnapshotStale(run.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "");
   }
