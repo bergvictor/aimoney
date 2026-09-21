@@ -45,7 +45,10 @@ async function timedJson(url, opts = {}) {
   }
 }
 
-async function hnSignals() {
+async function hnSignals(state) {
+  // A query that throws marks this source failed; a source whose queries ALL
+  // fail is named in the run log, so a total outage never reads as a quiet tick.
+  let failed = 0;
   // Queries run in parallel: sequential fetches + one hanging source blew the
   // fetch-handler wall clock on the first live run (stuck "running" forever).
   const one = async (q) => {
@@ -63,13 +66,17 @@ async function hnSignals() {
           published_at: h.created_at || "",
         });
       }
-    } catch { /* source hiccup must not kill the run */ }
+    } catch { failed++; /* source hiccup must not kill the run */ }
     return out;
   };
-  return (await Promise.all(HN_QUERIES.map(one))).flat();
+  const rows = (await Promise.all(HN_QUERIES.map(one))).flat();
+  if (failed === HN_QUERIES.length) state.src_fail.push("hn");
+  return rows;
 }
 
-async function redditSignals() {
+async function redditSignals(state) {
+  // Same failure accounting as hnSignals: all queries failed names the source.
+  let failed = 0;
   const one = async (q) => {
     const out = [];
     try {
@@ -87,13 +94,18 @@ async function redditSignals() {
           published_at: d.created_utc ? new Date(d.created_utc * 1000).toISOString() : "",
         });
       }
-    } catch { /* 429s happen; HN usually carries the run */ }
+    } catch { failed++; /* 429s happen; HN usually carries the run */ }
     return out;
   };
-  return (await Promise.all(REDDIT_QUERIES.map(one))).flat();
+  const rows = (await Promise.all(REDDIT_QUERIES.map(one))).flat();
+  if (failed === REDDIT_QUERIES.length) state.src_fail.push("reddit");
+  return rows;
 }
 
-async function githubSignals() {
+async function githubSignals(state) {
+  // Same failure accounting as hnSignals (against the fetched slice, not the
+  // full query list, so a 2-of-2 outage still reports).
+  let failed = 0;
   const since = new Date(Date.now() - 90 * 864e5).toISOString().slice(0, 10);
   const one = async (q) => {
     const out = [];
@@ -110,10 +122,13 @@ async function githubSignals() {
           published_at: repo.created_at || "",
         });
       }
-    } catch { /* unauth rate limit is 10 req/min; fine at this volume */ }
+    } catch { failed++; /* unauth rate limit is 10 req/min; fine at this volume */ }
     return out;
   };
-  return (await Promise.all(GITHUB_QUERIES.slice(0, 2).map(one))).flat();
+  const queries = GITHUB_QUERIES.slice(0, 2);
+  const rows = (await Promise.all(queries.map(one))).flat();
+  if (failed === queries.length) state.src_fail.push("github");
+  return rows;
 }
 
 // Every AI call races a timeout: a queued model must fail HONESTLY (and be
@@ -180,7 +195,7 @@ export function agentMoneyEstimates(v) {
 }
 
 async function runResearch(env, trigger) {
-  const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0, stale: 0 };
+  const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0, stale: 0, src_fail: [] };
   // Reap runs a killed worker left behind: a "running" row older than the
   // cutoff is dead by definition (a live run finishes in minutes).
   await env.DB.prepare(
@@ -214,7 +229,13 @@ async function runResearch(env, trigger) {
     // ticks, which get a long wall clock; a slow tick still self-skips.
     const briefDeadline = trigger === "cron" ? 300000 : -1;
     // 1. Collect signals (bounded, independent — one dead source is fine).
-    const batches = await Promise.allSettled([hnSignals(), redditSignals(), githubSignals()]);
+    const batches = await Promise.allSettled([hnSignals(state), redditSignals(state), githubSignals(state)]);
+    const srcNames = ["hn", "reddit", "github"];
+    batches.forEach((b, i) => {
+      // A rejected collector means every query failed: name it like the
+      // per-query path does, so no outage reads as a quiet tick.
+      if (b.status === "rejected" && !state.src_fail.includes(srcNames[i])) state.src_fail.push(srcNames[i]);
+    });
     const signals = batches.flatMap((b) => (b.status === "fulfilled" ? b.value : []));
     state.seen = signals.length;
     // ONE batched round-trip instead of ~24 sequential inserts (9s -> 0.5s),
@@ -391,6 +412,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
     // 3. One AI pass: brief one bare row — top-scored, or oldest-unreviewed-first past 48h —
     // unless the clock is nearly spent (it lands on a later run instead).
     let briefMode = "skipped";
+    let briefFailed = false; // a brief parse/insert threw: named in the run log, retried next tick
     let bare = null;
     // Backlog age shared by the brief-mode flip and the extra-brief gate: one
     // oldest-unreviewed query per run (new proposals land newer, so the oldest
@@ -445,7 +467,7 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
           JSON.stringify(sigs.map((s) => ({ title: s.title, url: s.url })))).run();
           state.briefs++;
         }
-      } catch { /* malformed brief JSON: skip, briefs stay human-seeded */ }
+      } catch { briefFailed = true; /* malformed brief JSON or failed brief write: skip, briefs stay human-seeded */ }
     }
 
     // When the review backlog is old (>48h), brief one extra oldest-unreviewed
@@ -488,13 +510,13 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
                 JSON.stringify(sigs2.map((s) => ({ title: s.title, url: s.url })))).run();
               state.briefs++;
             }
-          } catch { /* extra brief is best-effort; lands next run */ }
+          } catch { briefFailed = true; /* extra brief is best-effort; lands next run */ }
         }
       }
     }
     // Single run-log write carrying the brief mode (a bare finish used to run
     // first and be overwritten here).
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);

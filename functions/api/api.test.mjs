@@ -189,6 +189,12 @@ function makeDB(seed = {}) {
       const withExp = new Set(data.experiments.map((e) => String(e.opportunity_id)));
       return { n: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]") && !withExp.has(String(o.id))).length };
     }
+    if (sql.includes("vetted]%") && /\[\d{4}-\d{2}-\d{2} vetted\]/.test(sql)) {
+      // Tag-date vetted count: emulate each inlined [YYYY-MM-DD vetted] LIKE.
+      const days = [...sql.matchAll(/\[(\d{4}-\d{2}-\d{2}) vetted\]/g)].map((m) => `[${m[1]} vetted]`);
+      return { n: data.opportunities.filter((o) => days.some((d) => String(o.notes || "").includes(d))).length };
+    }
+    // Legacy updated_at shape (production now inlines the tag dates above).
     if (sql.includes("vetted]%") && sql.includes("COUNT(*)")) {
       const cutoff = Date.now() - 7 * 86400000;
       let n = 0;
@@ -604,18 +610,20 @@ describe("decisions/week + vetted rate (round2 Task 1)", () => {
     assert.equal(r.body.decisions_last_7d, 2);
   });
 
-  it("counts vetted_last_7d from vetted-tag rows touched in 7d", async () => {
+  it("counts vetted_last_7d from [date vetted] tags in the last 7 calendar days", async () => {
     const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
     const db = makeDB({
       opportunities: [
-        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x\n[2026-09-18 vetted] Human vetted; cap lifted.", created_at: daysAgo(10), updated_at: daysAgo(2) },
-        { id: 2, slug: "b", title: "B", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "y\n[2026-09-01 vetted] Human vetted; cap lifted.", created_at: daysAgo(20), updated_at: daysAgo(10) },
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x [" + daysAgo(1).slice(0, 10) + " vetted] Human vetted; cap lifted.", created_at: daysAgo(10), updated_at: daysAgo(1) },
+        { id: 2, slug: "b", title: "B", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "y [" + daysAgo(30).slice(0, 10) + " vetted] Human vetted; cap lifted.", created_at: daysAgo(40), updated_at: daysAgo(1) },
+        { id: 4, slug: "d", title: "D", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "w [" + daysAgo(8).slice(0, 10) + " vetted] Human vetted; cap lifted.", created_at: daysAgo(20), updated_at: daysAgo(8) },
+        { id: 5, slug: "e", title: "E", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "v [" + daysAgo(0).slice(0, 10) + " vetted] Human vetted; cap lifted.", created_at: daysAgo(1), updated_at: daysAgo(0) },
         { id: 3, slug: "c", title: "C", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal \u2014 UNREVIEWED", created_at: daysAgo(1), updated_at: daysAgo(1) },
       ],
     });
     const r = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(r.status, 200);
-    assert.equal(r.body.vetted_last_7d, 1);
+    assert.equal(r.body.vetted_last_7d, 2);
   });
 
   it("keeps every existing health key for verify.sh", async () => {
@@ -1177,6 +1185,59 @@ describe("list needs_review bit + excerpt cap (audit 2026-09-20-round3 Task 2)",
     const d = await callApi(["opportunities", "2"], "http://localhost/api/opportunities/2", {}, db);
     assert.equal(d.status, 200);
     assert.ok(String(d.body.opportunity.notes).includes("UNREVIEWED"), "detail lost the full notes writers append to");
+  });
+});
+
+describe("health outage honesty (audit 2026-09-20-round2 Task 1)", () => {
+  const COUNT_KEYS = ["opportunities", "unreviewed", "bare_without_brief", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h"];
+  const downDB = () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    return { ...db, batch: async () => { throw new Error("D1 down"); } };
+  };
+
+  it("failed batch returns HTTP 200 with ok:false, db down, and null counters", async () => {
+    const r = await callApi(["health"], "http://localhost/api/health", {}, downDB());
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, false);
+    assert.equal(r.body.db, "down");
+    for (const k of COUNT_KEYS) {
+      assert.equal(r.body[k], null, `health ${k} must be null during a DB outage, not 0`);
+    }
+    assert.deepEqual(r.body.experiments_by_status, {});
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "time"]);
+  });
+
+  it("unchanged verify.sh ok:true grep fails the outage payload, passes the healthy one", async () => {
+    const up = await callApi(["health"], "http://localhost/api/health", {}, makeDB({ opportunities: oppSeed() }));
+    assert.ok(JSON.stringify(up.body).includes('"ok":true'), "healthy payload must keep the verify.sh marker");
+    const down = await callApi(["health"], "http://localhost/api/health", {}, downDB());
+    assert.ok(!JSON.stringify(down.body).includes('"ok":true'), "outage payload must fail the unchanged verify.sh grep");
+  });
+
+  it("dashboard typeof-guards each health count it renders (no client change)", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "public", "app.js"), "utf8");
+    for (const k of ["decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "revenue_last_7d", "revenue_total", "noise_24h"]) {
+      assert.ok(src.includes(`typeof state.health.${k} === "number"`), `dashboard lost its typeof guard for ${k}`);
+    }
+    assert.ok(src.includes("state.health.oldest_unreviewed_age_h"), "dashboard lost its oldest-age consumer");
+    assert.ok(src.includes('if (typeof h === "number" && Number.isFinite(h))'), "dashboard lost the oldest-age typeof guard");
+    assert.ok(src.includes("state.health.bare_without_brief"), "dashboard lost its bare-count consumer");
+    assert.ok(src.includes('(typeof n === "number" && Number.isFinite(n))'), "dashboard lost the bare-count typeof guard");
+  });
+});
+
+describe("vetted tag-date SELECT (audit 2026-09-20-round2 Task 2)", () => {
+  it("emits one vetted SELECT OR-matching the last 7 calendar days, no updated_at", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    await callApi(["health"], "http://localhost/api/health", {}, db);
+    const vetted = (db._prepared || []).filter((s) => s.includes("vetted]%") && !s.includes("NOT EXISTS"));
+    assert.equal(vetted.length, 1, "health must carry exactly one vetted-7d SELECT");
+    assert.ok(!vetted[0].includes("updated_at"), "vetted-7d must not key on updated_at");
+    const days = [...vetted[0].matchAll(/\[(\d{4}-\d{2}-\d{2}) vetted\]/g)].map((m) => m[1]);
+    assert.equal(days.length, 7, `vetted SELECT must inline 7 day tags, got ${days.length}`);
+    const expect = [];
+    for (let i = 0; i < 7; i++) expect.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
+    assert.deepEqual(days, expect);
   });
 });
 

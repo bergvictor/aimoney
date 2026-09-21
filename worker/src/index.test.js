@@ -352,6 +352,53 @@ describe("batched verdict writes + single heartbeat (audit 2026-09-20-round3 Tas
   });
 });
 
+describe("failed-source + failed-brief markers (audit 2026-09-20-round2 Task 3)", () => {
+  it("per-query throw marks its source; all-failed sources land in state.src_fail", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("src_fail: []"), "state lost the failed-source list");
+    assert.ok(src.includes("async function hnSignals(state)"), "hnSignals lost its state arg");
+    assert.ok(src.includes("async function redditSignals(state)"), "redditSignals lost its state arg");
+    assert.ok(src.includes("async function githubSignals(state)"), "githubSignals lost its state arg");
+    assert.ok(src.includes("failed === HN_QUERIES.length"), "hn lost its all-queries-failed check");
+    assert.ok(src.includes("failed === REDDIT_QUERIES.length"), "reddit lost its all-queries-failed check");
+    assert.ok(src.includes("failed === queries.length"), "github lost its all-queries-failed check");
+    assert.ok(src.includes('state.src_fail.push("hn")'), "hn lost its failure report");
+    assert.ok(src.includes('state.src_fail.push("reddit")'), "reddit lost its failure report");
+    assert.ok(src.includes('state.src_fail.push("github")'), "github lost its failure report");
+    assert.ok(src.includes("Promise.allSettled([hnSignals(state), redditSignals(state), githubSignals(state)])"), "collectors lost their state arg at the collect site");
+  });
+
+  it("finish-ok error line appends src_fail beside brief/stale; quiet ticks carry none", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("src_fail:"), "run log lost the src_fail marker");
+    assert.ok(src.includes("state.src_fail.join"), "run log lost the failed-source list");
+    assert.ok(src.includes("state.src_fail.length ?"), "src_fail suffix must be conditional (quiet ticks carry none)");
+  });
+
+  it("failed brief parse/insert records brief:failed, keeping skip-and-retry", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("briefFailed"), "worker lost the brief-failure flag");
+    assert.equal(src.split("briefFailed = true").length - 1, 2, "both brief catches must record the failure");
+    assert.ok(src.includes('" brief:failed"'), "run log lost the brief:failed marker");
+    assert.equal(src.split('await finish("ok"').length - 1, 1, "run must finish the run log exactly once");
+  });
+
+  it("same AI budget, no status moves, manual brief-skip intact", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+    assert.ok(src.includes('trigger === "cron" ? 300000 : -1'), "manual path lost its brief-skipping deadline");
+  });
+
+  it("README names the src_fail and brief:failed markers", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("src_fail"), "README lost the failed-source marker");
+    assert.ok(readme.includes("brief:failed"), "README lost the failed-brief marker");
+  });
+});
+
 describe("agentMoneyEstimates zero-spend normalization (audit 2026-09-20-round2 Task 3)", () => {
   it("prefixes bare 0/free/none phrasings with $0, raw phrasing preserved", () => {
     assert.equal(agentMoneyEstimates({ capital_needed: "Free" }).capital_needed, "$0 Free");

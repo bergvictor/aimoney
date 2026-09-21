@@ -371,6 +371,12 @@ export async function onRequest(context) {
   try {
     if (parts.length === 1 && parts[0] === "health" && method === "GET") {
       const dayAgoIso = new Date(Date.now() - 86400000).toISOString();
+      // Vetted-this-week counts tag dates, not touches: the [YYYY-MM-DD vetted]
+      // tag the dashboard appends is fixed-width and greppable, so the last 7
+      // calendar days match inline — no migration, and a fresh touch on an
+      // old-vetted row no longer fakes velocity.
+      const vettedDays = [];
+      for (let i = 0; i < 7; i++) vettedDays.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
       // One batched round-trip for every independent health select (paired
       // scans merged: decisions+revenue, lifetime totals, unreviewed+oldest).
       const healthStmts = env.DB ? [
@@ -381,11 +387,15 @@ export async function onRequest(context) {
         env.DB.prepare("SELECT finished_at, started_at FROM agent_runs WHERE status='ok' ORDER BY id DESC LIMIT 1"),
         env.DB.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
         env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS revenue, COALESCE(SUM(spent_cents),0) AS spent FROM experiments WHERE status IN ('won','lost')"),
-        env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%vetted]%' AND updated_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
+        env.DB.prepare(`SELECT COUNT(*) AS n FROM opportunities WHERE ${vettedDays.map((d) => `notes LIKE '%[${d} vetted]%'`).join(" OR ")}`),
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
         env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso),
       ] : [];
       const healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;
+      // A failed batch must read as an outage, not as zeros: ok flips to
+      // false (so the unchanged verify.sh '"ok":true' grep fails the rollout)
+      // and every count key goes null — the dashboard typeof-guards each one.
+      const healthDown = !healthRes;
       const firstRow = (i) => (healthRes && healthRes[i] && healthRes[i].results && healthRes[i].results[0]) || null;
       const db = firstRow(0);
       const unreviewedRow = firstRow(1);
@@ -399,7 +409,7 @@ export async function onRequest(context) {
       const noiseRow = firstRow(9);
       // Lane metric, read-only from existing columns (no migration): decisions
       // are won/lost rows closed in the window; vetted counts rows carrying
-      // the "[YYYY-MM-DD vetted]" tag (see vetOpportunity) touched in 7d.
+      // the "[YYYY-MM-DD vetted]" tag (see vetOpportunity) dated in the last 7 calendar days.
       const decisionsRow = weekRow ? { n: weekRow.n } : null;
       const revenueRow = weekRow ? { total: weekRow.total } : null;
       const revenueTotalRow = lifetimeRow ? { total: lifetimeRow.revenue } : null;
@@ -426,7 +436,7 @@ export async function onRequest(context) {
           if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
         }
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, unreviewed: unreviewedRow ? unreviewedRow.n : 0, bare_without_brief: bareRow ? bareRow.n : 0, experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: decisionsRow ? decisionsRow.n : 0, revenue_last_7d: revenueRow ? (revenueRow.total || 0) : 0, revenue_total: revenueTotalRow ? (revenueTotalRow.total || 0) : 0, spent_total: spentTotalRow ? (spentTotalRow.total || 0) : 0, vetted_last_7d: vettedRow ? vettedRow.n : 0, vetted_no_experiment: vettedNoExpRow ? vettedNoExpRow.n : 0, noise_24h: noiseRow ? noiseRow.n : 0, time: new Date().toISOString() });
+      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db ? "up" : "down"), opportunities: healthDown ? null : (db ? db.n : 0), unreviewed: healthDown ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: healthDown ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: healthDown ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: healthDown ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: healthDown ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: healthDown ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: healthDown ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: healthDown ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: healthDown ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString() });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({
