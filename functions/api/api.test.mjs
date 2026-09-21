@@ -3,7 +3,7 @@
 // Run: npm test (node --test, no framework)
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { onRequest, _resetSchemaMigrationForTests } from "./[[path]].js";
+import { onRequest, _resetSchemaMigrationForTests, outcomeLedgerLine } from "./[[path]].js";
 import { effectiveScore as workerEffectiveScore } from "../../worker/src/lib.js";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -89,7 +89,8 @@ function makeDB(seed = {}) {
       return { results: rows };
     }
     if (sql.includes("FROM opportunities") && sql.includes("vetted]%") && !sql.includes("COUNT(*)") && (sql.includes("substr(notes, -500)") || sql.includes("SELECT notes FROM opportunities"))) {
-      return { results: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]")).map((o) => ({ notes: String(o.notes || "").slice(-500) })) };
+      const wantKilled = sql.includes("killed]%");
+      return { results: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]") || (wantKilled && String(o.notes || "").includes("killed]"))).map((o) => ({ notes: String(o.notes || "").slice(-500) })) };
     }
     return { results: [] };
   }
@@ -253,6 +254,7 @@ function makeDB(seed = {}) {
       if (row) {
         const combined = String(row.notes || "") + String(addition || "");
         row.notes = combined.length <= 8000 ? combined : combined.slice(-8000);
+        if (sql.includes("updated_at")) row.updated_at = new Date().toISOString();
       }
       return { success: true };
     }
@@ -1228,7 +1230,7 @@ describe("health batch + rev cache (audit 2026-09-20-round2 Task 2)", () => {
     const db = makeDB({ opportunities: oppSeed() });
     const r = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(r.status, 200);
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "vetted_no_experiment", "noise_24h", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time"]);
   });
 
   it("reports merged figures identical to the old per-query math", async () => {
@@ -1339,8 +1341,9 @@ describe("health outage honesty (audit 2026-09-20-round2 Task 1)", () => {
       assert.equal(r.body[k], null, `health ${k} must be null during a DB outage, not 0`);
     }
     assert.equal(r.body.last_vetted, null, "health last_vetted must be null during a DB outage");
+    assert.equal(r.body.last_verdict, null, "health last_verdict must be null during a DB outage");
     assert.equal(r.body.experiments_by_status, null, "health experiments_by_status must be null during a DB outage, not {}");
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "vetted_no_experiment", "noise_24h", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time"]);
   });
 
   it("unchanged verify.sh ok:true grep fails the outage payload, passes the healthy one", async () => {
@@ -1475,7 +1478,7 @@ describe("health probe isolation (audit 2026-09-20-round1 Task 1)", () => {
   it("names the failing probe, keeps existing keys byte-identical for verify.sh", async () => {
     const r = await callApi(["health"], "http://localhost/api/health", {}, oneBadProbeDB());
     assert.deepEqual(r.body.health_probe_failures, ["revenue_lifetime"]);
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
     assert.deepEqual(r.body.health_probe_detail, { revenue_lifetime: "spent_cents" });
     assert.ok(JSON.stringify(r.body).includes('"ok":true'), "partial payload must keep the verify.sh marker");
   });
@@ -1517,7 +1520,7 @@ describe("health probe isolation (audit 2026-09-20-round1 Task 1)", () => {
     assert.equal(r.body.db, "up");
     assert.ok(!("health_probe_failures" in r.body), "a batch that rejects spuriously must not attach an empty failures key");
     assert.ok(!("health_probe_detail" in r.body), "a batch that rejects spuriously must not attach a detail key either");
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "vetted_no_experiment", "noise_24h", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time"]);
     assert.equal(r.body.opportunities, 3);
     assert.equal(r.body.unreviewed, 2);
     assert.equal(r.body.decisions_last_7d, 1);
@@ -1893,7 +1896,7 @@ describe("decisions COUNT split from revenue SUM (audit 2026-09-20-round4 Task 1
     assert.equal(r.body.spent_total, 1200);
     assert.deepEqual(r.body.health_probe_failures, ["revenue_week"]);
     assert.deepEqual(r.body.health_probe_detail, { revenue_week: "revenue_cents" });
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
   });
 });
 
@@ -2006,6 +2009,7 @@ describe("vetting path Vet-PATCH-health (audit 2026-09-20-round2 Task 1)", () =>
     assert.equal(before.body.unreviewed, 2);
     assert.equal(before.body.vetted_last_7d, 0);
     assert.equal(before.body.last_vetted, null);
+    assert.equal(before.body.last_verdict, null);
 
     const notes = vettedNotes(db.data.opportunities[0].notes);
     assert.ok(!notes.includes("UNREVIEWED"), "vetted notes must clear UNREVIEWED");
@@ -2023,6 +2027,7 @@ describe("vetting path Vet-PATCH-health (audit 2026-09-20-round2 Task 1)", () =>
     assert.equal(after.body.unreviewed, 1);
     assert.equal(after.body.vetted_last_7d, 1);
     assert.equal(after.body.last_vetted, today);
+    assert.equal(after.body.last_verdict, today);
   });
 
   it("a touch without the tag date does not fake velocity (tag contract, not updated_at)", async () => {
@@ -2038,6 +2043,7 @@ describe("vetting path Vet-PATCH-health (audit 2026-09-20-round2 Task 1)", () =>
     assert.equal(health.body.unreviewed, 0);
     assert.equal(health.body.vetted_last_7d, 0, "clearing UNREVIEWED without a dated tag must not count as vetted");
     assert.equal(health.body.last_vetted, null);
+    assert.equal(health.body.last_verdict, null);
   });
 
   it("Vet without the admin token 401s and leaves health unchanged", async () => {
@@ -2110,8 +2116,154 @@ describe("experiments_by_status null on probe failure (audit 2026-09-20-round2 T
       assert.deepEqual(partial.body[k], healthy.body[k], `key ${k} changed while only the status probe failed`);
     }
     assert.deepEqual(partial.body.last_vetted, healthy.body.last_vetted);
+    assert.deepEqual(partial.body.last_verdict, healthy.body.last_verdict);
     assert.deepEqual(healthy.body.experiments_by_status, { won: 1, planned: 1 });
     assert.equal(partial.body.experiments_by_status, null);
-    assert.deepEqual(Object.keys(partial.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
+    assert.deepEqual(Object.keys(partial.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
+  });
+});
+
+describe("kill verdicts in health verdict date (audit 2026-09-20-round3 Task 2)", () => {
+  it("kill-only row reports today's verdict date while vetted count stays pure", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "killed", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal\n[" + today + " killed] no demand", created_at: "2026-09-10T00:00:00Z", updated_at: new Date().toISOString() },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.last_verdict, today);
+    assert.equal(r.body.last_vetted, null, "kill must not fake a vetted date");
+    assert.equal(r.body.vetted_last_7d, 0, "kill must not fake the vetted count");
+    assert.equal(r.body.unreviewed, 0);
+  });
+
+  it("vetted row still reports via its tag on both dates", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x [" + today + " vetted] Human vetted; cap lifted.", created_at: "2026-09-10T00:00:00Z", updated_at: new Date().toISOString() },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.last_vetted, today);
+    assert.equal(r.body.last_verdict, today);
+    assert.equal(r.body.vetted_last_7d, 1);
+  });
+
+  it("no-vetted-no-killed still null on both dates", async () => {
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.last_vetted, null);
+    assert.equal(r.body.last_verdict, null);
+    assert.equal(r.body.vetted_last_7d, 0);
+  });
+
+  it("verdict takes the max over vetted and killed tags", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x [" + daysAgo(5) + " vetted] Human vetted; cap lifted.", created_at: daysAgo(10), updated_at: daysAgo(5) },
+        { id: 2, slug: "b", title: "B", status: "killed", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "y [" + daysAgo(2) + " killed] no demand", created_at: daysAgo(10), updated_at: daysAgo(2) },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.last_vetted, daysAgo(5));
+    assert.equal(r.body.last_verdict, daysAgo(2));
+  });
+
+  it("probe stays bounded to a 500-char tail while matching killed rows", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    await callApi(["health"], "http://localhost/api/health", {}, db);
+    const probeSql = (db._prepared || []).filter((s) => s.includes("vetted]%") && !s.includes("COUNT(*)") && !s.includes("NOT EXISTS"));
+    assert.equal(probeSql.length, 1, "health must carry exactly one verdict-date SELECT");
+    assert.ok(probeSql[0].includes("substr(notes, -500)"), "verdict probe must select the bounded substr tail");
+    assert.ok(probeSql[0].includes("killed]%"), "verdict probe must match killed rows");
+  });
+});
+
+describe("shared outcome-ledger builder (audit 2026-09-20-round3 Task 4)", () => {
+  const oppRow = () => ([
+    { id: 1, slug: "a", title: "A", status: "testing", value: 7, effort: 3, confidence: 5, fit: 8, score: 7000, notes: "seed notes", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+  ]);
+  const ledgerTail = (notes) => String(notes || "").split("\n").filter((l) => l.includes("outcome] Experiment")).slice(-1)[0] || "";
+
+  it("POST-close and PATCH-close emit byte-identical lines for identical input", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const body = { opportunity_id: 1, name: "Landing test", status: "won", result: "12 signups in 7d", post_mortem: "headline worked", revenue_cents: 50000, spent_cents: 1250, revenue_source: "Stripe" };
+    const postDb = makeDB({ opportunities: oppRow() });
+    const post = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body }, postDb);
+    assert.equal(post.status, 201);
+    const patchDb = makeDB({
+      opportunities: oppRow(),
+      experiments: [{ id: 1, opportunity_id: 1, name: "Landing test", hypothesis: "", status: "running", budget_cap: "", spent: "", metric: "", target: "", result: "", started_at: "2026-09-01T00:00:00Z", ended_at: "", post_mortem: "", revenue_cents: 0, spent_cents: 0, revenue_source: "" }],
+    });
+    const patch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "won", result: body.result, post_mortem: body.post_mortem, revenue_cents: body.revenue_cents, spent_cents: body.spent_cents, revenue_source: body.revenue_source } }, patchDb);
+    assert.equal(patch.status, 200);
+    const postLine = ledgerTail(postDb.data.opportunities[0].notes);
+    const patchLine = ledgerTail(patchDb.data.opportunities[0].notes);
+    const expected = `[${today} outcome] Experiment "Landing test" won: 12 signups in 7d ($500.00 rev / $12.50 spent via Stripe)`;
+    assert.equal(postLine, expected);
+    assert.equal(patchLine, expected);
+    assert.equal(postLine, patchLine, "both close paths must emit byte-identical ledger lines");
+  });
+
+  it("empty source and zero cents render identically on both paths ($0.00, no via)", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const postDb = makeDB({ opportunities: oppRow() });
+    const post = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Z", status: "lost", result: "no sales", post_mortem: "wrong channel" } }, postDb);
+    assert.equal(post.status, 201);
+    const patchDb = makeDB({
+      opportunities: oppRow(),
+      experiments: [{ id: 1, opportunity_id: 1, name: "Z", hypothesis: "", status: "running", budget_cap: "", spent: "", metric: "", target: "", result: "", started_at: "", ended_at: "", post_mortem: "", revenue_cents: 0, spent_cents: 0, revenue_source: "" }],
+    });
+    const patch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "lost", result: "no sales", post_mortem: "wrong channel" } }, patchDb);
+    assert.equal(patch.status, 200);
+    const expected = `[${today} outcome] Experiment "Z" lost: no sales ($0.00 rev / $0.00 spent)`;
+    assert.equal(ledgerTail(postDb.data.opportunities[0].notes), expected);
+    assert.equal(ledgerTail(patchDb.data.opportunities[0].notes), expected);
+  });
+
+  it("shared builder collapses whitespace and truncates name/result like both paths", () => {
+    const line = outcomeLedgerLine({ day: "2026-09-21", name: "N".repeat(200), status: "won", result: "line one\nline   two", revenue_cents: 1050, spent_cents: 0, revenue_source: "" });
+    assert.equal(line, `[2026-09-21 outcome] Experiment "${"N".repeat(120)}" won: line one line two ($10.50 rev / $0.00 spent)`);
+    const via = outcomeLedgerLine({ day: "2026-09-21", name: "W", status: "lost", result: "x", revenue_cents: 0, spent_cents: 0, revenue_source: "PayPal" });
+    assert.ok(via.endsWith("($0.00 rev / $0.00 spent via PayPal)"));
+  });
+
+  it("both close paths call the shared builder and touch parent updated_at alike", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "[[path]].js"), "utf8");
+    assert.ok(src.includes("export const outcomeLedgerLine"), "API lost the shared outcomeLedgerLine builder");
+    assert.equal(src.split("outcomeLedgerLine({").length - 1, 2, "both close paths must call outcomeLedgerLine");
+    assert.ok(!src.includes("String.fromCharCode(34)"), "create-close must not keep its drifted quote builder");
+    const ledgerUpdates = src.split("UPDATE opportunities SET notes = substr(notes || ?, -8000)");
+    assert.ok(ledgerUpdates.length >= 3, "both close paths must append via the newest-kept idiom");
+    for (const tail of ledgerUpdates.slice(1, 3)) {
+      assert.ok(tail.startsWith(", updated_at ="), "both ledger appends must touch parent updated_at alike");
+    }
+  });
+
+  it("editing a closed row still appends nothing", async () => {
+    const db = makeDB({
+      opportunities: oppRow(),
+      experiments: [{ id: 1, opportunity_id: 1, name: "W", hypothesis: "", status: "won", budget_cap: "", spent: "", metric: "", target: "", result: "old", started_at: "", ended_at: "2026-09-10T00:00:00Z", post_mortem: "old pm", revenue_cents: 100, spent_cents: 50, revenue_source: "" }],
+    });
+    const before = db.data.opportunities[0].notes;
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { result: "updated" } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(db.data.opportunities[0].notes, before);
   });
 });

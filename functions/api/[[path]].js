@@ -80,6 +80,15 @@ const clamp10 = (v, dflt) => {
 // Ledger money: integer cents to fixed-2dp dollars ($10.50, never $10.5).
 // Mirrors public/app.js moneyCents so drawer and ledger agree.
 const centsDollars = (cents) => "$" + (Number(cents) / 100).toFixed(2);
+// Outcome-ledger line (round3 F6): one pure builder for both close paths
+// (create-close and update-close) so the money-made-real record cannot drift
+// by close path. Pure over its inputs; callers pass already-clamped cents.
+export const outcomeLedgerLine = ({ day, name, status, result, revenue_cents, spent_cents, revenue_source }) => {
+  const oneLine = String(result || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  const viaBit = revenue_source ? ` via ${revenue_source}` : "";
+  const moneyBit = ` (${centsDollars(revenue_cents)} rev / ${centsDollars(spent_cents)} spent${viaBit})`;
+  return `[${day} outcome] Experiment "${String(name || "").slice(0, 120)}" ${status}: ${oneLine}${moneyBit}`;
+};
 // effectiveScore shared via worker/src/lib.js (F3); scoreOf deduped (F6).
 // (local duplicate removed; see import above)
 
@@ -376,13 +385,10 @@ async function createExperiment(request, env) {
   }
   if (status === "won" || status === "lost") {
     const day = nowIso.slice(0, 10);
-    const oneLine = String(b.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
-    const viaBit = revenue_source ? " via " + revenue_source : "";
-    const moneyBit = " (" + centsDollars(revenue_cents) + " rev / " + centsDollars(spent_cents) + " spent" + viaBit + ")";
-    const line = "[" + day + " outcome] Experiment " + String.fromCharCode(34) + String(b.name || "").slice(0, 120) + String.fromCharCode(34) + " " + status + ": " + oneLine + moneyBit;
+    const line = outcomeLedgerLine({ day, name: b.name, status, result: b.result, revenue_cents, spent_cents, revenue_source });
     await env.DB.prepare(
-      "UPDATE opportunities SET notes = substr(notes || ?, -8000) WHERE id = ?"
-    ).bind(String.fromCharCode(10) + line, b.opportunity_id).run();
+      "UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?"
+    ).bind("\n" + line, b.opportunity_id).run();
   }
   return json({ id: r.meta.last_row_id }, 201);
 }
@@ -426,10 +432,7 @@ async function updateExperiment(request, env, id) {
     // the drawer offers a suggested rescore the human applies with one click.
     if (cur.status !== "won" && cur.status !== "lost" && cur.opportunity_id) {
       const day = nowIso.slice(0, 10);
-      const oneLine = String(next.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
-      const viaBit = next.revenue_source ? ` via ${next.revenue_source}` : "";
-      const moneyBit = ` (${centsDollars(next.revenue_cents)} rev / ${centsDollars(next.spent_cents)} spent${viaBit})`;
-      const line = `[${day} outcome] Experiment "${String(next.name || "").slice(0, 120)}" ${next.status}: ${oneLine}${moneyBit}`;
+      const line = outcomeLedgerLine({ day, name: next.name, status: next.status, result: next.result, revenue_cents: next.revenue_cents, spent_cents: next.spent_cents, revenue_source: next.revenue_source });
       await env.DB.prepare(
         "UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?"
       ).bind("\n" + line, cur.opportunity_id).run();
@@ -503,7 +506,7 @@ export async function onRequest(context) {
         env.DB.prepare(`SELECT COUNT(*) AS n FROM opportunities WHERE ${vettedDays.map((d) => `notes LIKE '%[${d} vetted]%'`).join(" OR ")}`),
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
         env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso),
-        env.DB.prepare("SELECT substr(notes, -500) AS notes FROM opportunities WHERE notes LIKE '%vetted]%'"),
+        env.DB.prepare("SELECT substr(notes, -500) AS notes FROM opportunities WHERE notes LIKE '%vetted]%' OR notes LIKE '%killed]%'"),
       ] : [];
       let healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;
       // Isolation fallback (F1): one bad probe (e.g. a SELECT touching a
@@ -590,19 +593,27 @@ export async function onRequest(context) {
       const vettedRow = firstRow(8);
       const vettedNoExpRow = firstRow(9);
       const noiseRow = firstRow(10);
-      // Last-verdict date (finding 2): max [YYYY-MM-DD vetted] tag across all
-      // rows, null when no vetted row exists. Parsed in JS (not SQL) so every
-      // tag in the transferred tail counts and a stall shows its age without
-      // a told count. The probe selects only the trailing 500 chars per row:
-      // vettedNotes appends newest-last under the same 8000-char cap, so the
-      // newest tag always lands in the tail while full bodies never cross D1.
+      // Last-verdict date (finding 2, round3 F3): last_vetted stays the max
+      // [YYYY-MM-DD vetted] tag (pure vet signal, null when never vetted);
+      // last_verdict is the max over [date vetted] and [date killed] so a
+      // kill-heavy clearing session still dates its verdict. Parsed in JS
+      // (not SQL) so every tag in the transferred tail counts and a stall
+      // shows its age without a told count. The probe selects only the
+      // trailing 500 chars per row: vettedNotes/kill notes append newest-last
+      // under the same 8000-char cap, so the newest tag always lands in the
+      // tail while full bodies never cross D1.
       const lastVettedRows = (healthRes && healthRes[11] && healthRes[11].results) || [];
       let last_vetted = null;
+      let last_verdict = null;
       if (!healthDown && !probeFailed(11)) {
         for (const r of lastVettedRows) {
           const text = String((r && r.notes) || "");
           for (const m of text.matchAll(/\[(\d{4}-\d{2}-\d{2}) vetted\]/g)) {
             if (!last_vetted || m[1] > last_vetted) last_vetted = m[1];
+            if (!last_verdict || m[1] > last_verdict) last_verdict = m[1];
+          }
+          for (const m of text.matchAll(/\[(\d{4}-\d{2}-\d{2}) killed\]/g)) {
+            if (!last_verdict || m[1] > last_verdict) last_verdict = m[1];
           }
         }
       }
@@ -638,7 +649,7 @@ export async function onRequest(context) {
           if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
         }
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status: (healthDown || probeFailed(3)) ? null : experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(6)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(7)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(7)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(8)) ? null : (vettedRow ? vettedRow.n : 0), last_vetted: (healthDown || probeFailed(11)) ? null : last_vetted, vetted_no_experiment: (healthDown || probeFailed(9)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(10)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}) });
+      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status: (healthDown || probeFailed(3)) ? null : experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(6)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(7)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(7)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(8)) ? null : (vettedRow ? vettedRow.n : 0), last_vetted: (healthDown || probeFailed(11)) ? null : last_vetted, last_verdict: (healthDown || probeFailed(11)) ? null : last_verdict, vetted_no_experiment: (healthDown || probeFailed(9)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(10)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}) });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

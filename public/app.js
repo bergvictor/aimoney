@@ -16,13 +16,51 @@ let metaLoaded = false; // /api/meta is deploy-static: fetch once per boot, reus
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+const API_READ_TIMEOUT_MS = 15000;
+const API_WRITE_TIMEOUT_MS = 25000;
+// Pure: reads fail fast, writes wait longer; opts.timeoutMs overrides (tests).
+const apiTimeoutMs = (opts = {}) => {
+  const override = Number(opts.timeoutMs);
+  if (Number.isFinite(override) && override > 0) return override;
+  const method = String(opts.method || "GET").toUpperCase();
+  return (method === "GET" || method === "HEAD") ? API_READ_TIMEOUT_MS : API_WRITE_TIMEOUT_MS;
+};
+
 async function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   if (state.token) headers.authorization = `Bearer ${state.token}`;
-  const r = await fetch(path, { ...opts, headers });
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
-  return body;
+  const { timeoutMs: _timeoutIgnored, ...fetchOpts } = opts;
+  const timeoutMs = apiTimeoutMs(opts);
+  const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+  const timeoutErr = () => {
+    const e = new Error(`request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    e.name = "TimeoutError";
+    return e;
+  };
+  const doFetch = async () => {
+    const r = await fetch(path, { ...fetchOpts, headers, ...(ctrl ? { signal: ctrl.signal } : {}) });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+    return body;
+  };
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !ctrl) return doFetch();
+  let timer = null;
+  try {
+    const timeoutP = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        try { ctrl.abort(); } catch { /* already settled: race below still rejects */ }
+        reject(timeoutErr());
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([doFetch(), timeoutP]);
+    } catch (e) {
+      if (e && e.name === "AbortError") throw timeoutErr();
+      throw e;
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function toast(msg, action = null) {

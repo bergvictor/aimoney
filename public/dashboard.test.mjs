@@ -1238,3 +1238,96 @@ describe("vetting path contract (audit 2026-09-20-round2 Task 1)", () => {
     }
   });
 });
+
+describe("dashboard api timeout (audit 2026-09-20-round3 Task 3)", () => {
+  function shippedApi() {
+    const start = js.indexOf("const API_READ_TIMEOUT_MS");
+    assert.ok(start !== -1, "app.js lost API_READ_TIMEOUT_MS");
+    const apiStart = js.indexOf("async function api(", start);
+    assert.ok(apiStart !== -1, "app.js lost async function api");
+    const apiEnd = js.indexOf("\n}\n", apiStart) + 3;
+    assert.ok(apiEnd > apiStart, "app.js api() block never closes");
+    const src = js.slice(start, apiEnd);
+    assert.ok(src.includes("AbortController"), "api() lost its AbortController");
+    assert.ok(src.includes("Promise.race"), "api() lost its timeout race");
+    return new Function("state", "fetch", "AbortController", "setTimeout", "clearTimeout",
+      `${src}; return { api, apiTimeoutMs, API_READ_TIMEOUT_MS, API_WRITE_TIMEOUT_MS };`);
+  }
+
+  it("ships 15s reads / 25s writes with an override for tests", () => {
+    assert.ok(js.includes("const API_READ_TIMEOUT_MS = 15000"), "reads must time out at 15s");
+    assert.ok(js.includes("const API_WRITE_TIMEOUT_MS = 25000"), "writes must time out at 25s");
+    assert.ok(js.includes("signal: ctrl.signal"), "api() must pass the abort signal to fetch");
+    assert.ok(js.includes("clearTimeout(timer)"), "api() must clear its timeout on settle");
+    assert.ok(js.includes('e.name = "TimeoutError"'), "abort must surface as a named TimeoutError");
+    const factory = shippedApi();
+    const { apiTimeoutMs, API_READ_TIMEOUT_MS, API_WRITE_TIMEOUT_MS } = factory({ token: "" }, async () => ({}), AbortController, setTimeout, clearTimeout);
+    assert.equal(API_READ_TIMEOUT_MS, 15000);
+    assert.equal(API_WRITE_TIMEOUT_MS, 25000);
+    assert.equal(apiTimeoutMs({}), 15000);
+    assert.equal(apiTimeoutMs({ method: "GET" }), 15000);
+    assert.equal(apiTimeoutMs({ method: "PATCH" }), 25000);
+    assert.equal(apiTimeoutMs({ method: "POST" }), 25000);
+    assert.equal(apiTimeoutMs({ timeoutMs: 20 }), 20);
+  });
+
+  it("a hung read fails visibly within the timeout instead of hanging the tap", async () => {
+    const factory = shippedApi();
+    const neverFetch = () => new Promise(() => {});
+    const { api } = factory({ token: "" }, neverFetch, AbortController, setTimeout, clearTimeout);
+    const t0 = Date.now();
+    await assert.rejects(api("/api/health", { timeoutMs: 20 }), /timed out/, "hung read must reject with a timeout");
+    assert.ok(Date.now() - t0 < 2000, "hung read must fail within the timeout, not hang");
+    try {
+      await api("/api/health", { timeoutMs: 20 });
+      assert.fail("hung read must reject");
+    } catch (e) {
+      assert.equal(e.name, "TimeoutError");
+    }
+  });
+
+  it("a hung Vet PATCH fails visibly within the timeout, like the read path", async () => {
+    const factory = shippedApi();
+    const neverFetch = () => new Promise(() => {});
+    const { api } = factory({ token: "secret" }, neverFetch, AbortController, setTimeout, clearTimeout);
+    const t0 = Date.now();
+    await assert.rejects(
+      api("/api/opportunities/1", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ notes: "x" }), timeoutMs: 20 }),
+      /timed out/,
+      "hung Vet PATCH must reject with a timeout"
+    );
+    assert.ok(Date.now() - t0 < 2000, "hung Vet PATCH must fail within the timeout, not hang");
+  });
+
+  it("fast paths still resolve, keep auth, and keep the HTTP error contract", async () => {
+    const factory = shippedApi();
+    const seen = [];
+    const okFetch = async (path, init) => {
+      seen.push([path, init]);
+      return { ok: true, json: async () => ({ ok: true }) };
+    };
+    const { api } = factory({ token: "secret" }, okFetch, AbortController, setTimeout, clearTimeout);
+    const read = await api("/api/health");
+    assert.deepEqual(read, { ok: true });
+    assert.equal(seen[0][1].headers.authorization, "Bearer secret");
+    assert.ok(seen[0][1].signal, "fast read must still pass an abort signal");
+    assert.ok(!("timeoutMs" in (seen[0][1] || {})), "timeout override must not leak into fetch init");
+    const write = await api("/api/opportunities/1", { method: "PATCH", body: "{}" });
+    assert.deepEqual(write, { ok: true });
+    const badFetch = async () => ({ ok: false, status: 400, json: async () => ({ error: "bad range" }) });
+    const { api: badApi } = factory({ token: "" }, badFetch, AbortController, setTimeout, clearTimeout);
+    await assert.rejects(badApi("/api/opportunities/1", { method: "PATCH" }), /bad range/, "HTTP errors must keep their body message");
+  });
+
+  it("timeouts land in the existing toast + banner paths (no new failure UI)", () => {
+    const vetInner = js.slice(js.indexOf("async function vetOpportunityInner"), js.indexOf("async function vetAndLogStarter"));
+    assert.ok(vetInner.includes("toast(`Vet failed:"), "Vet timeout must reuse the Vet failed toast");
+    assert.ok(js.includes("toast(`Kill failed:"), "Kill timeout must reuse the Kill failed toast");
+    assert.ok(js.includes("toast(`Start failed:"), "Start timeout must reuse the Start failed toast");
+    assert.ok(js.includes("toast(`Close failed:"), "Win/Lose timeout must reuse the Close failed toast");
+    const targets = js.slice(js.indexOf("async function refreshTargets"), js.indexOf("paintLastGood();"));
+    assert.ok(targets.includes("state.apiFailures.push(\"/api/opportunities\")"), "hung reads must reuse the apiFailures banner path");
+    assert.ok(targets.includes("state.apiFailures.push(\"/api/health\")"), "hung health must reuse the apiFailures banner path");
+    assert.ok(js.includes("function renderApiErrors"), "banner renderer lost");
+  });
+});
