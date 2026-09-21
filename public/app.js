@@ -244,7 +244,9 @@ function renderReview() {
       <td class="num money">${money(o.est_monthly_low, o.est_monthly_high)}</td>
       <td class="muted">${esc(o.time_to_first_dollar || "—")}</td>
     </tr>`).join("")
-    : `<tr><td colspan="10" class="muted">Review queue empty — every agent proposal has been vetted or killed.</td></tr>`;
+    : (state.apiFailures.includes("/api/opportunities")
+      ? `<tr><td colspan="10" class="muted">Could not load the review queue — see the banner above and retry.</td></tr>`
+      : `<tr><td colspan="10" class="muted">Review queue empty — every agent proposal has been vetted or killed.</td></tr>`);
   document.querySelectorAll("#ledger-body tr.row").forEach((tr) => {
     tr.addEventListener("click", () => openDrawer(Number(tr.dataset.id)));
   });
@@ -526,6 +528,11 @@ function prefetchReviewDetail(id) {
 async function fetchDetailForWrite(id, actionLabel) {
   if (!state.token) { openAdminModal("Enter the admin token first."); return null; }
   const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
+  // Cold-boot guard (audit 2026-09-20-round5 Task 2): the last-good strip
+  // renders tappable Vet/Kill before the first refresh fills the lists. A
+  // tap then is unloaded, not failed — say so and return before the wasted
+  // GET instead of vanishing silently. The token gate above stays first.
+  if (!o) { toast("List still loading — try again in a moment."); return null; }
   prefetchReviewDetail(nextReviewId(id)); // verdicting N warms N+1; never awaited
   const cached = getCachedDetailNotes(id);
   if (cached !== null) {
@@ -876,8 +883,13 @@ function renderExperiments() {
   const revenueTotal = state.health && typeof state.health.revenue_total === "number" ? state.health.revenue_total : null;
   // Fallback: when the decisions probe fails (null), count decisions from the
   // already-loaded list so the week line and the stall nudge survive the
-  // outage. Health wins whenever present; no new request is made.
-  const decisions = healthDecisions !== null ? healthDecisions : fallbackDecisions(exps);
+  // outage — but only when that list actually loaded. A failed experiments
+  // fetch leaves state.experiments as [], and counting that 0 would present
+  // unknown as zero, so the double failure stays null (the guard and the
+  // nudge below already handle null). Health wins whenever present; no new
+  // request is made.
+  const expsFailed = state.apiFailures.includes("/api/experiments");
+  const decisions = healthDecisions !== null ? healthDecisions : (expsFailed ? null : fallbackDecisions(exps));
   let summary = exps.length
     ? `${exps.length} experiments · ${running} running · ${won} won`
     : (state.apiFailures.includes("/api/experiments")

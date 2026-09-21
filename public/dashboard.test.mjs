@@ -973,7 +973,8 @@ describe("decisions fallback on probe failure (audit 2026-09-20-round3 Task 2)",
 
   it("health wins whenever present; the fallback feeds the week line and the nudge", () => {
     assert.ok(js.includes("decisions_last_7d"), "fallback must not drop the health read");
-    assert.ok(js.includes("healthDecisions !== null ? healthDecisions : fallbackDecisions(exps)"), "health decisions must win; fallback only on null probes");
+    assert.ok(js.includes("healthDecisions !== null ? healthDecisions : (expsFailed ? null : fallbackDecisions(exps))"), "health decisions must win; fallback only on null probes with a loaded list");
+    assert.ok(js.includes('const expsFailed = state.apiFailures.includes("/api/experiments")'), "fallback must read the experiments failure flag");
     const line = js.indexOf("const decisions = healthDecisions");
     const nudge = js.indexOf("const nudge = (decisions === 0)");
     assert.ok(line !== -1 && nudge !== -1 && line < nudge, "the nudge must gate on the post-fallback decisions count");
@@ -1710,5 +1711,217 @@ describe("guarded drawer skills parse (audit 2026-09-20-round4 Task 3)", () => {
     assert.ok(drawer.includes('|| "—"'), "malformed skills must render —");
     assert.ok(!drawer.includes("JSON.parse(o.skills_needed"), "drawer must keep no unguarded skills parse");
     assert.ok(!js.includes("JSON.parse(o.skills_needed"), "no shipped path may parse skills unguarded");
+  });
+});
+
+describe("review queue load-failure row (audit 2026-09-20-round5 Task 1)", () => {
+  // renderReview extracted from the shipped source (not copied) with stubbed
+  // sinks, so these cases fail if the empty branch prints the wrong row.
+  function shippedRenderReview() {
+    const start = js.indexOf("function renderReview");
+    assert.ok(start !== -1, "app.js lost renderReview");
+    const end = js.indexOf("// Review queue derivation", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the renderReview block boundary");
+    return new Function("state", "$", "document", "esc", "money", "meter", "statusPill",
+      "noBriefBadge", "isZeroSpend", "reviewDecisionLine", "reviewBriefLine",
+      "vetOpportunity", "vetAndLogStarter", "killOpportunity",
+      `${js.slice(start, end)}; return renderReview;`);
+  }
+
+  function renderReviewHtml(reviewList, apiFailures) {
+    const factory = shippedRenderReview();
+    const els = {};
+    const $ = (sel) => (els[sel] ??= { innerHTML: "", textContent: "", addEventListener() {} });
+    const noop = () => "";
+    const renderReview = factory(
+      { reviewList, zeroOnly: false, apiFailures },
+      $, { querySelectorAll: () => [] },
+      noop, noop, noop, noop, noop, () => true, noop, noop,
+      () => {}, () => {}, () => {});
+    renderReview();
+    return els["#ledger-body"].innerHTML;
+  }
+
+  it("a failed opps fetch renders the failure row, never the all-clear", () => {
+    const html = renderReviewHtml([], ["/api/opportunities"]);
+    assert.ok(html.includes("Could not load the review queue"), `failure row missing, got: ${html}`);
+    assert.ok(html.includes("see the banner above and retry"), "failure row must reuse the ledger retry copy");
+    assert.ok(!html.includes("Review queue empty"), "an outage must never print the all-clear");
+  });
+
+  it("a healthy empty queue still prints the all-clear", () => {
+    const html = renderReviewHtml([], []);
+    assert.ok(html.includes("Review queue empty — every agent proposal has been vetted or killed."), `all-clear missing, got: ${html}`);
+    assert.ok(!html.includes("Could not load"), "a healthy queue must not print a failure row");
+  });
+
+  it("an unrelated failure keeps the all-clear (the branch keys off opps only)", () => {
+    const html = renderReviewHtml([], ["/api/runs"]);
+    assert.ok(html.includes("Review queue empty"), "an unrelated outage must not fail the review queue");
+    assert.ok(!html.includes("Could not load"), "an unrelated outage must not print the opps failure row");
+  });
+});
+
+describe("cached-strip verdict before the list loads (audit 2026-09-20-round5 Task 2)", () => {
+  // fetchDetailForWrite extracted from the shipped source (not copied) with
+  // stubbed transport, so these cases fail if the cold-boot tap stays
+  // silent or burns a GET.
+  function shippedFetchDetail() {
+    const start = js.indexOf("async function fetchDetailForWrite");
+    assert.ok(start !== -1, "app.js lost fetchDetailForWrite");
+    const end = js.indexOf("async function vetOpportunity(", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the fetchDetailForWrite block boundary");
+    return new Function("state", "api", "toast", "openAdminModal", "prefetchReviewDetail",
+      "nextReviewId", "getCachedDetailNotes", "setCachedDetailNotes",
+      `${js.slice(start, end)}; return fetchDetailForWrite;`);
+  }
+
+  function runFetchDetail(state, { detail = null, cached = null } = {}) {
+    const calls = [];
+    const toasts = [];
+    const modals = [];
+    const factory = shippedFetchDetail();
+    const fetchDetailForWrite = factory(
+      state,
+      async (path) => { calls.push(path); return detail; },
+      (m) => toasts.push(m),
+      (m) => modals.push(m),
+      () => {},
+      () => null,
+      () => cached,
+      () => {});
+    return { fetchDetailForWrite, calls, toasts, modals };
+  }
+
+  it("an unloaded row toasts and returns before any GET", async () => {
+    const { fetchDetailForWrite, calls, toasts } = runFetchDetail(
+      { token: "t", reviewList: [], opportunities: [] });
+    const out = await fetchDetailForWrite(7, "Vet");
+    assert.equal(out, null, "an unloaded row must still return null");
+    assert.deepEqual(toasts, ["List still loading — try again in a moment."], "an unloaded tap must toast, not vanish");
+    assert.equal(calls.length, 0, "an unloaded tap must not burn a detail GET");
+  });
+
+  it("the token gate stays first: no toast, no GET without a token", async () => {
+    const { fetchDetailForWrite, calls, toasts, modals } = runFetchDetail(
+      { token: "", reviewList: [], opportunities: [] });
+    const out = await fetchDetailForWrite(7, "Vet");
+    assert.equal(out, null, "a tokenless tap must still return null");
+    assert.deepEqual(modals, ["Enter the admin token first."], "a tokenless tap must open the admin modal");
+    assert.equal(toasts.length, 0, "the token gate must stay ahead of the loading toast");
+    assert.equal(calls.length, 0, "the token gate must stay ahead of the detail GET");
+  });
+
+  it("loaded lists behave exactly as today: one GET on a miss, none on a cache hit", async () => {
+    const row = { id: 7 };
+    const miss = runFetchDetail(
+      { token: "t", reviewList: [row], opportunities: [row] },
+      { detail: { opportunity: { notes: "full notes" } } });
+    const out = await miss.fetchDetailForWrite(7, "Vet");
+    assert.equal(out, row, "a loaded row must resolve");
+    assert.equal(row.notes, "full notes", "a loaded miss must stash the fetched notes");
+    assert.deepEqual(miss.calls, ["/api/opportunities/7"], "a loaded miss must cost exactly one detail GET");
+    assert.equal(miss.toasts.length, 0, "a loaded row must not toast");
+    const row2 = { id: 7 };
+    const hit = runFetchDetail(
+      { token: "t", reviewList: [row2], opportunities: [row2] },
+      { cached: "cached notes" });
+    const out2 = await hit.fetchDetailForWrite(7, "Kill");
+    assert.equal(out2, row2, "a cached row must resolve");
+    assert.equal(row2.notes, "cached notes", "a cache hit must stash the cached notes");
+    assert.equal(hit.calls.length, 0, "a cache hit must cost zero GETs");
+    assert.equal(hit.toasts.length, 0, "a cache hit must not toast");
+  });
+
+  it("the guard precedes the detail GET in the shipped order", () => {
+    const helper = js.slice(js.indexOf("async function fetchDetailForWrite"), js.indexOf("async function vetOpportunity("));
+    const guardAt = helper.indexOf("List still loading — try again in a moment.");
+    const getAt = helper.indexOf("api(`/api/opportunities/${id}`)");
+    assert.ok(guardAt !== -1, "helper lost the still-loading toast");
+    assert.ok(getAt !== -1, "helper lost its detail GET");
+    assert.ok(guardAt < getAt, "the still-loading guard must precede the detail GET");
+    assert.ok(helper.indexOf("if (!state.token)") < guardAt, "the token gate must stay ahead of the still-loading guard");
+  });
+});
+
+describe("decisions unknown on experiments outage (audit 2026-09-20-round5 Task 3)", () => {
+  // renderExperiments extracted from the shipped source (not copied) with the
+  // real fallback/nudge helpers and stubbed sinks, so these cases fail if a
+  // failed fetch fabricates a 0 or fires the nudge.
+  function shippedRenderExperiments() {
+    const start = js.indexOf("function renderExperiments");
+    assert.ok(start !== -1, "app.js lost renderExperiments");
+    const end = js.indexOf("/* ---- research log ---- */", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the renderExperiments block boundary");
+    const fbStart = js.indexOf("const fallbackDecisions");
+    assert.ok(fbStart !== -1, "app.js lost the fallbackDecisions helper");
+    const fallbackDecisions = new Function(
+      `${js.slice(fbStart, js.indexOf("\n};", fbStart) + 3)} return fallbackDecisions;`)();
+    const stStart = js.indexOf("const stalestOpenExp");
+    assert.ok(stStart !== -1, "app.js lost stalestOpenExp");
+    const stalestOpenExp = new Function(
+      `${js.slice(stStart, js.indexOf("\n};", stStart) + 3)} return stalestOpenExp;`)();
+    const moneyStart = js.indexOf("const moneyCents");
+    assert.ok(moneyStart !== -1, "app.js lost moneyCents");
+    const moneyCents = new Function(
+      `${js.slice(moneyStart, js.indexOf("\n", moneyStart))}; return moneyCents;`)();
+    const colsStart = js.indexOf("const EXP_COLS");
+    assert.ok(colsStart !== -1, "app.js lost EXP_COLS");
+    const EXP_COLS = new Function(
+      `${js.slice(colsStart, js.indexOf("\n", colsStart))}; return EXP_COLS;`)();
+    const renderExperiments = new Function("state", "$", "document", "esc", "moneyCents",
+      "fallbackDecisions", "stalestOpenExp", "focusNudgeCard", "startExperiment",
+      "statusPill", "ageChip", "runningMismatchBadge", "EXP_COLS",
+      `${js.slice(start, end)}; return renderExperiments;`);
+    return { renderExperiments, moneyCents, fallbackDecisions, stalestOpenExp, EXP_COLS };
+  }
+
+  function renderExpSummary(state) {
+    const shipped = shippedRenderExperiments();
+    const els = {};
+    const $ = (sel) => (els[sel] ??= { innerHTML: "", textContent: "", addEventListener() {} });
+    const noop = () => "";
+    const renderExperiments = shipped.renderExperiments(
+      state, $, { querySelectorAll: () => [] }, (s) => String(s ?? ""),
+      shipped.moneyCents, shipped.fallbackDecisions, shipped.stalestOpenExp,
+      () => {}, () => {}, noop, noop, noop, shipped.EXP_COLS);
+    renderExperiments();
+    return els["#exp-summary"].textContent + els["#exp-summary"].innerHTML;
+  }
+
+  it("decisions-probe-null plus a failed fetch prints no 0 and no nudge", () => {
+    // A scoped refresh can leave a stale non-empty list behind alongside the
+    // failure flag — the old fallback counted that 0 and fired the nudge.
+    const summary = renderExpSummary({
+      experiments: [{ id: 1, status: "planned", days_in_status: 9, name: "Stale", target: "" }],
+      health: { vetted_last_7d: 2 },
+      apiFailures: ["/api/experiments"],
+    });
+    assert.ok(!summary.includes("decisions this week"), `a failed fetch must not print a decisions count, got: ${summary}`);
+    assert.ok(!summary.includes("Nudge:"), `a failed fetch must not fire the stall nudge, got: ${summary}`);
+  });
+
+  it("probe-null with a loaded list still falls back to the list count", () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const summary = renderExpSummary({
+      experiments: [{ id: 1, status: "won", ended_at: daysAgo(2), days_in_status: 2, name: "W", target: "" }],
+      health: { vetted_last_7d: 2 },
+      apiFailures: [],
+    });
+    assert.ok(summary.includes("1 decisions this week"), `a loaded list must still feed the week line, got: ${summary}`);
+  });
+
+  it("health wins whenever present, even on a failed fetch", () => {
+    const summary = renderExpSummary({
+      experiments: [],
+      health: { decisions_last_7d: 3, vetted_last_7d: 1 },
+      apiFailures: ["/api/experiments"],
+    });
+    assert.ok(summary.includes("3 decisions this week"), `health must win over the outage, got: ${summary}`);
+  });
+
+  it("the week line and the nudge keep their null guards", () => {
+    assert.ok(js.includes("if (decisions !== null && vetted !== null)"), "the week line must stay null-guarded");
+    assert.ok(js.includes("const nudge = (decisions === 0)"), "the nudge must stay gated on a counted 0, never null");
   });
 });
