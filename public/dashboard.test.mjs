@@ -921,6 +921,39 @@ describe("decisions fallback on probe failure (audit 2026-09-20-round3 Task 2)",
   });
 });
 
+describe("schema-migration disclosure (audit 2026-09-20-round2 Task 2)", () => {
+  it("pairs a failing probe with its missing column (pure helper, live-shaped payload)", () => {
+    const start = js.indexOf("const probeLabel");
+    assert.ok(start !== -1, "app.js lost the probeLabel helper");
+    const probeLabel = new Function(
+      `${js.slice(start, js.indexOf(";", start) + 1)} return probeLabel;`)();
+    const detail = { revenue_week: "revenue_cents", revenue_lifetime: "revenue_cents" };
+    assert.equal(probeLabel("revenue_week", detail), "revenue_week (revenue_cents)");
+    assert.equal(probeLabel("decisions_week", detail), "decisions_week");
+    assert.equal(probeLabel("revenue_week", null), "revenue_week");
+    assert.equal(probeLabel("revenue_week", {}), "revenue_week");
+  });
+
+  it("error banner names the column and prints the migration one-liner without a new fetch", () => {
+    const banner = js.slice(js.indexOf("function renderApiErrors"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(banner.includes("probeLabel("), "banner must pair probes with their columns");
+    assert.ok(banner.includes("schemaMissingColumns()"), "banner must reuse the schemaMissingColumns helper");
+    assert.ok(js.includes("state.health.schema_missing_columns"), "app.js never reads health.schema_missing_columns");
+    assert.ok(banner.includes("Missing columns: "), "banner lost the missing-columns copy");
+    assert.ok(banner.includes("schemaMigrationLine()"), "banner must reuse the schemaMigrationLine helper");
+    assert.ok(js.includes("state.health.schema_migration"), "app.js never reads health.schema_migration");
+    assert.ok(banner.includes("Schema migration: "), "banner lost the migration-line copy");
+    assert.ok(!banner.includes("api(\"/api/"), "banner must not issue a new fetch for schema names");
+  });
+
+  it("agent pill tooltip mirrors the column names and stays non-red", () => {
+    const runs = js.slice(js.indexOf("function renderRuns"), js.indexOf("/* ---- detail drawer ---- */"));
+    assert.ok(runs.includes("probeLabel("), "pill tooltip must pair probes with their columns");
+    assert.ok(runs.includes("failing probes: "), "pill title lost the failing-probes disclosure");
+    assert.equal(runs.split('"bad"').length - 1, 2, "renderRuns must add no new red path for probe failures");
+  });
+});
+
 describe("last-good first paint (audit 2026-09-20-round3 Task 2)", () => {
   it("persists the painted surfaces to localStorage on each successful refresh", () => {
     assert.ok(js.includes('const LAST_GOOD_KEY = "aimoney_last_good"'), "app.js lost the last-good cache key");

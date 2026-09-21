@@ -724,7 +724,7 @@ function renderRuns() {
     const noise = state.health && typeof state.health.noise_24h === "number" ? state.health.noise_24h : null;
     pill.title = noise !== null ? "Latest research run: +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise" : "Latest research run";
     const probeFails = probeFailures();
-    if (probeFails.length) pill.title += " · failing probes: " + probeFails.join(", ");
+    if (probeFails.length) pill.title += " · failing probes: " + probeFails.map((p) => probeLabel(p, probeDetailMap())).join(", ");
     const when = last.finished_at || last.started_at || "";
     $("#agent-text").textContent =
       `agent: ${last.status} · +${last.added}/${last.updated}/${last.briefs} · ${when.slice(0, 16).replace("T", " ")}`;
@@ -1170,19 +1170,38 @@ const runningMismatchBadge = (e) => {
 
 // Partial-health honesty (audit 2026-09-20-round2 Task 3): when the API
 // isolates failing probes it names them in health_probe_failures; the pill
-// tooltip and the error banner surface the names so a green pill with null
+// tooltip and the error banner surface the names plus the missing columns and the migration one-liner, so a green pill with null
 // money probes still explains itself. Read-only, no new fetch.
 const probeFailures = () =>
   (state.health && Array.isArray(state.health.health_probe_failures) && state.health.health_probe_failures.length)
     ? state.health.health_probe_failures.slice()
     : [];
 
+// Schema-drift disclosure (audit 2026-09-20-round2 Task 2): the health
+// payload names the missing column per probe (health_probe_detail) plus the
+// overall missing list and the one-line owner fix (schema_migration). The
+// banner and pill tooltip surface all three so the owner finds the
+// ALLOW_SCHEMA_MIGRATION=1 switch where he actually looks. Read-only.
+const probeDetailMap = () =>
+  (state.health && state.health.health_probe_detail && typeof state.health.health_probe_detail === "object")
+    ? state.health.health_probe_detail : {};
+const schemaMissingColumns = () =>
+  (state.health && Array.isArray(state.health.schema_missing_columns))
+    ? state.health.schema_missing_columns.filter((c) => typeof c === "string" && c) : [];
+const schemaMigrationLine = () =>
+  (state.health && typeof state.health.schema_migration === "string" && state.health.schema_migration)
+    ? state.health.schema_migration : "";
+// Pure: pair a failing probe with its missing column when the API named one.
+const probeLabel = (name, detail) =>
+  (detail && typeof detail[name] === "string" && detail[name]) ? `${name} (${detail[name]})` : name;
+
 function renderApiErrors() {
   const el = $("#api-errors");
   if (!el) return;
   const fails = state.apiFailures || [];
   const probes = probeFailures();
-  if (!fails.length && !probes.length) {
+  const migLine = schemaMigrationLine();
+  if (!fails.length && !probes.length && !migLine) {
     el.classList.add("hidden");
     el.innerHTML = "";
     return;
@@ -1190,8 +1209,11 @@ function renderApiErrors() {
   el.classList.remove("hidden");
   const parts = [];
   if (fails.length) parts.push(`API ${fails.length === 1 ? "error" : "errors"}: ${fails.map((f) => esc(f)).join(", ")} failed to load.`);
-  if (probes.length) parts.push(`Health probes failing: ${probes.map((p) => esc(p)).join(", ")}.`);
-  el.innerHTML = `${parts.join(" ")} <button id="api-retry" class="btn small ghost" type="button">Retry</button> <button id="api-dismiss" class="btn small ghost" type="button" aria-label="Dismiss">Dismiss</button>`;
+  if (probes.length) parts.push(`Health probes failing: ${probes.map((p) => esc(probeLabel(p, probeDetailMap()))).join(", ")}.`);
+  const missingCols = schemaMissingColumns();
+  if (missingCols.length) parts.push(`Missing columns: ${missingCols.map((c) => esc(c)).join(", ")}.`);
+  if (migLine) parts.push(`Schema migration: ${esc(migLine)}`);
+  el.innerHTML = `${parts.join(" ") <button id="api-retry" class="btn small ghost" type="button">Retry</button> <button id="api-dismiss" class="btn small ghost" type="button" aria-label="Dismiss">Dismiss</button>`;
   const retry = $("#api-retry");
   if (retry) retry.addEventListener("click", () => refresh());
   const dismiss = $("#api-dismiss");

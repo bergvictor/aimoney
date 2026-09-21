@@ -1,0 +1,4 @@
+# Pin LF line endings: shell scripts break on CRLF, and CRLF worktree dirt
+# rewrites every diff (audit 2026-09-20-round2 F6). text=auto keeps binary
+# detection; eol=lf keeps Windows checkouts clean too.
+* text=auto eol=lf
