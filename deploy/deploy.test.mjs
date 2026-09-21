@@ -213,3 +213,43 @@ describe("verify.sh requires live revision == deployed commit (audit 2026-09-20-
     assert.ok(verify.includes("scripts/stamp-release.sh"), "verify.sh must document the build command that stamps release.json");
   });
 });
+
+describe("full-SHA revision plus package release (audit 2026-09-20-round1 Task 4)", () => {
+  it("stamp-release.sh stamps the full SHA plus release, short form stays in the log", () => {
+    const stamp = read("scripts/stamp-release.sh");
+    assert.ok(stamp.includes("CF_PAGES_COMMIT_SHA"), "stamp must keep the Pages SHA source");
+    assert.ok(stamp.includes("git rev-parse HEAD"), "stamp fallback must read the full HEAD, not a short form");
+    assert.ok(!stamp.includes("git rev-parse --short"), "stamp must not cut the stamped revision to short");
+    assert.ok(stamp.includes("cut -c1-7"), "stamp must keep the short form for the deploy log");
+    assert.ok(stamp.includes("package.json") && stamp.includes("version"), "stamp must read the release from package.json");
+    assert.ok(stamp.includes('"revision":"%s","release":"%s","built_at"'), "release.json must carry revision + release + built_at");
+    assert.ok(stamp.includes('"$SHA" "$REL" "$STAMP"'), "stamped revision must be the full SHA with release, not the short REV");
+    assert.ok(stamp.includes("rev=${REV} release=${REL}"), "deploy log must keep the short form plus release");
+  });
+
+  it("deploy.sh stamps the full SHA plus release, short form stays in the log", () => {
+    const deploy = read("deploy/deploy.sh");
+    assert.ok(deploy.includes("git rev-parse HEAD"), "deploy must read the full HEAD for the stamped revision");
+    assert.ok(!deploy.includes("git rev-parse --short HEAD"), "deploy must not stamp the short form");
+    assert.ok(deploy.includes("cut -c1-7"), "deploy must keep the short form for the log");
+    assert.ok(deploy.includes("package.json") && deploy.includes("version"), "deploy must read the release from package.json");
+    assert.ok(deploy.includes('"revision":"%s","release":"%s","built_at"'), "release.json must carry revision + release + built_at");
+    assert.ok(deploy.includes('"$FULL" "$REL" "$STAMP"'), "stamped revision must be the full SHA with release");
+    assert.ok(deploy.includes("FULL=\"${FULL}-dirty\"") && deploy.includes("REV=\"${REV}-dirty\""), "dirty must tag both the full revision and the short log form");
+    assert.ok(deploy.includes("rev=${REV} release=${REL}"), "deploy log must keep the short form plus release");
+  });
+
+  it("verify.sh accepts a full revision against a short expected prefix and vice versa", () => {
+    const verify = read("deploy/verify.sh");
+    assert.ok(verify.includes('[ "$REV" = "$EXPECTED_REV" ]'), "verify must keep the exact-match pass");
+    assert.ok(verify.includes('case "$REV" in'), "verify must prefix-match live full against expected short");
+    assert.ok(verify.includes('"$EXPECTED_REV"*)'), "verify must accept live starting with expected");
+    assert.ok(verify.includes('case "$EXPECTED_REV" in'), "verify must prefix-match expected full against live short");
+    assert.ok(verify.includes('"$REV"*)'), "verify must accept expected starting with live");
+    const exactAt = verify.indexOf('[ "$REV" = "$EXPECTED_REV" ]');
+    const fwdAt = verify.indexOf('case "$REV" in');
+    const revAt = verify.indexOf('case "$EXPECTED_REV" in');
+    const staleAt = verify.indexOf("FAIL live-revision: stale revision");
+    assert.ok(exactAt !== -1 && fwdAt > exactAt && revAt > fwdAt && staleAt > revAt, "prefix passes must sit after exact match and before the stale fail");
+  });
+});

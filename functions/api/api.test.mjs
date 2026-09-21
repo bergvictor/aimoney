@@ -88,8 +88,8 @@ function makeDB(seed = {}) {
       const rows = data.runs.slice().sort((a, b) => b.id - a.id).slice(0, limit);
       return { results: rows };
     }
-    if (sql.includes("SELECT notes FROM opportunities") && sql.includes("vetted]%")) {
-      return { results: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]")).map((o) => ({ notes: o.notes })) };
+    if (sql.includes("FROM opportunities") && sql.includes("vetted]%") && !sql.includes("COUNT(*)") && (sql.includes("substr(notes, -500)") || sql.includes("SELECT notes FROM opportunities"))) {
+      return { results: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]")).map((o) => ({ notes: String(o.notes || "").slice(-500) })) };
     }
     return { results: [] };
   }
@@ -270,7 +270,7 @@ function makeDB(seed = {}) {
         const sql = (s && s._sql) || "";
         const args = (s && s._args) || [];
         if (sql.includes("GROUP BY status")) return handleAll(sql, args);
-        if (sql.includes("SELECT notes FROM opportunities") && sql.includes("vetted]%")) return handleAll(sql, args);
+        if (sql.includes("FROM opportunities") && sql.includes("vetted]%") && !sql.includes("COUNT(*)") && (sql.includes("substr(notes, -500)") || sql.includes("SELECT notes FROM opportunities"))) return handleAll(sql, args);
         const row = handleFirst(sql, args);
         return { results: row ? [row] : [] };
       });
@@ -1571,6 +1571,36 @@ describe("health last-verdict date (audit 2026-09-20-round1 Task 2)", () => {
     const fresh = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(fresh.status, 200);
     assert.equal(fresh.body.last_vetted, today);
+  });
+
+  it("bounds the probe to a 500-char tail while still reporting the newest tag", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const oldDay = daysAgo(30).slice(0, 10);
+    const today = new Date().toISOString().slice(0, 10);
+    const shortNotes = "x [" + oldDay + " vetted] Human vetted; cap lifted.\n[" + today + " vetted] Human vetted; cap lifted.";
+    const longNotes = ("A".repeat(7350) + "\n[" + oldDay + " vetted] old vet buried by filler\n" + "B".repeat(600) + "\n[" + today + " vetted] Human vetted; cap lifted.").slice(-8000);
+    assert.equal(longNotes.length, 8000, "fixture must model the full 8000-char vettedNotes cap");
+    assert.ok(longNotes.endsWith("[" + today + " vetted] Human vetted; cap lifted."), "newest tag must sit newest-last in the tail");
+    const mkOpp = (notes, created) => ({ id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes, created_at: created, updated_at: daysAgo(0) });
+    const created = daysAgo(40);
+    const longDb = makeDB({ opportunities: [mkOpp(longNotes, created)] });
+    const long = await callApi(["health"], "http://localhost/api/health", {}, longDb);
+    assert.equal(long.status, 200);
+    assert.equal(long.body.last_vetted, today, "8000-char notes must still report the newest tag from the bounded tail");
+    const probeSql = (longDb._prepared || []).filter((s) => s.includes("vetted]%") && !s.includes("COUNT(*)") && !s.includes("NOT EXISTS"));
+    assert.equal(probeSql.length, 1, "health must carry exactly one last_vetted SELECT");
+    assert.ok(probeSql[0].includes("substr(notes, -500)"), "last_vetted probe must select the bounded substr tail");
+    assert.ok(!probeSql[0].includes("SELECT notes FROM opportunities"), "last_vetted probe must not select full bodies");
+    const tailRows = await longDb.prepare(probeSql[0]).all();
+    for (const row of (tailRows.results || [])) {
+      assert.ok(String(row.notes || "").length <= 500, "transferred tail must stay within 500 chars");
+    }
+    const shortDb = makeDB({ opportunities: [mkOpp(shortNotes, created)] });
+    const short = await callApi(["health"], "http://localhost/api/health", {}, shortDb);
+    assert.equal(short.status, 200);
+    const { time: _lt, ...longRest } = long.body;
+    const { time: _st, ...shortRest } = short.body;
+    assert.deepEqual(longRest, shortRest, "every health key besides time must be byte-identical between long and short notes");
   });
 });
 

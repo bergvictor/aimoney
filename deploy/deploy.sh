@@ -20,12 +20,15 @@ else
 fi
 command -v git >/dev/null 2>&1 || { echo "deploy.sh: git not found"; exit 1; }
 
-REV="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+FULL="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+REV="$(printf '%s' "$FULL" | cut -c1-7)"
+REL="$(python3 -c "import json; print(json.load(open('package.json')).get('version','unknown'))" 2>/dev/null || echo unknown)"
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  FULL="${FULL}-dirty"
   REV="${REV}-dirty"
 fi
-echo "==> aimoney deploy rev=${REV}"
+echo "==> aimoney deploy rev=${REV} release=${REL}"
 
 # 1. D1 schema (idempotent) + seed (only when the table is empty, so agent and
 # human rows are never overwritten by a redeploy).
@@ -55,8 +58,8 @@ else
 fi
 
 # 2. Stamp the revision marker the verifier checks (cache-busted).
-printf '{"project":"aimoney","revision":"%s","built_at":"%s"}\n' "$REV" "$STAMP" > public/release.json
-echo "==> stamped public/release.json rev=${REV}"
+printf '{"project":"aimoney","revision":"%s","release":"%s","built_at":"%s"}\n' "$FULL" "$REL" "$STAMP" > public/release.json
+echo "==> stamped public/release.json rev=${REV} release=${REL}"
 
 # 3. Pages site (direct deploy; the Git-connected project redeploys itself on push).
 echo "==> Pages: deploy"

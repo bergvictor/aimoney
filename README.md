@@ -44,7 +44,7 @@ wrangler d1 execute aimoney --file=d1/seed.sql
 
 # 3. Deploy everything (Pages site + research worker), then verify
 ./deploy/deploy.sh
-./deploy/verify.sh            # optional arg: expected short SHA (default: current HEAD)
+./deploy/verify.sh            # optional arg: expected SHA, full or short (default: current HEAD)
 ```
 
 Admin writes (add opportunity, update status, trigger research) need a bearer

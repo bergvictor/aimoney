@@ -91,6 +91,12 @@ else
     if [ "$REV" = "$EXPECTED_REV" ]; then
       echo "ok   live-revision (${REV})"; break
     fi
+    case "$REV" in
+      "$EXPECTED_REV"*) echo "ok   live-revision (${REV} matches ${EXPECTED_REV})"; break ;;
+    esac
+    case "$EXPECTED_REV" in
+      "$REV"*) echo "ok   live-revision (${REV} matches ${EXPECTED_REV})"; break ;;
+    esac
     if [ "$ATTEMPT" -ge "$VERIFY_ATTEMPTS" ]; then
       echo "FAIL live-revision: stale revision ${REV}, expected ${EXPECTED_REV} after ${VERIFY_ATTEMPTS} tries"; FAIL=1; break
     fi
