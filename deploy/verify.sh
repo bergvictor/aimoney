@@ -2,6 +2,8 @@
 # AIMoney Lab verification: fetch every public surface with a cache-buster and
 # confirm the expected revision/content. Any stale/mismatched/unreachable
 # surface fails the rollout. No credentials needed (reads are public).
+# Usage: ./deploy/verify.sh [expected-sha] (default: current short HEAD;
+# EXPECTED_REV overrides the default when no arg is given).
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -36,8 +38,45 @@ check "api-runs"            "$PAGES/api/runs?$CB"          '"runs"'
 echo "==> verifying ${WORKER}"
 check "worker-status"       "$WORKER/?$CB"                 '"agent":"research-v1"'
 
-REV="$(curl -fsSL --max-time 25 "$PAGES/release.json?$CB" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('revision','?'))" 2>/dev/null || echo ?)"
-echo "==> live revision: ${REV}"
+# Live-revision gate: the edge must serve the deployed commit. release.json
+# is stamped at build time (Pages build command `scripts/stamp-release.sh`;
+# manual deploys stamp in deploy.sh step 2), so a wrong revision means a
+# stale edge, a queued build, or a skipped stamp step.
+EXPECTED_REV="${1:-${EXPECTED_REV:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}}"
+VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-6}"
+VERIFY_RETRY_DELAY="${VERIFY_RETRY_DELAY:-10}"
+if [ "$EXPECTED_REV" = "unknown" ]; then
+  echo "FAIL live-revision: cannot determine the expected revision (pass it as \$1 or set EXPECTED_REV)"; FAIL=1
+else
+  ATTEMPT=0
+  REV=""
+  while [ "$ATTEMPT" -lt "$VERIFY_ATTEMPTS" ]; do
+    ATTEMPT=$((ATTEMPT + 1))
+    BODY="$(curl -fsSL --max-time 25 "$PAGES/release.json?$CB" 2>/dev/null || true)"
+    if [ -z "$BODY" ]; then
+      echo "FAIL live-revision: unreachable ($PAGES/release.json)"; FAIL=1; break
+    fi
+    case "$BODY" in
+      <*|*"<html"*|*"<!DOCTYPE"*)
+        echo "FAIL live-revision: expected JSON, got an HTML body (edge error page?)"; FAIL=1; break ;;
+    esac
+    REV="$(printf '%s' "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('revision',''))" 2>/dev/null || true)"
+    if [ -z "$REV" ]; then
+      echo "FAIL live-revision: unparsable body (not JSON with a revision key)"; FAIL=1; break
+    fi
+    if [ "$REV" = "dev-undeployed" ]; then
+      echo "FAIL live-revision: placeholder revision dev-undeployed (stamp step skipped?)"; FAIL=1; break
+    fi
+    if [ "$REV" = "$EXPECTED_REV" ]; then
+      echo "ok   live-revision (${REV})"; break
+    fi
+    if [ "$ATTEMPT" -ge "$VERIFY_ATTEMPTS" ]; then
+      echo "FAIL live-revision: stale revision ${REV}, expected ${EXPECTED_REV} after ${VERIFY_ATTEMPTS} tries"; FAIL=1; break
+    fi
+    echo "...  live-revision stale (${REV}, expected ${EXPECTED_REV}), retry ${ATTEMPT}/${VERIFY_ATTEMPTS} in ${VERIFY_RETRY_DELAY}s"
+    sleep "$VERIFY_RETRY_DELAY"
+  done
+fi
 
 # Non-empty priority list: the seed (or the agent) must have populated D1.
 N="$(curl -fsSL --max-time 25 "$PAGES/api/opportunities?limit=1&$CB" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('opportunities',[])))" 2>/dev/null || echo 0)"

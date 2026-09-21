@@ -1,124 +1,242 @@
-# AUDIT 2026-09-20 — aimoney (round 1, overnight lane: HEALTH ISOLATION + FIRST FIVE SECONDS)
+# AUDIT-2026-09-20-round1 — aimoney (read-only lane)
 
-Clone HEAD: `284163c` ("Night round 2: outage-honest health, tag-date vetted count, worker failure markers").
-Live rev (`_night/live/aimoney_pages_dev_api_health.html`): `284163c` — live matches HEAD; the round-3 "live trails HEAD" gap is closed.
-Lane metric right now: **unmeasured** — live health reads `{"ok":false,"db":"down"}` with every count `null` (outage, not zeros). Last healthy measurement: **0 decisions/week, 0 vetted/week, $0.00 lifetime, 11 unreviewed (oldest ~6.5d), 19/27 without a brief, 2 planned / 0 running** (orchestrator + round-3 audit of live `d1aa266`).
-MONEY FIRST (numbers before any proposal): earned to date **none** ($0.00 lifetime on the last healthy snapshot; the current snapshot is `null`/unknown and must not be read as 0). Last krone arrived: **never**. Single step to the next payment: the owner presses Start on the planned $0 spec-ad sprint and sends the 10 spec ads. Measured conversion at that step: **unmeasured** (0 sent → 0 replies). AIMoney is a tool the owner uses to pick money experiments, not a product he sells — so this round ranks by decisions/week and minutes-to-clear, not revenue. The bottleneck is outside the code: no change here can help until the human sends the ads.
-No repo-local `AGENTS.md`/`CLAUDE.md`/`CONTRIBUTING.md`; governed by `README.md` plus the session standing rules.
-Working tree arrived dirty on all 32 tracked files (pre-existing CRLF checkout artifact: `git diff --ignore-cr-at-eol --stat` empty — content untouched, left alone).
-Surfaces judgment: live HTML is text-identical to `public/index.html` (`diff --strip-trailing-cr -q` exit 0). Light palette only (`public/styles.css:4` `color-scheme: light`; no `prefers-color-scheme`/`data-theme`/toggle in served HTML/CSS/JS — those strings appear only inside the guard tests), favicon + `theme-color` (`public/index.html:9-10`, hand-written `public/favicon.svg`), inline brand mark (`public/index.html:16`), guard suite green (`public/tab-icon.test.mjs`, 5/5 inside the 233). **Zero surface-rule findings this round.**
+Scope note: delegated path `/mnt/c/coding-projects/_workspace/trackb-aimoney-r1` resolves in this
+session to `/root/coding-projects/_workspace/trackb-aimoney-r1`; all work was done there. No git
+writes, no network, no installs, no edits to existing files, no `.env`/secret reads (no `AGENTS.md`,
+`CLAUDE.md`, or `CONTRIBUTING` exists in this repo; `README.md` was read first). This file is the
+only file created. Nothing was changed, so there is no "CI file:line changed" to report; the steps
+that must change are cited per finding. New file uses LF to match HEAD convention; the worktree
+checkout itself is CRLF (Finding 5).
 
 ## 1. What this project is and how it runs
 
-- Purpose: AIMoney Lab — a ranked board of AI-money opportunities with evidence briefs and experiments, re-optimized as results land (`README.md:1-15`).
-- Entry points: dashboard `public/index.html` + `public/app.js`; API `functions/api/[[path]].js`; agent `worker/src/index.js` + `worker/src/lib.js`.
-- Live surfaces: `https://aimoney.pages.dev`, `/api/health`, research worker (`README.md:27-31`, `deploy/public-surfaces.json:31-44`).
-- Scheduled jobs: worker cron every 6h (`worker/wrangler.toml:8-9`); manual triage-only `POST /run` 202 with `briefs_skipped:true` (`worker/src/index.js:584-593`).
-- Deploys: `./deploy/deploy.sh` (D1 schema+migrations+seed-if-empty, stamp `release.json`, Pages, worker), `./deploy/verify.sh` gates rollout; Pages auto-redeploys on push, worker via `.github/workflows/deploy-worker.yml` (schema-only, see F2).
+- Purpose: AIMoney Lab, a tool the owner uses (not a product he sells) — a scored ledger of AI-money opportunities, research briefs, and an experiment tracker that kills/scales ideas on evidence.
+- Entry points: static dashboard (`public/index.html`, `public/app.js` 1361 lines); Pages Functions REST API (`functions/api/[[path]].js` 520 lines); research Worker (`worker/src/index.js` 605 lines, shared `worker/src/lib.js` 77 lines).
+- Live surfaces: `https://aimoney.pages.dev/` (dashboard), `https://aimoney.pages.dev/api/health` (JSON), research worker `https://aimoney-research.levitinvlad.workers.dev/`; one D1 database `aimoney` bound as `DB` (`wrangler.toml:13-16`, `worker/wrangler.toml:11-14`).
+- Scheduled jobs: Worker cron `0 */6 * * *` (`worker/wrangler.toml:9`) → collect signals → AI triage → brief bare rows; manual triage-only `POST /run` (202, `briefs_skipped:true`); no other schedulers.
+- Deploys: Pages Git-connected build (`scripts/stamp-release.sh:5-8` stamps `public/release.json` from `CF_PAGES_COMMIT_SHA`) plus worker via CI (`.github/workflows/deploy-worker.yml:54`) or `./deploy/deploy.sh` (D1 → Pages → worker), verified by `./deploy/verify.sh`.
 
 ## 2. End-to-end walk-through
 
-Signal → triage → proposal → brief → vet → experiment → close → money:
+Main flow A — signal → proposal → brief (all in `worker/src/index.js` unless noted). Cron fires
+`scheduled` (:536) → `runResearch(env,"cron")` (:195): reaps stuck runs (:199-204), opens an
+`agent_runs` row (:205-214), collects HN/Reddit/GitHub in parallel (`hnSignals` :47, `redditSignals`
+:76, `githubSignals` :104 via `timedJson` :35; `Promise.allSettled` :230; per-source failure named in
+`src_fail` :72/:100/:235). Signals batch-insert (:242-245), one heartbeat (:247-250), >30d
+unprocessed swept to noise (:255-259), oldest-first take of 6 (:261-263), exact-URL supports
+pre-pass with no AI call (:269-295, `exactUrlTarget` :166), one Mistral classify call (:306-327,
+`aiComplete` :134, `parseJsonLines` in `worker/src/lib.js:62`). Validated verdicts (:339-407): `new`
+INSERTs a `researching` row with `UNREVIEWED` + capped score (:367-377, at most 2/run via
+`MAX_NEW_PER_RUN` :16/:356; slug collision links as supports :386-393); `supports` appends a notes
+line (:395-403); `noise` just marks processed (:404-406); verdict writes flush as one `env.DB.batch`
+(:408). Cron then briefs one bare row (:435-468, INSERT :458-466) plus one extra oldest-unreviewed
+row past 48h (:476-524), and finishes the run log once (:527). Manual `POST /run` (:592-601) runs
+collect+triage only and always skips briefs (:228, 202 with `briefs_skipped:true` :600).
 
-1. Collect: cron tick → `runResearch(env,"cron")` (`worker/src/index.js:197` via `scheduled` at `:528-530`) fans out HN/Reddit/GitHub (`:232`, `:48-75`, `:77-103`, `:105-132`), one batched `INSERT OR IGNORE` (`:243-248`).
-2. Sweep + take: 30d-stale signals → noise with count (`:256-262`); oldest 6 unprocessed taken (`:263-265`); exact-URL matches link as supports before triage, no AI call (`:271-297` via pure `exactUrlTarget`, `:168-178`); quiet ticks continue to the brief pass (`:298-301`).
-3. Triage: top-60 list fetched (`:309-311`), one Mistral NDJSON call (`:312-329`; budget `MAX_AI_CALLS=4`, `:17`); `parseJsonLines` (`worker/src/lib.js:49-64`); strict validation (`worker/src/index.js:341-356`); `new` inserts a `researching` + `UNREVIEWED` row with humility clamp (`:363-364`) and capped score (`:376`), at most 2 per run with overflow left unprocessed (`:358`, `MAX_NEW_PER_RUN`, `:16`); slug collision links as supports (`:384-396`); `supports` appends `[signal date]` evidence newest-kept (`:397-405`); else noise (`:406-408`); verdict writes go out as one batch (`:410`).
-4. Brief: cron only (`briefDeadline`, `:230`; manual `POST /run` always skips, `:592`); oldest-unreviewed-first past 48h (`:421-436`); one Llama call (`:441-453`); empty/malformed JSON skipped (`:454-470`, `briefFailed` flag); one extra oldest bare row past 48h (`:476-516`); single run-log write carrying the brief mode (`:519`).
-5. Serve: `GET /api/opportunities` with `needs_review` bit + capped excerpts (`functions/api/[[path]].js:46-88`); detail + briefs + experiments (`:90-101`); batched 10-statement health (`:382-439`); `GET /api/meta` (`:441-447`).
-6. Decide (all human): boot `refresh()` → `refreshTargets` (`public/app.js:1177-1179`, `:1187-1221`); review queue derived client-side (`:228-234`, `:236-253`); review rows carry capital + next action + source + brief summary with inline Vet/Vet-&-starter/Kill (`:161-219`); Vet clears the marker and appends `[date vetted]`, toast offers Log experiment (`:396-427`); Vet-&-starter vets + POSTs a prefilled planned experiment + flips to testing with a Start shortcut (`:435-477`); Kill takes an inline post-mortem line (`:479-515`); Start-here strip reads the list excerpt with Vet/Kill for unreviewed top picks (`:103-127`); drawer + admin zone for rescore/status (`:765-812`, `:837-934`).
-7. Experiment: modal log with dollar→cents conversion (`:1032-1083`); board one-click Start (`:576-588`), one-click Lose (`:595-612`) and one-click Win with inline $ + source + line (`:621-638`); API create (`functions/api/[[path]].js:253-302`) and update (`:304-357`) enforce result + post-mortem on close (`:327-331`), stamp `started_at`/`ended_at` (`:326`,`:332`), append a `($X rev / $Y spent via {source})` outcome line to the parent on the won/lost transition (`:337-346`); drawer suggests a ±1 rescore, never auto-applied (`public/app.js:825-835`); zero-decision weeks get a read-only stale nudge that deep-links to the board card (`:665-674`, `:562-569`).
-8. Money made real: modal + Win row record `revenue_cents`/`spent_cents`/`revenue_source`; board/drawer render `$X rev / $Y spent via {source}` + ended date; `/api/health` sums `revenue_last_7d`/`revenue_total`/`spent_total` (`functions/api/[[path]].js:388-389`).
-9. Where it most often breaks or goes silent, in order: **(a)** the health batch fails as a whole on live right now (`ok:false`, all `null`) while `/api/opportunities` serves real rows — one bad probe takes the entire report (F1); **(b)** the two revenue selects touch columns that CI can never have applied (F2); **(c)** the human funnel converts at zero (0 vetted, 0 decisions, oldest ~6.5d) while the single step to money is a human sending ads, not code (F4); **(d)** silent drops: the 30d sweep noises old signals (`worker/src/index.js:256-262`), malformed brief JSON is skipped with only a `brief:failed` log token (`:454-470`), bad-action verdicts mark signals processed with no parent (`:347-350`).
+Main flow B — review → vet → experiment → decision. Dashboard `refresh()` (`public/app.js:1304` via
+`refreshTargets` :1314) loads `/api/opportunities` (`functions/api/[[path]].js:499` →
+`listOpportunities` :44-86, capped scores, `needs_review` bit, brief excerpts) and `/api/health`
+(:374-490); the start-here strip renders the #1 pick (`renderStartHere`, `public/app.js:103`) and
+the review chip lists UNREVIEWED oldest-first (`refreshReview`, `public/app.js:242`). Vet
+(`public/app.js:406`, inner :419) / Kill (:487, inner :499) PATCH `updateOpportunity`
+(`[[path]].js:138-179`); Start (`public/app.js:582`) PATCHes `updateExperiment` (`[[path]].js:306-359`),
+whose closure gate requires `result` + `post_mortem` for `won`/`lost`, stamps `ended_at`, and appends
+a one-line `$X rev / $Y spent` outcome to the parent notes (:339-348). Health answers from one
+10-statement batch (:390-402) with an isolation fallback that re-runs statements individually and
+names failures plus the missing column (:411-440, response :490).
+
+Where it most often breaks or goes silent. (1) Live D1 still lacks the three 2026-09-20 columns, so
+the four money fields read null with `health_probe_detail` naming `revenue_cents` (live snapshot
+below; applying the migrations is the owner's action, the path is now correct). (2) The human
+bottleneck is outside the code: 11 unreviewed, oldest 170.9h (~7.1d), 19 of 27 rows without a brief,
+2 planned / 0 running / 0 decided experiments, `vetted_last_7d` 0 — no code change vets a row for
+him. (3) Deploy-time: the seed guard fails open and re-seeds on any COUNT failure (Finding 1); the
+manual migration loop hides every error as "already applied" (Finding 2). (4) Runtime sources:
+unauthenticated Reddit search (`index.js:82-84`) is 429-prone, but `src_fail` accounting (:235, :527)
+already degrades that honestly into the research log.
 
 ## 3. Health signals measured here
 
-- `npm test` (this Linux checkout, exit 0): **233 pass / 0 fail, 81 suites, `duration_ms 1708.784868`**. The Windows baseline (`duration_ms 2442.0916`) is a different environment, not a comparable total. Only warnings are the known `MODULE_TYPELESS_PACKAGE_JSON` reparsing notes and sandbox proxy notes.
-- `python3 -m compileall`: N/A — repo contains zero `*.py` files (filename search returned nothing; JS-only: Pages + Functions + Worker, `node --test` suites).
-- `node --check`: exit 0 on `public/app.js`, `worker/src/index.js`, `worker/src/lib.js` (proxy warning only). The API router's parse is proven by the green suite that imports it (`functions/api/api.test.mjs:6`).
-- TODO density: **0** — regex search for `TODO|FIXME|XXX|HACK` across `public/`, `functions/`, `worker/`, `scripts/`, `deploy/`, `d1/` returns nothing.
-- Dead code (all verified present at HEAD): `BRIEF_DEADLINE_MS` defined but never referenced (`worker/src/index.js:21`, sole occurrence; live logic uses `briefDeadline` at `:230`); unused `scoreOf` import (`:155`, sole occurrence in file); five unreachable toast gates after modal returns (`public/app.js:412,494,579,598,624`, each behind its `return openAdminModal(…)` at `:410,492,577,596,622`); `GITHUB_QUERIES` third entry `"ai-side-project"` (`:28`) never fetched (`:128` slices `(0, 2)`); `appendKeepNewest` has zero production callers (`worker/src/lib.js:36-39`, tests only).
-- Duplicated logic: `clamp10` in the API (`functions/api/[[path]].js:16-20`) vs `worker/src/lib.js:4-7` (near-identical, not shared); classify prompt text duplicated between the pass (`worker/src/index.js:312-322`) and `/debug-classify` (`:563-572`); brief-prompt + brief-insert duplicated for main (`:444-470`) and extra (`:488-513`) briefs; `inlinePostMortem` (`public/app.js:284-322`) vs `inlineWinClose` (`:328-390`) share ~50 lines of row/input/cancel/Escape shape; `centsDollars` (`functions/api/[[path]].js:24`) vs `moneyCents` (`public/app.js:53`) are an intentional commented mirror; `UNREVIEWED` appears as SQL/string literals while the exported `UNREVIEWED_MARKER` (`worker/src/lib.js:21`) is used only inside lib; worker token compare repeated 3x with `!==` (`worker/src/index.js:539-541,554-556,585-586`) vs the API constant-time compare (`functions/api/[[path]].js:28-36`); three separate `#board` click listeners for Start/Lose/Win (`public/app.js:1088-1111`).
-- Create/update asymmetry: create slices every string (`functions/api/[[path]].js:108-124`); update stores eight fields raw with no slice (`:147-150`), so a PATCH can write unbounded `notes` past the 8000-char newest-kept idiom.
-- Live surfaces: `_night/live/aimoney_pages_dev.html` (5514 bytes) text-identical to `public/index.html` modulo checkout CRLF; surface rules all pass, so they expose zero findings. Live health (383 bytes): `{"ok":false,"rev":"284163c","db":"down",…all counts null…,experiments_by_status":{},…}` — the honesty half of round 2 is live (nulls, not fabricated zeros) but the isolation half is not (F1).
-- Note on acceptance: `git status --short` showed every tracked file as modified before I wrote anything (`git diff --ignore-cr-at-eol --stat` is empty — CRLF line endings only, pre-existing). I created only this file and edited nothing.
+- `npm test` (this session, repo root): exit 0. TAP head shows green suites including the round-4
+  additions (`CI applies sorted d1/migrate-*.sql`, 3 tests; `old-schema migration convergence`, 2
+  tests with positive control). Compact re-run (`node --test --test-reporter=dot`, same 6 files):
+  exit 0, 360/360 completion marks, zero failures — matching the committed Windows baseline
+  (`_night/tests-baseline.log`: `ℹ tests 267, suites 93, pass 267, fail 0`, 267+93=360).
+- `node --check public/app.js`: exit 0. The ESM sources (`functions/api/[[path]].js`,
+  `worker/src/index.js`, `worker/src/lib.js`) are imported live by the suite — a syntax error would
+  fail every suite that touches them. `sh -n` on the three shell scripts could not run (sandbox
+  approval denied `sh` invocations — blocker, see below); all three were instead reviewed by
+  full-file reads (`deploy.sh` 61 lines, `verify.sh` 63, `stamp-release.sh` 8).
+- `python3 -m compileall`: not applicable — zero `.py` files (full recursive listing plus a
+  `**/*.py` search with no matches; control: the same glob search lists the 3 `*.test.*` files under
+  `d1/` and `public/`, and `ls -R` shows the JS/SQL/sh-only tree).
+- TODO density: 0 matches for `TODO|FIXME|XXX|HACK` across `public functions worker deploy scripts
+  d1`. Dead code: none found. Live near-duplication: the brief-write pass ×2 (Finding 6) plus two
+  documented mirrors (`centsDollars` in `[[path]].js:24` ↔ dashboard money render, noted at
+  `[[path]].js:23`; local `clamp10` in `[[path]].js:16-20` vs `worker/src/lib.js:4` with a different
+  signature).
+- Sizes (measured): app.js 1361, `[[path]].js` 520, api.test.mjs 1463, worker index.js 605, lib.js
+  77, index.html 121, styles.css 215, schema.sql 102, seed.sql 71, deploy.sh 61, verify.sh 63,
+  deploy-worker.yml 57, migrations.test.mjs 126. `public/favicon.svg` is one short line (a few
+  hundred bytes, far under the 2 KB limit — also enforced by the green tab-icon suite).
+- Surface rules: COMPLIANT, no finding. Served HTML carries icon + `theme-color`
+  (`public/index.html:9-10`), inline brand mark (:16), neutral `…` placeholders (:23, :52);
+  `styles.css:4` declares `color-scheme: light` with no dark branch; the served snapshot
+  (`_night/live/aimoney_pages_dev.html`, 121 lines) is line-identical to `public/index.html`. Live
+  health (rev `8d9b974` = HEAD, `2026-09-21T03:17:26Z`): `ok:true, db:up`, 27 opportunities, 11
+  unreviewed, 19 bare, `{planned:2}`, `hours_since_last_ok_run:3.3`, `oldest_unreviewed_age_h:170.9`,
+  all four money fields null with `health_probe_failures:[decisions_revenue_week,revenue_lifetime]`
+  and `health_probe_detail` naming `revenue_cents` twice — isolation + column detail both live.
+- Tree state: HEAD `8d9b974` (round 4) equals the live `rev`, so no stale-deploy lag at snapshot
+  time. `git status --short` lists 34 modified files but `git diff --ignore-cr-at-eol --stat` is
+  empty and `file(1)` reports CRLF on 4/4 sampled worktree files — the entire diff is line endings
+  (HEAD is LF). First-five-seconds: strip above the toolbar (`index.html:42`, `app.js:103`),
+  mobile compaction (`styles.css:210-215`), last-good paint (`app.js:1193-1242`) — all present and
+  test-pinned, no finding.
+- Positive controls (absences claimed above): the TODO/dark-pattern searches use the same tool that
+  returned 5 hits for `UNREVIEWED` in `worker/src/lib.js`, 6 hits for `color-scheme` (incl.
+  `styles.css:4` and the guard tests), and 20+ hits for `experiments_by_status` — so zero means
+  absent, not a broken matcher. The suite executed a non-zero denominator (267 tests + 93 suites,
+  0 skipped in baseline; 360/360 dots here), so "all green" is a measurement, not an empty pass.
+  The convergence suite's withhold-one-migration control fails as required (it ran green, and its
+  assertion fails the run if any withheld file still converges).
+- Blockers (honest, no workaround attempted beyond one retry): `sh -n <script>` denied twice by
+  sandbox approval (`approval aborted`); executing a summary probe from `/tmp` likewise denied, so
+  the TAP tail was re-observed via the in-workspace dot-reporter run instead. No network, no
+  `--remote` D1, no secret access was attempted.
 
 ## 4. Ranked findings (max 8)
 
-Impact order for the lane number (decisions/week, vetted→experiment, backlog drained) and the money-first ranking above. No surface-rule findings: the served page is light-only with icon, brand mark, and a guard test (see §3).
+Money-first answers, in this project's own numbers, before any task. Earned to date: none recorded
+— live health shows `experiments_by_status:{"planned":2}` with zero `won`/`lost` ever, and
+`revenue_total` is null (unknown while the probes fail — 0 is not claimed). Last krone arrived:
+never. This project is a tool the owner uses, not a product he sells, so findings rank by
+owner-time saved and decisions unblocked. Single step to the next payment: a human closes one
+experiment `won` with `revenue_cents > 0` and a source (the $0 spec-ad sprint on
+`ai-ugc-ads-service`, `d1/seed.sql:67-71`, is the named first candidate). Measured conversion at that
+step: 0 decisions from 2 planned (0%); `vetted_last_7d` is 0 for the fourth straight snapshot. The
+bottleneck is outside the code (section 2, item 2) — one line, as directed. Surface-rule findings
+would rank here but there are none (section 3).
 
-**F1 — The health endpoint reports a live database as dead: one bad probe fails all ten as a whole.**
-Evidence: `functions/api/[[path]].js:394` `const healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;` then `:398` `const healthDown = !healthRes;` and `:439` `db: healthDown ? "down" : …` with every count forced `null`. Live proves it: `_night/live/aimoney_pages_dev_api_health.html` reads `ok:false, db:down`, thirteen nulls, while `/api/opportunities` returns real rows at the same moment. The prime suspects are the two selects touching 2026-09-20 columns (`:388-389`, `revenue_cents`/`spent_cents` over `won`/`lost` + `ended_at`) — see F2.
-Why it costs money, users and trust: the lane metric (decisions, vetted, oldest age, revenue) is unreadable exactly when it is needed; the dashboard header prints `agent: db down` (`public/app.js:705-710`) on a healthy database, training the owner to ignore the surface; `./deploy/verify.sh` fails its `"ok":true` grep and its freshness gate on every rollout until this is fixed.
-Fix: keep the batch for the round trip it saves, but when it rejects, re-run the ten statements individually so the nine healthy probes still report; put the failing statement's name or index in the response instead of a blanket `down`; let `db` reflect whether the database answered at all. Add a test that makes one statement reject and asserts the other nine still report and `db` is not `down` — the stub batch (`functions/api/api.test.mjs:252-263`) never rejects and the only outage test (`:1193-1208`) throws the whole batch, which is why this shipped twice. Touch `functions/api/[[path]].js`, `functions/api/api.test.mjs`. Size M. Risk: low-medium — health shape gains one failure-name key; keep every existing key and order byte-identical for `verify.sh`.
-
-**F2 — CI can never apply a migration, so the 2026-09-20 columns never reached the live database.**
-Evidence: `.github/workflows/deploy-worker.yml:20` runs only `wrangler d1 execute aimoney --file=d1/schema.sql --remote`, and `d1/schema.sql` is all `CREATE TABLE IF NOT EXISTS` (it cannot add a column to an existing table). The `ALTER TABLE` migrations (`d1/migrate-2026-09-20-experiment-cents.sql:5-6`, `d1/migrate-2026-09-20-revenue-source.sql:5`) are applied only by `deploy/deploy.sh:34-38`, which CI never runs. Separately, the orchestrator measured that this repository has no `CF_API_TOKEN`/`CF_ACCOUNT_ID` secrets, so the workflow's last runs failed before wrangler could do anything (I cannot verify secrets from a read-only clone and did not try — no network, never touch credentials).
-Why it costs money: every schema change can never reach the live database, so F1's failing selects will keep failing no matter how honest the endpoint gets; the revenue columns the money ranking depends on do not exist where they are read.
-Fix (two owners): the owner adds `CF_API_TOKEN` and `CF_ACCOUNT_ID` to this repository's secrets — nothing in the database path can work until they exist. The repo change makes the workflow run `d1/migrate-*.sql` the way `deploy/deploy.sh` already does (tolerating the duplicate-column error on re-runs) and fails loudly rather than silently when credentials are absent. Touch `.github/workflows/deploy-worker.yml` only. Size S. Risk: medium — touches the deploy path; the migration loop is already proven by `deploy.sh`, and re-runs are idempotent by design.
-
-**F3 — First five seconds: on a phone, the decision sits below the fold behind chrome the owner never acts on.**
-Evidence: `public/index.html:13-55` stacks masthead (brand + 34px headline + lede + agent pill + two buttons), three tabs + formula, then a toolbar of eight filter chips + Add button — and only then the `#start-here` strip (`:55`, rendered by `public/app.js:103-127`). On a 360px phone the eight chips wrap to several rows (`public/styles.css:101-102` toolbar wraps; `.table-wrap` scrolls horizontally at `:105`), so the #1 pick, its capital, and its next action require scrolling past the headline, the formula (`:71`, already hidden on mobile at `:212`), and filters. The ledger's ten columns (`public/index.html:59-70`) cannot be the five-second read on any phone.
-Why it costs money: the lane's bottleneck is minutes-to-clear (oldest unreviewed ~6.5d, 0 vetted/week); every extra scroll between opening the page and the Vet/Kill call defends the stall.
-Fix: move the Start-here strip above the filter toolbar so the #1 pick is the first thing under the tabs; compact the mobile masthead (smaller headline, one-line lede or none); leave the strip's Vet/Kill wiring untouched. Remove nothing load-bearing — reorder and shrink only. Touch `public/index.html`, `public/app.js`, `public/styles.css`, `public/dashboard.test.mjs` (pin strip-above-filters + mobile compactness). Size S. Risk: low — read-only reorder; keep every filter and handler byte-identical in behavior.
-
-**F4 — The single step to the next payment is a human sending 10 spec ads; no code in this repo can take it.**
-Evidence: `d1/seed.sql:66-71` — `Spec-ad sprint: 10 brands, 10 free ads`, `planned`, `$0 + 10 hours`, target `>=3 replies; >=1 pilot at >=$500`, unpressed since seed; `public/app.js:576` names it the first Start candidate and notes a human still presses it. Conversion at that step is unmeasured (0 sent → 0 replies) and this project's own health endpoint has never reported a krone of revenue.
-Why it costs money: it is the entire money path — everything else in this repo is queue hygiene around a step that lives outside the code.
-Fix (operator action, no code): press Start on the spec-ad sprint and send the 10 ads this week; record replies as the experiment's `result` so the next audit can report a measured conversion instead of another zero. Touch no repo files. Size S. Risk: none. Honesty rule: never invent a revenue figure for work not yet sent.
-
-**F5 — Dead safety rails still shipped: a deadline that enforces nothing, an unused import, five dead gates, a dead query.**
-Evidence: `const BRIEF_DEADLINE_MS = 18000; // skip the brief pass past this elapsed time` (`worker/src/index.js:21`, sole occurrence — the live gate is `briefDeadline` at `:230`); `scoreOf` in the import at `:155` (sole occurrence); five `if (!state.token) return toast(…)` lines (`public/app.js:412,494,579,598,624`) each unreachable behind its `return openAdminModal(…)` and self-commented as superseded; `"ai-side-project"` in `GITHUB_QUERIES` (`worker/src/index.js:28`) excluded by `.slice(0, 2)` (`:128`).
-Why it costs trust: a reader (or a future worker) will believe the 18s deadline is enforced and the toast gates can fire — false confidence in safety rails that do not exist. The dead query string promises coverage the fetcher silently drops.
-Fix: delete the constant, the `scoreOf` import name, and the five dead toast lines; either drop `.slice(0, 2)` to fetch all three GitHub queries or delete the third string so config matches behavior. (`appendKeepNewest` at `worker/src/lib.js:36-39` is tests-only but harmless as the documented newest-kept spec — leave it.) Touch `worker/src/index.js`, `public/app.js`, and `public/dashboard.test.mjs` only if a static guard counts the removed lines. Size S. Risk: low.
-
-**F6 — The verdict-phase batch has no fallback either: one failed write can throw the whole research pass.**
-Evidence: `worker/src/index.js:410` `if (verdictWrites.length) await env.DB.batch(verdictWrites);` — no catch, inside the `try` whose `catch` at `:521-524` finishes the run as `error`. The comment at `:335-339` accepts the tradeoff ("signals stay unprocessed, retried next tick"), which bounds the damage to one lost tick rather than F1's permanent false-down.
-Why it costs money: a single bad verdict write burns a 6h cron tick's triage output (up to 2 proposals + evidence appends) inside the 30s budget the pass is engineered for (`:7-11`).
-Fix: wrap the batch in try/catch with a per-statement fallback (same F1 idiom at smaller scale), or keep all-or-nothing but record which verdict write failed in the run log so the next tick is a targeted retry instead of a blind one. Touch `worker/src/index.js`, `worker/src/index.test.js`. Size S. Risk: low — verdict semantics unchanged; signals already retry by design.
-
-**F7 — Opportunity updates store unbounded strings while creates slice them.**
-Evidence: create slices every field (`functions/api/[[path]].js:108-124`, e.g. `notes` to 8000); update assigns eight text fields raw (`:147-150` `next[f] = String(b[f]);` with no slice), so a PATCH can write `notes` past the 8000-char newest-kept idiom every other writer honors.
-Why it costs money and trust: unbounded rows bloat the detail payload the vet path fetches on every decision tap, and break the "newest 8000 kept" contract the worker, the outcome ledger, and the dashboard all assume.
-Fix: apply the same `.slice()` bounds in `updateOpportunity` as `createOpportunity` (notes 8000, money fields 120, title 200, one_liner 500, source_url 500, category/source 40). Touch `functions/api/[[path]].js`, `functions/api/api.test.mjs` (pin an oversized PATCH arriving truncated). Size S. Risk: low — pure input bounding; no shape change.
-
-**F8 — Worker admin-token compare is a plain `!==` in three places; the API uses a constant-time compare.**
-Evidence: `worker/src/index.js:539-541` (`/ping-ai`), `:554-556` (`/debug-classify`), `:585-586` (`/run`) all do `got !== want`, while `functions/api/[[path]].js:28-36` compares in constant time with a length check first.
-Why it costs trust: the same `ADMIN_TOKEN` value guards both surfaces (`README.md:85-88`); the worker endpoints leak timing information about it that the API deliberately does not.
-Fix: share one constant-time compare (move it into `worker/src/lib.js` next to `clamp10` and import it in both the worker and the API, or duplicate the ~8 lines with a comment pointing at the twin). Touch `worker/src/index.js`, `worker/src/lib.js`, `worker/src/index.test.js`, `worker/src/lib.test.js`. Size S. Risk: low — behavior identical for correct and incorrect tokens.
+1. **The seed guard fails open: any COUNT failure re-seeds live D1.**
+   Evidence: `deploy/deploy.sh:39-41` —
+   `COUNT="$($WRANGLER d1 execute aimoney --remote --json --command "SELECT COUNT(*) ..." |
+   python3 -c "..." 2>/dev/null || echo 0)"`, then `:42 if [ "${COUNT:-0}" = "0" ]` applies
+   `d1/seed.sql`, whose three INSERTs are plain (no `OR IGNORE`: `d1/seed.sql:5,20,67`). A missing
+   python3, a changed JSON shape, or any query error prints 0 and seeds a live table: the
+   opportunities INSERT fails on slug conflict while the briefs INSERT (SELECT-subselect ids,
+   `:20-64`) and the starter-experiment INSERT (`:67-71`) can still land as duplicates — or, since
+   the seed step has no tolerance under `set -eu`, the deploy aborts mid-way with Pages/worker
+   undeployed. Either branch is wrong, and `2>/dev/null` hides which.
+   Why it costs: the only remaining check in the deploy chain that reports success by measuring
+   nothing; one bad run corrupts live D1 (duplicate briefs/experiments) or ships half a deploy.
+   Fix: fail closed — drop `|| echo 0`, abort with a named error when COUNT is empty/unreadable;
+   and make the seed re-runnable (`INSERT OR IGNORE` on opportunities by slug, existence guards on
+   the briefs/experiment inserts). Files: `deploy/deploy.sh`, `d1/seed.sql`. Size S. Risk: low.
+2. **`deploy.sh` still calls EVERY migration failure "already applied", and has drifted from CI.**
+   Evidence: `deploy/deploy.sh:34-38` —
+   `$WRANGLER d1 execute aimoney --file="$f" --remote || echo "==> D1: $f already applied
+   (continuing)"` — versus `.github/workflows/deploy-worker.yml:38-49`, which tolerates only
+   `duplicate column`/`already exists` (case-insensitive) and `exit 1`s otherwise. The comment at
+   `deploy-worker.yml:31-32` ("Mirror of the deploy/deploy.sh D1 migration loop") is now false:
+   the two paths already disagree, because they are mirrored text, not one list.
+   Why it costs: a broken migration on the manual path prints success and the rollout stays green;
+   schema drift goes silent exactly where the money-column outage hid for three rounds.
+   Fix: give both paths one list — extract the tolerate-list loop into `deploy/migrate.sh` called
+   by `deploy.sh` and (after checkout) by the workflow, or at minimum paste the CI case-statement
+   verbatim into `deploy.sh` and correct the mirror comment. Second runs must stay clean no-ops.
+   Files: `deploy/deploy.sh` (plus `deploy/migrate.sh` / `.github/workflows/deploy-worker.yml` if
+   shared). Size S. Risk: low.
+3. **`verify.sh` prints the live revision but never checks it — the placeholder passes.**
+   Evidence: `deploy/verify.sh:31` greps only `'"project":"aimoney"'`, which the committed
+   placeholder `public/release.json:1`
+   (`{"project":"aimoney","revision":"dev-undeployed",...}`) also contains; `:39-40` fetch
+   `/release.json` and `echo "==> live revision: ${REV}"` with no comparison to the deployed
+   commit, no JSON-parse requirement, no HTML-body rejection, no retry, and no expected-SHA input.
+   (No second source of truth is needed: `release.json` + health `rev` already exist.)
+   Why it costs: a stale edge, a queued build, or a skipped stamp step looks identical to a
+   successful deploy — this is the fleet-wide "surface cannot prove what it serves" gap, applying
+   here by verification, not by missing file.
+   Fix: pass the expected short SHA into `verify.sh` (default `git rev-parse --short HEAD`), fetch
+   `/release.json?cb=<ts>`, require JSON parse plus `revision == expected`, retry a stale revision
+   a bounded number of times, fail immediately on an HTML body or a wrong revision. Files:
+   `deploy/verify.sh` (document the dashboard build-command string alongside). Size S. Risk: low.
+4. **`experiments_by_status` still has no probe-failure guard: dead probe 3 reports `{}`.**
+   Evidence: `functions/api/[[path]].js:480-481` build the object unconditionally and `:490` guards
+   probes 0,1,2,5,6,7,8,9 with `probeFailed(i)` but never probe 3 — `{}` is byte-identical to the
+   genuine empty state. (No dashboard consumer today — zero `experiments_by_status` matches in
+   `public/app.js` — so this is an API-honesty wart, not a live wrong number; the outage test at
+   `functions/api/api.test.mjs:1223` pins the `{}` contract and would need updating with the fix.)
+   Why it costs: the one hole left in the unknown-not-zero contract; any future consumer renders a
+   phantom "no experiments", the exact wrong-number-instead-of-unknown the money directive bans.
+   Fix: emit `probeFailed(3) ? null : experiments_by_status`, add a probe-3 failure case to the
+   isolation suite (other nine report, `db` stays `up`, probe named), and keep the healthy payload
+   byte-identical. Files: `functions/api/[[path]].js`, `functions/api/api.test.mjs`. Size S.
+   Risk: low.
+5. **The whole tree diffs on line endings; CRLF shebangs break `./` on Linux.**
+   Evidence: `git status --short` lists 34 modified files while `git diff --ignore-cr-at-eol
+   --stat` is empty; `file(1)` reports CRLF on 4/4 sampled worktree files; `deploy/deploy.sh:1`,
+   `deploy/verify.sh:1`, `scripts/stamp-release.sh:1` carry CR after `#!/usr/bin/env sh`. Same
+   family as tonight's `export→port` mangling from an LF pattern in a CRLF file.
+   Why it costs: `git status` acceptance is unreadable, every future edit risks off-by-CR
+   replacement bugs, and the scripts cannot run via `./` on Linux as-is.
+   Fix (owner decision, not this lane): add `.gitattributes` (`* text=auto`, `*.sh eol=lf`) plus
+   one normalization commit kept lone; until then, match each file's actual endings and prefer
+   whole-line replacements. Files: `.gitattributes` (new), one-time normalization. Size S
+   (config) / M (normalize). Risk: medium for the normalization (touches every file).
+6. **The worker's brief-write pass is duplicated (~30 lines × 2) and will drift.**
+   Evidence: `worker/src/index.js:435-468` (first brief: prompt, parse, empty-brief guard :457,
+   `INSERT INTO briefs` :458-466) vs `:491-521` (extra brief: same shape, guard :510, INSERT
+   :511-519) — prompt text, guards, and bind order maintained in two places.
+   Why it costs: the next prompt/guard/schema fix lands in one copy and silently misses the other;
+   with briefs the scarcest output (19 of 27 rows bare), a half-applied brief fix directly taxes
+   the review queue that feeds vet→experiment.
+   Fix: extract one `briefOne(env, state, target, sigs, retries)` helper (keeping `retries:1` vs
+   `retries:0` as a parameter and the distinct bare/extra-bare selection queries at the call
+   sites); existing worker tests should pass unchanged. Files: `worker/src/index.js`. Size S.
+   Risk: low.
 
 ## 5. What NOT to change
 
-- The scoring formula and the honest cap: `score = 100 * (value * confidence * fit) / (effort + 1)` (`README.md:56`, `worker/src/lib.js:15-16`) with `UNREVIEWED` rows clamped to ≤6000 (`worker/src/lib.js:29-32`). Isolate probes and reorder chrome, not the math.
-- "The agent PROPOSES; the human owns the testing workflow (it never moves status to testing/scaling/killed)." (`worker/src/index.js:4-5`; also `README.md:72`: "`researching → testing` is a human decision".)
-- "No auto-transitions — the human still owns every status move." (`public/app.js:560-561`.) Start/Win/Lose/Vet/Kill stay human-pressed, including the spec-ad sprint.
-- "Killed strategies stay on the board with their post-mortem — that is the point." (`README.md:63-64`.) Never delete killed rows or their notes.
-- The experiment closure gate: `won`/`lost` require non-empty `result` + `post_mortem` (`functions/api/[[path]].js:327-331`), `ended_at` stamped (`:332`). Never mark an experiment decided without evidence, never invent a revenue figure.
-- Public-read / token-write split (`functions/api/[[path]].js:28-36`); `ADMIN_TOKEN` rotation stays a human deploy step (`README.md:85-88`). No tokenless writes, no stored bypass.
-- Idempotent deploy: schema always, seed only when the table is empty (`deploy/deploy.sh:30-47`). Never reseed over live rows.
-- Manual-triage-only + briefs-on-cron (`README.md:77`; `worker/src/index.js:592`). F1/F6 preserve the manual skip.
-- Credentials are the owner's: never create, enter, or store `CF_API_TOKEN`/`CF_ACCOUNT_ID`/`ADMIN_TOKEN`. The secrets fix in F2 is an owner action in the GitHub UI, not a repo edit.
-- Anything needing a login, credential, payment, or a human decision: Cloudflare deploys, sending the spec ads, pricing a pilot, vet/kill calls, closing experiments. This audit changed no code and read no secrets.
+- Credentials and remote writes. The repo has no `CF_API_TOKEN`/`CF_ACCOUNT_ID`; adding them to
+  this repository's secrets is the owner's action — never create, enter, print, or store a
+  credential. Likewise never run `wrangler d1 execute --remote`, a migration, or any write against
+  production D1 from an audit/implementation lane; applying the pending migrations to live D1 is
+  the owner's action. `ADMIN_TOKEN` rotation stays manual per `README.md:85-88`.
+- The human-owned review boundary. `worker/src/index.js:4-5`: "The agent PROPOSES; the human owns
+  the testing workflow (it never moves status to testing/scaling/killed)." Vet/Kill/vetted-tag,
+  `researching → testing`, and every close decision stay human taps; never auto-transition status,
+  never mark an experiment decided without evidence, never invent a revenue figure.
+- Deliberate board semantics. `README.md:64`: "Killed strategies stay on the board with their
+  post-mortem — that is the point." Score formula `score = 100 * (value * confidence * fit) /
+  (effort + 1)`, the `UNREVIEWED` ≤6000 cap (`worker/src/lib.js:21-29`), inflow cap 2/run
+  (`worker/src/index.js:16`), `MAX_AI_CALLS = 4` (:17), manual brief-skip (:228, :592-601), and the
+  <30s `waitUntil` budget (:7-11) are all documented load-bearing rails — tune only with owner
+  sign-off and a test pinning the new bound.
+- Anything needing a login, payment, or platform permission: Reddit/GitHub/HN terms (no scraping or
+  messaging a platform forbids), Cloudflare dashboard settings (Pages build command, env vars),
+  and the `.gitattributes` normalization in Finding 5 (owner decision; lone commit).
 
 ## 6. Proposed next tasks (2–4)
 
-Order: isolation first (the lane metric must be readable), then the migration path (the numbers must exist), then the five-second read (the owner must act), then hygiene.
-
-### Task 1: Health survives one bad probe: per-statement fallback, failing name, db-by-answered, test
-
-- Owned files: `functions/api/[[path]].js`, `functions/api/api.test.mjs`.
-- Acceptance: (a) when `env.DB.batch(...)` rejects, health re-runs the ten statements individually and the healthy probes report their numbers; (b) the response names the failing statement (name or index); (c) `db` reads by whether the database answered at all, not whether every probe succeeded; (d) a new test fails exactly one statement and asserts the other nine still report and `db` is not `down`; (e) every existing health key and order byte-identical for `verify.sh`; (f) `npm test` green.
-
-### Task 2: CI applies D1 migrations like deploy.sh and fails loudly without credentials
-
-- Owned files: `.github/workflows/deploy-worker.yml`.
-- Acceptance: (a) the workflow runs `d1/migrate-*.sql` after `schema.sql` with the same tolerate-duplicate-column behavior as `deploy/deploy.sh:34-38`; (b) with empty `CF_API_TOKEN`/`CF_ACCOUNT_ID` it fails loudly before calling wrangler instead of falling back to interactive login; (c) no credential value enters the repo; (d) the owner adds the two secrets in the GitHub UI (operator step, outside the diff); (e) `npm test` green (no app-code change expected).
-
-### Task 3: First five seconds: Start-here above filters, compact mobile masthead
-
-- Owned files: `public/index.html`, `public/app.js`, `public/styles.css`, `public/dashboard.test.mjs`.
-- Acceptance: (a) the Start-here strip renders above the filter toolbar with the #1 pick, $/mo range, capital, next action, and working Vet/Kill-or-drawer actions; (b) the mobile masthead compacts (smaller headline, one-line or no lede) so the strip is visible without scrolling on a 360px viewport; (c) every filter, tab, and handler behaves exactly as today; (d) new dashboard tests pin strip-above-filters and the compact mobile rules; (e) `npm test` green; tab-icon guard still green.
-
-### Task 4: Hygiene: drop dead rails, bound update strings, constant-time worker auth
-
-- Owned files: `worker/src/index.js`, `worker/src/lib.js`, `public/app.js`, `functions/api/[[path]].js`, `functions/api/api.test.mjs`, `worker/src/index.test.js`, `worker/src/lib.test.js`.
-- Acceptance: (a) `BRIEF_DEADLINE_MS`, the `scoreOf` import name, the five dead toast gates, and the GitHub slice-or-string mismatch are gone; (b) `updateOpportunity` applies the same `.slice()` bounds as create (oversized PATCH arrives truncated, pinned by a test); (c) all three worker token checks use the shared constant-time compare; (d) no behavior change on any happy path; (e) `npm test` green.
+1. `Seed guard fails closed and seed.sql re-runs cleanly` (52 chars). Owned files:
+   `deploy/deploy.sh`, `d1/seed.sql`. Acceptance: when the COUNT query fails or returns nothing,
+   the deploy aborts before the seed step with a named error (never seeds on a failed
+   measurement); re-running the seed against a non-empty table is a clean no-op; first deploy
+   against an empty table still seeds all 12 rows + 4 briefs + starter experiment; all tests green.
+2. `deploy.sh shares the CI migration tolerate-list verbatim` (55 chars). Owned files:
+   `deploy/deploy.sh` (optionally a shared `deploy/migrate.sh` also called by
+   `.github/workflows/deploy-worker.yml`). Acceptance: both paths apply `schema.sql` then every
+   `d1/migrate-*.sql` in sorted order from one list; a re-run exits 0; a deliberately broken
+   migration exits non-zero with the driver error surfaced (not "already applied"); report the
+   exact file:line changed. No `--remote` execution from the lane.
+3. `verify.sh requires live revision to equal the deployed commit` (59 chars). Owned files:
+   `deploy/verify.sh`. Acceptance: takes an expected SHA (default: current short HEAD); requires
+   the body to parse as JSON with `revision == expected`; retries a stale revision a bounded
+   number of times; fails immediately on an HTML body, an unparsable body, or the
+   `dev-undeployed` placeholder; all existing marker checks behave as today.
+4. `health emits null experiments_by_status when probe 3 fails` (55 chars). Owned files:
+   `functions/api/[[path]].js`, `functions/api/api.test.mjs`. Acceptance: a probe-3 failure
+   yields `experiments_by_status:null` named in `health_probe_failures` while the other nine
+   probes report and `db` reads `up`; the healthy payload stays byte-identical (key order
+   included); the outage contract test is updated; full suite green.

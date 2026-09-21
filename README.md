@@ -44,7 +44,7 @@ wrangler d1 execute aimoney --file=d1/seed.sql
 
 # 3. Deploy everything (Pages site + research worker), then verify
 ./deploy/deploy.sh
-./deploy/verify.sh
+./deploy/verify.sh            # optional arg: expected short SHA (default: current HEAD)
 ```
 
 Admin writes (add opportunity, update status, trigger research) need a bearer
@@ -80,7 +80,7 @@ Agent proposals enter as `researching` with an `UNREVIEWED` marker in notes and 
 
 ## Seed vs live counts
 
-- `d1/seed.sql` inserts 12 researched opportunities. Live boards show more (e.g. 40) because the research agent appends proposals every 6h and humans add rows. Seed runs once on an empty table; live count = 12 seeds + agent proposals + manual adds. Killed rows stay listed, so the count only grows.
+- `d1/seed.sql` inserts 12 researched opportunities. Live boards show more (e.g. 40) because the research agent appends proposals every 6h and humans add rows. Seed runs once on an empty table; live count = 12 seeds + agent proposals + manual adds. Killed rows stay listed, so the count only grows. The seed file is re-runnable (every statement is a no-op when its row already exists) and the deploy.sh seed guard aborts the deploy instead of seeding when it cannot measure the table.
 
 ## Token rotation
 
