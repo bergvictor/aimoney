@@ -613,6 +613,18 @@ async function findStarterForResume(id, starterName) {
   return findPlannedStarter((d && d.experiments) || [], id, starterName);
 }
 
+// Missing-money-column hint (audit 2026-09-20-round3 Task 3): experiment
+// writes against a pre-money D1 503 with `missing column: revenue_cents` (or
+// spent_cents). Pure: map exactly those two to the same migration one-liner
+// the health banner shows, so the write failure names the fix; everything
+// else — revenue_source, timeouts, HTTP errors — passes through byte-identical
+// (an empty suffix). Shared by the five experiment-write catches below
+// (starter, Start, Lose, Win, modal save); opportunity writes never hint.
+const missingMoneyColumnHint = (msg) =>
+  /missing column:\s*(revenue_cents|spent_cents)\b/.test(String(msg ?? ""))
+    ? " — schema migration disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)"
+    : "";
+
 async function vetAndLogStarter(id) {
   if (!await fetchDetailForWrite(id, "Starter")) return;
   return vetAndLogStarterInner(id);
@@ -651,7 +663,7 @@ async function vetAndLogStarterInner(id) {
     await refreshReview();
     if (state.reviewOnly) renderLedger();
     advanceReviewFocus(id, orderBefore);
-  } catch (e) { toast(`Starter failed: ${e.message}`); }
+  } catch (e) { toast(`Starter failed: ${e.message}${missingMoneyColumnHint(e.message)}`); }
 }
 
 async function killOpportunity(id, anchorEl) {
@@ -831,7 +843,7 @@ async function startExperiment(id) {
     });
     toast("Experiment started");
     await refreshTargets({ opportunities: false, runs: false });
-  } catch (e) { toast(`Start failed: ${e.message}`); }
+  } catch (e) { toast(`Start failed: ${e.message}${missingMoneyColumnHint(e.message)}`); }
 }
 
 // One-click Lose for planned/running experiments: one inline input for the
@@ -851,7 +863,7 @@ async function loseExperiment(id, anchorEl) {
     });
     toast("Experiment closed as lost");
     await refreshTargets({ runs: false });
-  } catch (e) { toast(`Close failed: ${e.message}`); }
+  } catch (e) { toast(`Close failed: ${e.message}${missingMoneyColumnHint(e.message)}`); }
   };
   inlinePostMortem(loseContainer, { label: "One-line post-mortem (required to close as lost):", placeholder: "One-line post-mortem (required to close as lost):", confirmText: "Lose", onSubmit: (pm) => doLose(pm), cancelToast: "Close cancelled — post-mortem required." });
 }
@@ -885,7 +897,7 @@ async function winExperiment(id, anchorEl) {
     });
     toast("Experiment closed as won" + (droppedSourceOf(saved) ? droppedSourceSuffix : ""));
     await refreshTargets({ runs: false });
-  } catch (e) { toast(`Close failed: ${e.message}`); }
+  } catch (e) { toast(`Close failed: ${e.message}${missingMoneyColumnHint(e.message)}`); }
   };
   inlineWinClose(winContainer, { label: "One-line post-mortem (required to close as won):", placeholder: "One-line post-mortem (required to close as won):", confirmText: "Win", onSubmit: (pm, revenueCents, revenueSource, spentCents) => doWin(pm, revenueCents, revenueSource, spentCents), cancelToast: "Win cancelled — post-mortem required." });
 }
@@ -1385,7 +1397,7 @@ function openExperimentModal(exp, defaultOpp = null) {
       toast((isNew ? "Experiment logged" : "Experiment updated") + (droppedSourceOf(saved) ? droppedSourceSuffix : ""));
       await refreshTargets({ runs: false });
       if (state.detail) openDrawer(state.detail.opportunity.id);
-    } catch (e) { toast(`Save failed: ${e.message}`); }
+    } catch (e) { toast(`Save failed: ${e.message}${missingMoneyColumnHint(e.message)}`); }
   });
 }
 $("#btn-add-exp").addEventListener("click", () => openExperimentModal(null));
@@ -1418,6 +1430,11 @@ $("#board").addEventListener("click", (ev) => {
 });
 
 /* ---- manual research trigger ---- */
+// Timed like every other write (audit 2026-09-20-round3 Task 2): the POST goes
+// through api() so a hung worker rejects within the 25s write timeout
+// (absolute URLs pass straight into fetch; auth comes from the shared
+// header), the button restores in a finally, and the success toast renders
+// the 202 reason the worker ships instead of a hardcoded sentence.
 $("#btn-run").addEventListener("click", async () => {
   if (!state.token) return toast("Enter the admin token first.");
   const worker = state.meta.worker_url;
@@ -1426,18 +1443,16 @@ $("#btn-run").addEventListener("click", async () => {
   btn.disabled = true;
   btn.textContent = "Triaging…";
   try {
-    const r = await fetch(`${worker}/run`, {
-      method: "POST", headers: { authorization: `Bearer ${state.token}` },
-    });
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
-    toast("Triage started — proposals land in Priority; briefs land on the next cron tick. Watch the Research log.");
+    const body = await api(`${worker}/run`, { method: "POST" });
+    toast(`Triage started — ${body.reason || "triage running"}; briefs land on the next cron tick. Watch the Research log.`);
     // Delayed refresh only: /run returns 202 while the pass runs in waitUntil,
     // so an immediate refresh would re-paint pre-run state.
     setTimeout(refresh, 45000);
   } catch (e) { toast(`Research failed: ${e.message}`); }
-  btn.disabled = false;
-  btn.textContent = "Run triage now (briefs on cron)";
+  finally {
+    btn.disabled = false;
+    btn.textContent = "Run triage now (briefs on cron)";
+  }
 });
 
 /* ---- read-only warnings (no auto-transitions) ---- */

@@ -1985,3 +1985,157 @@ describe("decisions unknown on experiments outage (audit 2026-09-20-round5 Task 
     assert.ok(js.includes("const nudge = (decisions === 0)"), "the nudge must stay gated on a counted 0, never null");
   });
 });
+
+describe("manual triage through timed api (audit 2026-09-20-round3 Task 2)", () => {
+  // Shipped btn-run handler extracted from app.js (not copied) with stubbed
+  // sinks, so these cases fail if the POST leaves the timed api() path, drops
+  // the 202 reason, or moves the guards.
+  function shippedRunHandler() {
+    const start = js.indexOf('$("#btn-run").addEventListener("click"');
+    assert.ok(start !== -1, "app.js lost the btn-run handler");
+    const end = js.indexOf("/* ---- read-only warnings", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the btn-run block boundary");
+    return new Function("state", "$", "api", "toast", "refresh", "setTimeout",
+      `${js.slice(start, end)};`);
+  }
+
+  // Shipped api() extracted for the end-to-end timeout pin (same extractor
+  // shape as the timeout suite above: its helper is scoped to its own
+  // describe, and every suite here owns its extractor).
+  function shippedApi() {
+    const start = js.indexOf("const API_READ_TIMEOUT_MS");
+    assert.ok(start !== -1, "app.js lost API_READ_TIMEOUT_MS");
+    const apiStart = js.indexOf("async function api(", start);
+    assert.ok(apiStart !== -1, "app.js lost async function api");
+    const apiEnd = js.indexOf("\n}\n", apiStart) + 3;
+    assert.ok(apiEnd > apiStart, "app.js api() block never closes");
+    const src = js.slice(start, apiEnd);
+    assert.ok(src.includes("AbortController"), "api() lost its AbortController");
+    assert.ok(src.includes("Promise.race"), "api() lost its timeout race");
+    return new Function("state", "fetch", "AbortController", "setTimeout", "clearTimeout",
+      `${src}; return { api, apiTimeoutMs, API_READ_TIMEOUT_MS, API_WRITE_TIMEOUT_MS };`);
+  }
+
+  function mountRunHandler({ token = "t", workerUrl = "https://worker.example", apiImpl }) {
+    const calls = [];
+    const toasts = [];
+    const api = async (...args) => { calls.push(args); return apiImpl(...args); };
+    const btn = {
+      disabled: false, textContent: "Run triage now (briefs on cron)", listeners: {},
+      addEventListener(ev, fn) { this.listeners[ev] = fn; },
+    };
+    const factory = shippedRunHandler();
+    factory({ token, meta: { worker_url: workerUrl } }, () => btn, api,
+      (m) => toasts.push(m), () => {}, () => {});
+    assert.ok(typeof btn.listeners.click === "function", "handler must register its click listener");
+    return { btn, calls, toasts, click: () => btn.listeners.click() };
+  }
+
+  it("POSTs through api() once and toasts the 202 reason with the cron-tick disclosure", async () => {
+    const h = mountRunHandler({ apiImpl: async () => ({ status: "accepted", briefs_skipped: true, reason: "manual skips brief pass" }) });
+    await h.click();
+    assert.equal(h.calls.length, 1, "tap must cost exactly one POST");
+    assert.equal(h.calls[0][0], "https://worker.example/run", "POST must target the worker /run URL");
+    assert.equal(h.calls[0][1].method, "POST", "tap must POST");
+    assert.equal(h.toasts.length, 1, "tap must toast exactly once");
+    assert.ok(h.toasts[0].includes("manual skips brief pass"), `toast must render the server reason, got: ${h.toasts[0]}`);
+    assert.ok(h.toasts[0].includes("briefs land on the next cron tick"), "toast must keep the where-briefs-land disclosure");
+    assert.equal(h.btn.disabled, false, "button must re-enable after success");
+    assert.equal(h.btn.textContent, "Run triage now (briefs on cron)", "button label must restore after success");
+  });
+
+  it("a hung POST rejects within the write timeout with the button restored (no reload)", async () => {
+    const factory = shippedApi();
+    const neverFetch = () => new Promise(() => {});
+    const { api } = factory({ token: "t" }, neverFetch, AbortController, setTimeout, clearTimeout);
+    const h = mountRunHandler({ apiImpl: (path, opts) => api(path, { ...opts, timeoutMs: 20 }) });
+    const t0 = Date.now();
+    await h.click();
+    assert.ok(Date.now() - t0 < 2000, "hung POST must fail within the timeout, not hang");
+    assert.equal(h.toasts.length, 1, "hung POST must toast exactly once");
+    assert.ok(h.toasts[0].startsWith("Research failed:"), `hung POST must reuse the Research failed toast, got: ${h.toasts[0]}`);
+    assert.ok(/timed out/.test(h.toasts[0]), `hung POST must name the timeout, got: ${h.toasts[0]}`);
+    assert.equal(h.btn.disabled, false, "button must re-enable after a timeout");
+    assert.equal(h.btn.textContent, "Run triage now (briefs on cron)", "button label must restore after a timeout");
+  });
+
+  it("401 and missing-worker_url paths are unchanged", async () => {
+    const denied = mountRunHandler({ apiImpl: async () => { throw new Error("unauthorized"); } });
+    await denied.click();
+    assert.deepEqual(denied.toasts, ["Research failed: unauthorized"], "401 must keep its exact toast");
+    assert.equal(denied.btn.disabled, false, "button must re-enable after a 401");
+    assert.equal(denied.btn.textContent, "Run triage now (briefs on cron)", "button label must restore after a 401");
+    const unconfigured = mountRunHandler({ workerUrl: "", apiImpl: async () => { throw new Error("must not POST without a worker URL"); } });
+    await unconfigured.click();
+    assert.deepEqual(unconfigured.toasts, ["Worker URL not configured (RESEARCH_WORKER_URL)."], "missing worker_url must keep its exact toast");
+    assert.equal(unconfigured.calls.length, 0, "missing worker_url must not POST");
+    const tokenless = mountRunHandler({ token: "", apiImpl: async () => { throw new Error("must not POST without a token"); } });
+    await tokenless.click();
+    assert.deepEqual(tokenless.toasts, ["Enter the admin token first."], "missing token must keep its exact toast");
+    assert.equal(tokenless.calls.length, 0, "missing token must not POST");
+  });
+
+  it("the handler keeps no bare fetch beside api()", () => {
+    const fn = js.slice(js.indexOf('$("#btn-run")'), js.indexOf("/* ---- read-only warnings"));
+    assert.ok(fn.includes("api(`${worker}/run`, {"), "handler must POST through api()");
+    assert.ok(!fn.includes("fetch(`${worker}/run`"), "handler must keep no bare fetch beside api()");
+    assert.ok(fn.includes("body.reason"), "handler must read the 202 reason");
+    assert.ok(fn.includes("finally"), "button restore must live in a finally");
+  });
+});
+
+describe("experiment-write schema hint (audit 2026-09-20-round3 Task 3)", () => {
+  // Shipped helper extracted from app.js (not copied) so these cases fail if
+  // the cents match drifts or the one-liner diverges from the health banner.
+  function shippedMoneyHint() {
+    const start = js.indexOf("const missingMoneyColumnHint");
+    assert.ok(start !== -1, "app.js lost missingMoneyColumnHint");
+    const end = js.indexOf("async function vetAndLogStarter", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the money-hint block boundary");
+    return new Function(`${js.slice(start, end)}; return missingMoneyColumnHint;`)();
+  }
+
+  it("maps exactly the two cents columns to the switch one-liner", () => {
+    const hint = shippedMoneyHint();
+    for (const col of ["revenue_cents", "spent_cents"]) {
+      const suffix = hint(`missing column: ${col}`);
+      assert.ok(suffix.includes("ALLOW_SCHEMA_MIGRATION=1"), `${col} must hint the switch, got: ${suffix}`);
+      assert.ok(suffix.includes("to add missing columns"), `${col} must reuse the health one-liner, got: ${suffix}`);
+    }
+  });
+
+  it("hint reuses the API's exact schema_migration one-liner", () => {
+    const apiJs = readFileSync(join(ROOT, "..", "functions", "api", "[[path]].js"), "utf8");
+    const m = apiJs.match(/schema_migration: "([^"]+)"/);
+    assert.ok(m, "API lost its schema_migration one-liner");
+    const hint = shippedMoneyHint();
+    assert.ok(hint("missing column: revenue_cents").includes(m[1]), `hint must reuse the API one-liner verbatim, got: ${hint("missing column: revenue_cents")}`);
+  });
+
+  it("passes revenue_source and every other error through byte-identical", () => {
+    const hint = shippedMoneyHint();
+    assert.equal(hint("missing column: revenue_source"), "", "revenue_source owns a separate retry path and must never hint the cents migration");
+    assert.equal(hint("request timed out after 25s"), "", "timeouts must pass through untouched");
+    assert.equal(hint("HTTP 500"), "", "HTTP errors must pass through untouched");
+    assert.equal(hint("boom"), "", "generic errors must pass through untouched");
+    assert.equal(hint(""), "", "empty messages must pass through untouched");
+    assert.equal(hint(null), "", "null messages must pass through untouched");
+    assert.equal(hint(undefined), "", "missing messages must pass through untouched");
+  });
+
+  it("all five experiment-write catches hint; opportunity writes never do", () => {
+    assert.equal(js.split("missingMoneyColumnHint(e.message)").length - 1, 5, "exactly the five experiment-write catches must hint (starter, Start, Lose, Win, modal save)");
+    for (const [name, start, end] of [
+      ["starter", "async function vetAndLogStarter", "async function killOpportunity"],
+      ["start", "async function startExperiment", "async function loseExperiment"],
+      ["lose", "async function loseExperiment", "async function winExperiment"],
+      ["win", "async function winExperiment", "function renderExperiments"],
+      ["modal save", "function openExperimentModal", '$("#btn-add-exp")'],
+    ]) {
+      const fn = js.slice(js.indexOf(start), js.indexOf(end));
+      assert.ok(fn.includes("missingMoneyColumnHint(e.message)"), `${name} must hint on a money-column 503`);
+    }
+    const admin = js.slice(js.indexOf("function renderAdminZone"), js.indexOf("/* ---- modals ---- */"));
+    assert.ok(!admin.includes("missingMoneyColumnHint"), "opportunity admin saves must never hint the experiment-cents migration");
+  });
+});
