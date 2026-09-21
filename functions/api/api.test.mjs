@@ -2030,7 +2030,7 @@ describe("vetting path Vet-PATCH-health (audit 2026-09-20-round2 Task 1)", () =>
     assert.equal(after.body.last_verdict, today);
   });
 
-  it("a touch without the tag date does not fake velocity (tag contract, not updated_at)", async () => {
+  it("a tagless UNREVIEWED clear 400s and leaves the row in the queue (audit 2026-09-20-round4 Task 3)", async () => {
     const db = makeDB({
       opportunities: [
         { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" },
@@ -2038,12 +2038,66 @@ describe("vetting path Vet-PATCH-health (audit 2026-09-20-round2 Task 1)", () =>
     });
     const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
       { method: "PATCH", token: "secret", body: { notes: "manually cleared, no tag" } }, db);
+    assert.equal(patch.status, 400);
+    assert.equal(patch.body.field, "notes");
+    assert.ok(String(patch.body.error).includes("verdict tag"), `400 must name the missing verdict tag, got: ${patch.body.error}`);
+    const detail = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1", {}, db);
+    assert.equal(detail.body.opportunity.notes, "Agent proposal — UNREVIEWED", "rejected clear must leave the row untouched");
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.body.unreviewed, 1, "rejected clear must not exit the review queue");
+    assert.equal(health.body.vetted_last_7d, 0);
+    assert.equal(health.body.last_vetted, null);
+    assert.equal(health.body.last_verdict, null);
+  });
+
+  it("a tagged kill PATCH passes the guard and dates the verdict (audit 2026-09-20-round4 Task 3)", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" },
+      ],
+    });
+    const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      { method: "PATCH", token: "secret", body: { status: "killed", notes: `Agent proposal\n[${today} killed] no demand` } }, db);
     assert.equal(patch.status, 200);
     const health = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(health.body.unreviewed, 0);
-    assert.equal(health.body.vetted_last_7d, 0, "clearing UNREVIEWED without a dated tag must not count as vetted");
-    assert.equal(health.body.last_vetted, null);
-    assert.equal(health.body.last_verdict, null);
+    assert.equal(health.body.last_verdict, today);
+    assert.equal(health.body.vetted_last_7d, 0, "kill must not fake the vetted count");
+  });
+
+  it("a malformed tag date still 400s (audit 2026-09-20-round4 Task 3)", async () => {
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" },
+      ],
+    });
+    for (const bad of ["[2026-9-5 vetted] sloppy date", "[09/20/2026 killed] wrong shape", "[vetted] no date"]) {
+      const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+        { method: "PATCH", token: "secret", body: { notes: `Agent proposal\n${bad}` } }, db);
+      assert.equal(patch.status, 400, `malformed tag must 400: ${bad}`);
+    }
+    const detail = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1", {}, db);
+    assert.ok(String(detail.body.opportunity.notes).includes("UNREVIEWED"), "rejected clears must leave the row in the queue");
+  });
+
+  it("a non-notes PATCH on an unreviewed row still passes (guard is clear-only)", async () => {
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" },
+      ],
+    });
+    const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      { method: "PATCH", token: "secret", body: { value: 8, confidence: 6 } }, db);
+    assert.equal(patch.status, 200);
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.body.unreviewed, 1);
+  });
+
+  it("README documents the tagless-clear 400 beside the update guards", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("clears `UNREVIEWED` without"), "README lost the tagless-clear guard");
+    assert.ok(readme.includes("missing verdict tag"), "README lost the verdict-tag marker");
   });
 
   it("Vet without the admin token 401s and leaves health unchanged", async () => {

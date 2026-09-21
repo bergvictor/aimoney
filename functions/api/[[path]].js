@@ -77,6 +77,12 @@ const clamp10 = (v, dflt) => {
   return Math.min(10, Math.max(1, Math.round(n)));
 };
 
+// Review-queue verdict tag (audit 2026-09-20-round4 F4): the dated marker a
+// notes PATCH must append when it clears UNREVIEWED. Same shape the health
+// probes count (vetted_7d SELECT, last_vetted/last_verdict parse) — a
+// malformed date matches nothing, so it can never fake velocity.
+const VERDICT_TAG = /\[\d{4}-\d{2}-\d{2} (vetted|killed)\]/;
+
 // Ledger money: integer cents to fixed-2dp dollars ($10.50, never $10.5).
 // Mirrors public/app.js moneyCents so drawer and ledger agree.
 const centsDollars = (cents) => "$" + (Number(cents) / 100).toFixed(2);
@@ -242,6 +248,17 @@ async function updateOpportunity(request, env, id) {
   }
   if (next.est_monthly_low > next.est_monthly_high) {
     return json({ error: "est_monthly_low must be <= est_monthly_high", field: "est_monthly_low" }, 400);
+  }
+  // Tagless-clear guard (audit 2026-09-20-round4 F4): a notes PATCH that
+  // drops UNREVIEWED without appending a dated verdict tag would silently
+  // exit the review queue uncounted (unreviewed drops, vetted_last_7d never
+  // rises, no verdict date). Reject it; the row stays untouched. The
+  // dashboard never sends this shape (every cleanUnreviewed call site appends
+  // a tag), so only raw-API misuse changes shape.
+  if (String(cur.notes || "").includes("UNREVIEWED") &&
+      !String(next.notes || "").includes("UNREVIEWED") &&
+      !VERDICT_TAG.test(String(next.notes || ""))) {
+    return json({ error: "clearing UNREVIEWED requires a [YYYY-MM-DD vetted] or [YYYY-MM-DD killed] verdict tag", field: "notes" }, 400);
   }
   if (Array.isArray(b.skills_needed)) next.skills_needed = JSON.stringify(b.skills_needed);
   next.score = effectiveScore(next);

@@ -379,6 +379,10 @@ export async function runResearch(env, trigger) {
     // signal URL is linked as supports before triage — reversible, notes
     // newest-kept, no status move. Linked rows leave `fresh` in place, so the
     // classify prompt and verdict indices below only see genuinely new signals.
+    // Best-effort (audit 2026-09-20-round4 F5): a failed link is skipped and
+    // counted, never thrown — one flaky write must not abort the tick's triage
+    // and brief passes. Skipped signals stay processed = 0 for a later tick.
+    let prepassFailed = 0;
     if (fresh.length) {
       // Bounded pre-pass (F4): match only the ≤6 fresh URLs in SQL instead of
       // loading two full-table URL sets. Empty URLs never match (exactUrlTarget
@@ -399,8 +403,9 @@ export async function runResearch(env, trigger) {
       for (const sig of fresh) {
         const target = exactUrlTarget(sig.url, oppUrls, linkedUrls);
         if (target === null) { rest.push(sig); continue; }
+        const linked = await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(target, sig.id).run().then(() => true, () => false);
+        if (!linked) { prepassFailed++; continue; }
         state.updated++;
-        await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(target, sig.id).run();
         await env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, target).run().catch(() => null);
       }
       fresh.length = 0;
@@ -626,7 +631,7 @@ export async function runResearch(env, trigger) {
     }
     // Single run-log write carrying the brief mode (a bare finish used to run
     // first and be overwritten here).
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : "") + (prepassFailed ? ` prepass:${prepassFailed}_failed` : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);

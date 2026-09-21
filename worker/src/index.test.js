@@ -1345,3 +1345,120 @@ describe("top-scored brief skips killed/paused (audit 2026-09-20-round2 Task 3)"
     assert.ok(readme.includes("top-scored excluding killed/paused"), "README lost the decided-row exclusion");
   });
 });
+
+describe("best-effort pre-pass link (audit 2026-09-20-round4 Task 4)", () => {
+  // Drives the real runResearch on the cron trigger against a stubbed D1:
+  // two fresh signals whose URLs exactly match existing opportunity
+  // source_urls (so the pre-pass attempts both links), a stub that throws
+  // once on the pre-pass signal UPDATE, and one bare row for the brief pass.
+  // The tick must still finish ok with briefs; the failed link is skipped
+  // and counted (prepass:1_failed) while the good link still counts updated.
+  const BRIEF_JSON = JSON.stringify({
+    summary: "Terse summary of the opportunity.", what_works: "Do X.",
+    numbers: [], risks: "Low.", first_steps: "1. Ship the smallest test.",
+  });
+
+  function stubEnv() {
+    const now = new Date().toISOString();
+    const signals = [
+      { id: 101, source: "hn", title: "Signal A", url: "https://example.com/match-a", snippet: "s", processed: 0, opportunity_id: null },
+      { id: 102, source: "hn", title: "Signal B", url: "https://example.com/match-b", snippet: "s", processed: 0, opportunity_id: null },
+    ];
+    const opps = [
+      { id: 7, source_url: "https://example.com/match-a" },
+      { id: 8, source_url: "https://example.com/match-b" },
+    ];
+    const bareRow = { id: 7, title: "Bare row", one_liner: "needs evidence", score: 9000, notes: "UNREVIEWED", created_at: now };
+    const briefedIds = [];
+    let runError = "";
+    let throwOnce = true;
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("SELECT o.* FROM opportunities o LEFT JOIN briefs")) return bareRow;
+            if (sql.includes("SELECT created_at FROM opportunities")) return { created_at: now };
+            if (sql.includes("LEFT JOIN briefs")) return { n: 1 };
+            if (sql.includes("FROM opportunities WHERE notes LIKE")) return { n: 1 };
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) {
+              const limit = Number(stmt.params[0]) || signals.length;
+              return { results: signals.filter((s) => s.processed === 0).slice(0, limit) };
+            }
+            if (sql.includes("SELECT id, source_url FROM opportunities WHERE source_url IN")) {
+              const wanted = new Set(stmt.params);
+              return { results: opps.filter((o) => wanted.has(o.source_url)) };
+            }
+            if (sql.includes("SELECT url, opportunity_id FROM signals WHERE opportunity_id IS NOT NULL")) {
+              return { results: [] };
+            }
+            if (sql.includes("SELECT title, url, snippet FROM signals")) {
+              briefedIds.push(stmt.params[0]);
+              return { results: [] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.startsWith("UPDATE signals SET processed=1, opportunity_id")) {
+              if (throwOnce) {
+                throwOnce = false;
+                throw new Error("D1 flap on pre-pass link");
+              }
+              const [oppId, sigId] = stmt.params;
+              const s = signals.find((x) => x.id === sigId);
+              if (s) { s.processed = 1; s.opportunity_id = oppId; }
+              return {};
+            }
+            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) {
+              return { meta: { changes: 0 } };
+            }
+            if (sql.includes("UPDATE agent_runs SET finished_at")) {
+              runError = String(stmt.params[6] || "");
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = { run: async () => ({ response: BRIEF_JSON }) };
+    return { env: { DB, AI }, signals, briefedIds, runError: () => runError };
+  }
+
+  it("one flaky pre-pass write still finishes ok with briefs; failed link counted, updated on success", async () => {
+    _resetBriefSkippedForTests();
+    const t = stubEnv();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    try {
+      const result = await runResearch(t.env, "cron");
+      assert.equal(result.status, "ok", `run failed: ${result.error || "(no error)"}`);
+      assert.ok(result.briefs >= 1, "tick must still write at least one brief after a pre-pass throw");
+      assert.deepEqual(t.briefedIds, [7], "tick must still brief the bare row after a pre-pass throw");
+      assert.ok(t.runError().includes("brief:top-scored"), `run log must name the brief mode: ${t.runError()}`);
+      assert.ok(t.runError().includes("prepass:1_failed"), `run log must count the skipped link: ${t.runError()}`);
+      assert.equal(result.updated, 1, "updated must count only the successful link");
+      assert.deepEqual(t.signals.map((s) => s.processed), [0, 1], "failed link must stay processed = 0 for a later tick");
+    } finally {
+      globalThis.fetch = realFetch;
+      _resetBriefSkippedForTests();
+    }
+  });
+
+  it("README documents the best-effort pre-pass beside the exact-URL rule", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("failed link is skipped and counted"), "README lost the best-effort pre-pass rule");
+    assert.ok(readme.includes("prepass:N_failed"), "README lost the prepass:N_failed marker");
+  });
+});
