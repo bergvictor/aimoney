@@ -429,3 +429,42 @@ describe("agentMoneyEstimates zero-spend normalization (audit 2026-09-20-round2 
     assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
   });
 });
+
+describe("hygiene: dead rails gone, shared auth (audit 2026-09-20-round1 Task 4)", () => {
+  it("drops the unenforced deadline, the unused import, and the slice-or-string mismatch", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(!src.includes("BRIEF_DEADLINE_MS"), "worker still ships the unenforced deadline constant");
+    assert.ok(!src.includes("scoreOf"), "worker still imports the unused scoreOf");
+    assert.ok(!src.includes("ai-side-project"), "worker still lists the unfetched GitHub query");
+    assert.ok(!src.includes("slice(0, 2)"), "worker still slices the GitHub query list");
+    assert.ok(src.includes("const queries = GITHUB_QUERIES;"), "worker lost the GitHub query list");
+    assert.ok(src.includes("failed === queries.length"), "github lost its all-queries-failed check");
+  });
+
+  it("all three worker token checks use the shared constant-time compare", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(!src.includes("got !== want"), "worker still compares tokens with !==");
+    assert.equal(src.split("tokensMatch(got, want)").length - 1, 3, "ping-ai, debug-classify, and run must all use tokensMatch");
+    assert.ok(src.includes("tokensMatch } from \"./lib.js\""), "worker must import tokensMatch from lib.js");
+  });
+
+  it("wrong or missing tokens still 401 on run, ping-ai, and debug-classify", async () => {
+    const env = { ADMIN_TOKEN: "secret", DB: null, AI: null };
+    const ctx = { waitUntil() {} };
+    const wrong = new Request("http://localhost/run", {
+      method: "POST",
+      headers: { authorization: "Bearer [REDACTED]" },
+    });
+    assert.equal((await worker.fetch(wrong, env, ctx)).status, 401);
+    const missing = new Request("http://localhost/run", { method: "POST" });
+    assert.equal((await worker.fetch(missing, env, ctx)).status, 401);
+    const ping = new Request("http://localhost/ping-ai", { method: "GET" });
+    assert.equal((await worker.fetch(ping, env, ctx)).status, 401);
+    const debug = new Request("http://localhost/debug-classify", { method: "GET" });
+    assert.equal((await worker.fetch(debug, env, ctx)).status, 401);
+  });
+
+  // Correct-token acceptance stays pinned by the pre-existing 202 test in
+  // "manual run disclosure (/run)" above: it passes the same token the
+  // shared compare now checks, so no second copy is kept here.
+});

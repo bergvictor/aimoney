@@ -2,7 +2,7 @@
 // Run: npm test  (node --test, no framework)
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { clamp10, slugify, scoreOf, parseJsonLines, repairJson, effectiveScore, isUnreviewed, appendKeepNewest, UNREVIEWED_SCORE_CAP } from "./lib.js";
+import { clamp10, slugify, scoreOf, parseJsonLines, repairJson, effectiveScore, isUnreviewed, appendKeepNewest, UNREVIEWED_SCORE_CAP, tokensMatch } from "./lib.js";
 
 describe("scoreOf", () => {
   it("matches the documented formula", () => {
@@ -98,5 +98,21 @@ describe("appendKeepNewest (F4)", () => {
   it("returns the whole string when short", () => {
     assert.equal(appendKeepNewest("a", "b"), "ab");
     assert.equal(appendKeepNewest("", ""), "");
+  });
+});
+
+describe("tokensMatch (F8 shared constant-time compare)", () => {
+  it("accepts the exact token only", () => {
+    assert.equal(tokensMatch("secret", "secret"), true);
+    assert.equal(tokensMatch("secret", "secret2"), false);
+    assert.equal(tokensMatch("secret2", "secret"), false);
+    assert.equal(tokensMatch("secreu", "secret"), false);
+  });
+  it("rejects empty and missing tokens on either side", () => {
+    assert.equal(tokensMatch("", "secret"), false);
+    assert.equal(tokensMatch("secret", ""), false);
+    assert.equal(tokensMatch("", ""), false);
+    assert.equal(tokensMatch(null, "secret"), false);
+    assert.equal(tokensMatch("secret", null), false);
   });
 });

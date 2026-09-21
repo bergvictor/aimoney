@@ -1190,12 +1190,29 @@ describe("list needs_review bit + excerpt cap (audit 2026-09-20-round3 Task 2)",
 
 describe("health outage honesty (audit 2026-09-20-round2 Task 1)", () => {
   const COUNT_KEYS = ["opportunities", "unreviewed", "bare_without_brief", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h"];
+  // Total outage: the batch AND every individual statement fail, so the
+  // isolation fallback finds zero answering probes (a batch-only throw now
+  // recovers via the per-probe re-run below).
   const downDB = () => {
     const db = makeDB({ opportunities: oppSeed() });
-    return { ...db, batch: async () => { throw new Error("D1 down"); } };
+    return {
+      ...db,
+      batch: async () => { throw new Error("D1 down"); },
+      prepare: (sql) => {
+        const stmt = {
+          _sql: sql,
+          _args: [],
+          bind(...a) { stmt._args = a; return stmt; },
+          all: async () => { throw new Error("D1 down"); },
+          first: async () => { throw new Error("D1 down"); },
+          run: async () => { throw new Error("D1 down"); },
+        };
+        return stmt;
+      },
+    };
   };
 
-  it("failed batch returns HTTP 200 with ok:false, db down, and null counters", async () => {
+  it("total outage returns HTTP 200 with ok:false, db down, and null counters", async () => {
     const r = await callApi(["health"], "http://localhost/api/health", {}, downDB());
     assert.equal(r.status, 200);
     assert.equal(r.body.ok, false);
@@ -1223,6 +1240,81 @@ describe("health outage honesty (audit 2026-09-20-round2 Task 1)", () => {
     assert.ok(src.includes('if (typeof h === "number" && Number.isFinite(h))'), "dashboard lost the oldest-age typeof guard");
     assert.ok(src.includes("state.health.bare_without_brief"), "dashboard lost its bare-count consumer");
     assert.ok(src.includes('(typeof n === "number" && Number.isFinite(n))'), "dashboard lost the bare-count typeof guard");
+  });
+});
+
+describe("health probe isolation (audit 2026-09-20-round1 Task 1)", () => {
+  // One bad probe (the lifetime-totals SELECT, as on live when the revenue
+  // migration never applied): the batch rejects and that statement fails
+  // individually too, while the other nine answer.
+  const oneBadProbeDB = () => {
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: new Date().toISOString(), revenue_cents: 50000, spent_cents: 1200 },
+      ],
+    });
+    const realPrepare = db.prepare.bind(db);
+    return {
+      ...db,
+      batch: async () => { throw new Error("no such column: revenue_cents"); },
+      prepare: (sql) => {
+        const stmt = realPrepare(sql);
+        if (sql.includes("SUM(spent_cents)") && !sql.includes("-7 days")) {
+          stmt.all = async () => { throw new Error("no such column: spent_cents"); };
+          stmt.first = async () => { throw new Error("no such column: spent_cents"); };
+        }
+        return stmt;
+      },
+    };
+  };
+
+  it("failed batch with nine answering probes reports their numbers, db up", async () => {
+    const r = await callApi(["health"], "http://localhost/api/health", {}, oneBadProbeDB());
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.db, "up");
+    assert.equal(r.body.opportunities, 3);
+    assert.equal(r.body.unreviewed, 2);
+    assert.equal(r.body.bare_without_brief, 3);
+    assert.deepEqual(r.body.experiments_by_status, { won: 1 });
+    assert.equal(r.body.decisions_last_7d, 1);
+    assert.equal(r.body.revenue_last_7d, 50000);
+    assert.equal(r.body.vetted_last_7d, 0);
+    assert.equal(r.body.vetted_no_experiment, 0);
+    assert.equal(r.body.noise_24h, 0);
+    assert.equal(r.body.revenue_total, null);
+    assert.equal(r.body.spent_total, null);
+  });
+
+  it("names the failing probe, keeps existing keys byte-identical for verify.sh", async () => {
+    const r = await callApi(["health"], "http://localhost/api/health", {}, oneBadProbeDB());
+    assert.deepEqual(r.body.health_probe_failures, ["revenue_lifetime"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures"]);
+    assert.ok(JSON.stringify(r.body).includes('"ok":true'), "partial payload must keep the verify.sh marker");
+  });
+
+  it("db reads up when the database answers even if the count probe itself fails", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const realPrepare = db.prepare.bind(db);
+    const probe0Down = {
+      ...db,
+      batch: async () => { throw new Error("probe 0 bad"); },
+      prepare: (sql) => {
+        const stmt = realPrepare(sql);
+        if (sql.includes("COUNT(*)") && sql.includes("FROM opportunities") && !sql.includes("WHERE")) {
+          stmt.first = async () => { throw new Error("probe 0 bad"); };
+        }
+        return stmt;
+      },
+    };
+    const r = await callApi(["health"], "http://localhost/api/health", {}, probe0Down);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.db, "up");
+    assert.equal(r.body.opportunities, null);
+    assert.equal(r.body.unreviewed, 2);
+    assert.deepEqual(r.body.health_probe_failures, ["opportunities"]);
   });
 });
 
@@ -1273,5 +1365,42 @@ describe("one-click Lose (audit 2026-09-20-round2 Task 2)", () => {
     assert.ok(noPm.body.fields && noPm.body.fields.post_mortem);
     assert.equal(db.data.experiments[0].status, "planned");
     assert.equal(db.data.experiments[0].ended_at, "");
+  });
+});
+
+describe("opportunity update bounds (audit 2026-09-20-round1 Task 4)", () => {
+  it("PATCH truncates oversized strings exactly like create", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const seen = [];
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql) => {
+      const stmt = realPrepare(sql);
+      if (sql.includes("UPDATE opportunities SET") && !sql.includes("substr")) {
+        const realBind = stmt.bind.bind(stmt);
+        stmt.bind = (...a) => { seen.push(a); return realBind(...a); };
+      }
+      return stmt;
+    };
+    const r = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      {
+        method: "PATCH",
+        token: "secret",
+        body: {
+          title: "t".repeat(300), one_liner: "o".repeat(600), category: "c".repeat(50),
+          time_to_first_dollar: "w".repeat(200), capital_needed: "m".repeat(200),
+          source: "s".repeat(50), source_url: "u".repeat(600), notes: "n".repeat(9000),
+        },
+      }, db);
+    assert.equal(r.status, 200);
+    assert.equal(seen.length, 1);
+    const args = seen[0];
+    assert.equal(args[0].length, 200);
+    assert.equal(args[1].length, 500);
+    assert.equal(args[2].length, 40);
+    assert.equal(args[11].length, 120);
+    assert.equal(args[12].length, 120);
+    assert.equal(args[14].length, 40);
+    assert.equal(args[15].length, 500);
+    assert.equal(args[16].length, 8000);
   });
 });

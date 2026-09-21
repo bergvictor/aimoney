@@ -18,14 +18,13 @@ const MAX_AI_CALLS = 4;
 const FETCH_TIMEOUT_MS = 6000;
 const CLASSIFY_TOKENS = 1200;
 const BRIEF_TOKENS = 1500;
-const BRIEF_DEADLINE_MS = 18000; // skip the brief pass past this elapsed time
 // Runs stuck in "running" past this are declared dead by the next run.
 const STUCK_RUN_MINUTES = 30;
 
 const HN_QUERIES = ["AI passive income", "AI SaaS revenue", "AI automation agency", "make money with AI"];
 const REDDIT_QUERIES = ["AI side income", "AI SaaS", "AI agency"];
 const REDDITS = "SideProject+Entrepreneur+alphaandbeta+startups";
-const GITHUB_QUERIES = ["ai-saas-boilerplate", "ai-money", "ai-side-project"];
+const GITHUB_QUERIES = ["ai-saas-boilerplate", "ai-money"];
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -103,8 +102,7 @@ async function redditSignals(state) {
 }
 
 async function githubSignals(state) {
-  // Same failure accounting as hnSignals (against the fetched slice, not the
-  // full query list, so a 2-of-2 outage still reports).
+  // Same failure accounting as hnSignals: all queries failed names the source.
   let failed = 0;
   const since = new Date(Date.now() - 90 * 864e5).toISOString().slice(0, 10);
   const one = async (q) => {
@@ -125,7 +123,7 @@ async function githubSignals(state) {
     } catch { failed++; /* unauth rate limit is 10 req/min; fine at this volume */ }
     return out;
   };
-  const queries = GITHUB_QUERIES.slice(0, 2);
+  const queries = GITHUB_QUERIES;
   const rows = (await Promise.all(queries.map(one))).flat();
   if (failed === queries.length) state.src_fail.push("github");
   return rows;
@@ -152,7 +150,7 @@ async function aiComplete(env, state, { model, fallback, maxTokens, messages, ti
   throw lastErr || new Error("AI failed");
 }
 
-import { clamp10, slugify, scoreOf, effectiveScore, parseJsonLines, repairJson } from "./lib.js";
+import { clamp10, slugify, effectiveScore, parseJsonLines, repairJson, tokensMatch } from "./lib.js";
 
 // Agent money estimates (F1): the triage verdict may carry est_monthly_low,
 // est_monthly_high, capital_needed, and time_to_first_dollar for "new" rows.
@@ -538,7 +536,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/ping-ai") {
       const want = (env.ADMIN_TOKEN || "").trim();
       const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
-      if (!want || got !== want) return json({ error: "unauthorized" }, 401);
+      if (!tokensMatch(got, want)) return json({ error: "unauthorized" }, 401);
       const t0 = Date.now();
       try {
         const r = await env.AI.run(AI_CLASSIFY, {
@@ -553,7 +551,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/debug-classify") {
       const want = (env.ADMIN_TOKEN || "").trim();
       const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
-      if (!want || got !== want) return json({ error: "unauthorized" }, 401);
+      if (!tokensMatch(got, want)) return json({ error: "unauthorized" }, 401);
       const fresh = await env.DB.prepare(
         "SELECT * FROM signals WHERE processed = 0 ORDER BY id ASC LIMIT ?")
         .bind(MAX_AI_SIGNALS).all().then((r) => r.results || []);
@@ -584,7 +582,7 @@ export default {
     if (request.method === "POST" && url.pathname === "/run") {
       const want = (env.ADMIN_TOKEN || "").trim();
       const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
-      if (!want || got !== want) return json({ error: "unauthorized" }, 401);
+      if (!tokensMatch(got, want)) return json({ error: "unauthorized" }, 401);
       // Accepted, not awaited: a research pass outlives the fetch-handler
       // wall clock, so it runs in waitUntil exactly like the cron path.
       // Watch progress at GET / and in the dashboard research log.

@@ -7,7 +7,7 @@ const json = (data, status = 200) =>
     headers: { "content-type": "application/json; charset=utf-8" },
   });
 
-import { effectiveScore } from "../../worker/src/lib.js";
+import { effectiveScore, tokensMatch } from "../../worker/src/lib.js";
 
 // release.json is deploy-static: its revision is fetched once per isolate and
 // reused by every later /api/health call (a failed fetch retries next call).
@@ -29,10 +29,8 @@ function authed(request, env) {
   const want = (env.ADMIN_TOKEN || "").trim();
   if (!want) return { ok: false, reason: "writes disabled (ADMIN_TOKEN not set)" };
   const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
-  if (!got || got.length !== want.length) return { ok: false, reason: "bad token" };
-  let diff = 0;
-  for (let i = 0; i < want.length; i++) diff |= want.charCodeAt(i) ^ got.charCodeAt(i);
-  return diff === 0 ? { ok: true } : { ok: false, reason: "bad token" };
+  if (!tokensMatch(got, want)) return { ok: false, reason: "bad token" };
+  return { ok: true };
 }
 
 const OPP_FIELDS = ["slug", "title", "one_liner", "category", "status", "value",
@@ -144,9 +142,13 @@ async function updateOpportunity(request, env, id) {
   if (!cur) return json({ error: "not found" }, 404);
   const b = await request.json().catch(() => ({}));
   const next = { ...cur };
-  for (const f of ["title", "one_liner", "category", "time_to_first_dollar",
-      "capital_needed", "source", "source_url", "notes"]) {
-    if (b[f] !== undefined) next[f] = String(b[f]);
+  // Same bounds as createOpportunity: an unbounded PATCH must not write past
+  // the newest-kept idiom every other writer honors (F7).
+  const OPP_TEXT_BOUNDS = { title: 200, one_liner: 500, category: 40,
+    time_to_first_dollar: 120, capital_needed: 120, source: 40,
+    source_url: 500, notes: 8000 };
+  for (const f of Object.keys(OPP_TEXT_BOUNDS)) {
+    if (b[f] !== undefined) next[f] = String(b[f]).slice(0, OPP_TEXT_BOUNDS[f]);
   }
   if (b.status !== undefined && !OPP_STATUSES.has(b.status)) {
     return json({ error: "invalid status: " + String(b.status).slice(0, 40), field: "status" }, 400);
@@ -379,6 +381,12 @@ export async function onRequest(context) {
       for (let i = 0; i < 7; i++) vettedDays.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
       // One batched round-trip for every independent health select (paired
       // scans merged: decisions+revenue, lifetime totals, unreviewed+oldest).
+      // Probe names for the isolation fallback: when the batch rejects, each
+      // statement re-runs individually and the failing probe is named in
+      // `health_probe_failures` instead of blanking the whole report (F1).
+      const healthProbeNames = ["opportunities", "unreviewed", "bare_without_brief",
+        "experiments_by_status", "last_ok_run", "decisions_revenue_week",
+        "revenue_lifetime", "vetted_7d", "vetted_no_experiment", "noise_24h"];
       const healthStmts = env.DB ? [
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities"),
         env.DB.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM opportunities WHERE notes LIKE '%UNREVIEWED%'"),
@@ -391,11 +399,43 @@ export async function onRequest(context) {
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
         env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso),
       ] : [];
-      const healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;
-      // A failed batch must read as an outage, not as zeros: ok flips to
-      // false (so the unchanged verify.sh '"ok":true' grep fails the rollout)
-      // and every count key goes null — the dashboard typeof-guards each one.
+      let healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;
+      // Isolation fallback (F1): one bad probe (e.g. a SELECT touching a
+      // column a migration never applied) must not fail the other nine. When
+      // the batch rejects, each statement re-runs individually: the healthy
+      // probes still report, only the failing counts go null, and `db` reads
+      // by whether the database answered at all. A total outage keeps the
+      // exact outage payload (ok:false, db down, all null, no new key).
+      let healthProbeFailures = null;
+      if (!healthRes && healthStmts.length) {
+        const perProbe = [];
+        const failed = [];
+        for (let i = 0; i < healthStmts.length; i++) {
+          try {
+            if (i === 3) perProbe.push(await healthStmts[i].all());
+            else {
+              const row = await healthStmts[i].first();
+              perProbe.push({ results: row ? [row] : [] });
+            }
+          } catch {
+            perProbe.push(null);
+            failed.push(healthProbeNames[i] || String(i));
+          }
+        }
+        if (perProbe.some((r) => r !== null)) {
+          healthRes = perProbe;
+          healthProbeFailures = failed;
+        }
+      }
+      // A batch with zero answering probes reads as an outage, not as zeros:
+      // ok flips to false (so the unchanged verify.sh '"ok":true' grep fails
+      // the rollout) and every count key goes null — the dashboard
+      // typeof-guards each one.
       const healthDown = !healthRes;
+      // Partial-failure honesty: a probe the fallback could not run reports
+      // null for its counts (never 0) — the dashboard typeof-guards each one.
+      const probeFailed = (i) =>
+        healthProbeFailures !== null && healthProbeFailures.includes(healthProbeNames[i]);
       const firstRow = (i) => (healthRes && healthRes[i] && healthRes[i].results && healthRes[i].results[0]) || null;
       const db = firstRow(0);
       const unreviewedRow = firstRow(1);
@@ -436,7 +476,7 @@ export async function onRequest(context) {
           if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
         }
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db ? "up" : "down"), opportunities: healthDown ? null : (db ? db.n : 0), unreviewed: healthDown ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: healthDown ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: healthDown ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: healthDown ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: healthDown ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: healthDown ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: healthDown ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: healthDown ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: healthDown ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString() });
+      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(5)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(6)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(6)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(7)) ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: (healthDown || probeFailed(8)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(9)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}) });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

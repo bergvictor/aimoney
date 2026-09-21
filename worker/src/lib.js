@@ -31,6 +31,19 @@ export function effectiveScore(o) {
   return isUnreviewed(o) ? Math.min(s, UNREVIEWED_SCORE_CAP) : s;
 }
 
+// Constant-time admin-token compare (F8): the same ADMIN_TOKEN value guards
+// the API and the worker, so both import this shared implementation instead of
+// `!==` (which leaks timing information about the secret). Lengths compare
+// first, then every charCode pair XORs into one accumulator.
+export function tokensMatch(got, want) {
+  const g = String(got || "");
+  const w = String(want || "");
+  if (!g || !w || g.length !== w.length) return false;
+  let diff = 0;
+  for (let i = 0; i < w.length; i++) diff |= w.charCodeAt(i) ^ g.charCodeAt(i);
+  return diff === 0;
+}
+
 // Evidence append (F4): keep the NEWEST max chars, not the oldest.
 // Mirrors the SQL fix `substr(notes || ?, -8000)` in worker/src/index.js.
 export function appendKeepNewest(notes, addition, max = 8000) {

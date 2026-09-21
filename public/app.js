@@ -408,8 +408,6 @@ async function vetOpportunity(id) {
 
 async function vetOpportunityInner(id) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
-  // (modal gate above supersedes the toast gate on the next line)
-  if (!state.token) return toast("Enter the admin token first.");
   const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
   if (!o) return;
   const day = new Date().toISOString().slice(0, 10);
@@ -490,8 +488,6 @@ async function killOpportunity(id, anchorEl) {
 
 async function killOpportunityInner(id, anchorEl) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
-  // (modal gate above supersedes the toast gate on the next line)
-  if (!state.token) return toast("Enter the admin token first.");
   const killContainer = (anchorEl ? (anchorEl.closest(".review-actions") || anchorEl.closest(".card") || anchorEl.parentElement) : null) || document.querySelector("#ledger-body") || document.body;
   const doKill = async (pm) => {
   // (cancel handled by inline row: empty still cancels, row untouched)
@@ -575,8 +571,6 @@ function focusNudgeCard(nudge) {
 // (d1/seed.sql) — a human still presses it.
 async function startExperiment(id) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
-  // (modal gate above supersedes the toast gate on the next line)
-  if (!state.token) return toast("Enter the admin token first.");
   try {
     await api(`/api/experiments/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
@@ -594,8 +588,6 @@ async function startExperiment(id) {
 // inline line cancels with the row untouched. Human-pressed, one decision.
 async function loseExperiment(id, anchorEl) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
-  // (modal gate above supersedes the toast gate on the next line)
-  if (!state.token) return toast("Enter the admin token first.");
   const loseContainer = (anchorEl ? (anchorEl.closest(".card") || anchorEl.closest(".review-actions") || anchorEl.parentElement) : null) || document.querySelector("#board") || document.body;
   const doLose = async (pm) => {
   // (cancel handled by inline row: empty still cancels, row untouched)
@@ -620,8 +612,6 @@ async function loseExperiment(id, anchorEl) {
 // exactly like the modal. Human-pressed, one decision.
 async function winExperiment(id, anchorEl) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
-  // (modal gate above supersedes the toast gate on the next line)
-  if (!state.token) return toast("Enter the admin token first.");
   const winContainer = (anchorEl ? (anchorEl.closest(".card") || anchorEl.closest(".review-actions") || anchorEl.parentElement) : null) || document.querySelector("#board") || document.body;
   const doWin = async (pm, revenueCents, revenueSource) => {
   // (cancel handled by inline row: empty still cancels, row untouched)

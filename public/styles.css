@@ -208,6 +208,8 @@ footer {
   * { transition: none !important; animation: none !important; }
 }
 @media (max-width: 760px) {
-  .masthead h1 { font-size: 26px; }
+  .masthead-inner { padding: 16px 16px 12px; gap: 12px; }
+  .masthead h1 { font-size: 22px; }
+  .lede { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .formula { display: none; }
 }

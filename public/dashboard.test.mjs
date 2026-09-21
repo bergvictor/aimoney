@@ -778,3 +778,55 @@ describe("meta once + delayed-only triage refresh (audit 2026-09-20-round1 Task 
     assert.ok(!fn.includes("await refresh()"), "manual run still paints an immediate no-op refresh");
   });
 });
+
+describe("five-second read (audit 2026-09-20-round1 Task 3)", () => {
+  it("Start-here strip renders above the filter toolbar inside #tab-priority", () => {
+    const stripAt = html.indexOf('id="start-here"');
+    const toolbarAt = html.indexOf('<div class="toolbar">');
+    const sectionAt = html.indexOf('id="tab-priority"');
+    assert.ok(stripAt !== -1 && toolbarAt !== -1, "index.html lost #start-here or the toolbar");
+    assert.ok(sectionAt !== -1 && sectionAt < stripAt, "#start-here must stay inside #tab-priority");
+    assert.ok(stripAt < toolbarAt, "#start-here must sit above the filter toolbar");
+  });
+
+  it("strip keeps the #1 pick with $/mo, capital, next action, and Vet/Kill-or-drawer actions", () => {
+    assert.ok(js.includes("money(top.est_monthly_low, top.est_monthly_high)"), "strip lost the $/mo range");
+    assert.ok(js.includes("Capital: ${esc(top.capital_needed"), "strip lost the capital line");
+    assert.ok(js.includes("firstStepsFirstLine({ first_steps: top.brief_first_steps })"), "strip lost the brief next action");
+    assert.ok(js.includes('id="start-here-open"'), "strip lost its drawer opener button");
+    assert.ok(js.includes("openDrawer(top.id)"), "strip must deep-link via openDrawer(top.id)");
+    assert.ok(js.includes('id="start-here-vet"'), "strip lost its Vet button");
+    assert.ok(js.includes('id="start-here-kill"'), "strip lost its Kill button");
+  });
+
+  it("mobile masthead compacts so the strip reads without scrolling on a 360px phone", () => {
+    const mobileAt = css.indexOf("@media (max-width: 760px)");
+    assert.ok(mobileAt !== -1, "styles.css lost the mobile block");
+    const mobile = css.slice(mobileAt);
+    assert.ok(/\.masthead h1 \{ font-size: 22px/.test(mobile), "mobile headline must shrink to 22px");
+    assert.ok(/\.lede \{[^}]*text-overflow: ellipsis/.test(mobile), "mobile lede must collapse to one ellipsized line");
+    assert.ok(/\.masthead-inner \{[^}]*padding: 16px 16px 12px/.test(mobile), "mobile masthead must tighten its padding");
+  });
+
+  it("every filter, tab, and handler behaves exactly as today", () => {
+    for (const chip of ['data-status=""', 'data-status="backlog"', 'data-status="researching"', 'data-status="testing"', 'data-status="scaling"', 'data-status="killed"', 'data-zero="1"', 'data-review="1"']) {
+      assert.ok(html.includes(chip), `index.html lost the ${chip} chip`);
+    }
+    assert.ok(html.includes('id="btn-add"'), "index.html lost the Add opportunity button");
+    for (const tab of ['data-tab="priority"', 'data-tab="experiments"', 'data-tab="research"']) {
+      assert.ok(html.includes(tab), `index.html lost the ${tab} tab`);
+    }
+    assert.ok(js.includes("chip.dataset.zero"), "chip handler ignores the Zero spend chip");
+    assert.ok(js.includes("chip.dataset.review"), "chip handler ignores the review chip");
+    assert.ok(js.includes("chip.dataset.status"), "chip handler ignores the status chips");
+    assert.ok(js.includes("renderStartHere()"), "ledger render lost the strip call");
+  });
+});
+
+describe("dead toast gates (audit 2026-09-20-round1 Task 4)", () => {
+  it("unreachable toast gates behind modal returns are gone; live gates stay", () => {
+    assert.ok(!js.includes("supersedes the toast gate"), "app.js still ships dead toast gates");
+    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 9, "modal gates must stay at 9");
+    assert.equal(js.split('return toast("Enter the admin token first.")').length - 1, 3, "only the 3 live toast gates must remain");
+  });
+});
