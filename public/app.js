@@ -246,7 +246,9 @@ async function refreshReview() {
   } catch { /* keep the client-side rows */ }
   state.reviewList = rows;
   const el = $("#review-count");
-  if (el) el.textContent = state.reviewList.length;
+  // On an opps-fetch failure the shell keeps its … placeholder (a 0 here
+  // would fabricate an empty queue); the error banner names the failure.
+  if (el && !(state.apiFailures || []).includes("/api/opportunities")) el.textContent = state.reviewList.length;
   const ageEl = $("#review-age");
   if (ageEl) ageEl.textContent = oldestReviewAge();
   updateReviewChipTitle();
@@ -701,6 +703,8 @@ function renderRuns() {
   } else if (last) {
     const noise = state.health && typeof state.health.noise_24h === "number" ? state.health.noise_24h : null;
     pill.title = noise !== null ? "Latest research run: +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise" : "Latest research run";
+    const probeFails = probeFailures();
+    if (probeFails.length) pill.title += " · failing probes: " + probeFails.join(", ");
     const when = last.finished_at || last.started_at || "";
     $("#agent-text").textContent =
       `agent: ${last.status} · +${last.added}/${last.updated}/${last.briefs} · ${when.slice(0, 16).replace("T", " ")}`;
@@ -1144,17 +1148,30 @@ const runningMismatchBadge = (e) => {
     : "";
 };
 
+// Partial-health honesty (audit 2026-09-20-round2 Task 3): when the API
+// isolates failing probes it names them in health_probe_failures; the pill
+// tooltip and the error banner surface the names so a green pill with null
+// money probes still explains itself. Read-only, no new fetch.
+const probeFailures = () =>
+  (state.health && Array.isArray(state.health.health_probe_failures) && state.health.health_probe_failures.length)
+    ? state.health.health_probe_failures.slice()
+    : [];
+
 function renderApiErrors() {
   const el = $("#api-errors");
   if (!el) return;
   const fails = state.apiFailures || [];
-  if (!fails.length) {
+  const probes = probeFailures();
+  if (!fails.length && !probes.length) {
     el.classList.add("hidden");
     el.innerHTML = "";
     return;
   }
   el.classList.remove("hidden");
-  el.innerHTML = `API ${fails.length === 1 ? "error" : "errors"}: ${fails.map((f) => esc(f)).join(", ")} failed to load. <button id="api-retry" class="btn small ghost" type="button">Retry</button> <button id="api-dismiss" class="btn small ghost" type="button" aria-label="Dismiss">Dismiss</button>`;
+  const parts = [];
+  if (fails.length) parts.push(`API ${fails.length === 1 ? "error" : "errors"}: ${fails.map((f) => esc(f)).join(", ")} failed to load.`);
+  if (probes.length) parts.push(`Health probes failing: ${probes.map((p) => esc(p)).join(", ")}.`);
+  el.innerHTML = `${parts.join(" ")} <button id="api-retry" class="btn small ghost" type="button">Retry</button> <button id="api-dismiss" class="btn small ghost" type="button" aria-label="Dismiss">Dismiss</button>`;
   const retry = $("#api-retry");
   if (retry) retry.addEventListener("click", () => refresh());
   const dismiss = $("#api-dismiss");

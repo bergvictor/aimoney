@@ -1,128 +1,210 @@
-# AUDIT 2026-09-20 — aimoney (round-2 file; angle: WASTE + FAILURE VISIBILITY)
+# AUDIT 2026-09-20 round 2 — aimoney (read-only)
 
-Clone HEAD: `091d6cf` (round-3 waste cuts: bounded pre-pass, needs_review bit, batched verdicts).
-Live rev in today's fetch (`_night/live/aimoney_pages_dev_api_health.html`): `091d6cf` — live EQUALS HEAD (round-3 F1 lag is closed).
-Today's live health reads `db:"down"` with every counter zeroed (see F1); stall metrics below therefore cite the last good snapshot (round-3 audit: 27 opps, 11 unreviewed, oldest 166.3h, 19/27 bare, `{planned:2}`, all money 0) and today's file where noted.
-No repo-local `AGENTS.md`/`CLAUDE.md`/`CONTRIBUTING.md`; governed by `README.md` plus the session standing rules.
-Working tree arrived dirty on all 32 tracked files (pre-existing CRLF checkout artifact: `git diff --ignore-cr-at-eol --stat` empty — content untouched, left alone). Only file created by this audit: this one. No `.env`/secrets read.
-Surfaces judgment: live HTML is byte-identical to `public/index.html` (`diff --strip-trailing-cr -q` exit 0). Light palette only (`public/styles.css:4` `color-scheme: light`; no `prefers-color-scheme`/`data-theme`/theme-toggle in served HTML/CSS/JS), favicon + `theme-color` (`public/index.html:9-10`, hand-written 285-byte `public/favicon.svg`), inline brand mark (`public/index.html:16`), guard suite green (`public/tab-icon.test.mjs`, 5/5). **Zero surface-rule findings this round.** Served `/app.js` bytes were not re-fetched (no network per task rules); the HTML shell matches source.
+Clone HEAD: `e28a4e4` (night round 1). Live rev at fetch: `284163c`.
+Tree note: `git status --short` showed every file `M` on arrival, but `git diff -w --stat` is
+empty — a CRLF-checkout artifact, zero content diff. This file is the only content added.
 
 ## 1. What this project is and how it runs
 
-- Purpose: AIMoney Lab — a ranked board of AI-money opportunities with evidence briefs and experiments, re-optimized as results land (`README.md:1-15`).
-- Entry points: dashboard `public/index.html` + `public/app.js`; API `functions/api/[[path]].js`; agent `worker/src/index.js` + `worker/src/lib.js`.
-- Live surfaces: `https://aimoney.pages.dev`, `/api/health`, research worker (`README.md:27-31`, `deploy/public-surfaces.json:31-44`).
-- Scheduled jobs: worker cron every 6h (`worker/wrangler.toml:8-9`); manual triage-only `POST /run` 202 with `briefs_skipped:true` (`worker/src/index.js:562-571`).
-- Deploys: `./deploy/deploy.sh` (D1 schema+migrations+seed-if-empty, stamp `release.json`, Pages, worker), `./deploy/verify.sh` gates rollout (≤12h freshness); Pages auto-redeploys on push, worker via `.github/workflows/deploy-worker.yml`.
+AIMoney Lab ranks AI-money opportunities, keeps research briefs, and tracks experiments to a won/lost decision.
+Entry points: dashboard `public/index.html` + `public/app.js`, API `functions/api/[[path]].js`, agent `worker/src/index.js`.
+Live surfaces: `https://aimoney.pages.dev`, `/api/health`, `/api/opportunities`, worker `GET /` (`deploy/public-surfaces.json`).
+Scheduled job: worker cron `0 */6 * * *` (`worker/wrangler.toml:9`) → `scheduled` → `runResearch` (`worker/src/index.js:526,195`).
+Deploys: Pages auto-deploys on push to master (build stamps `public/release.json` via `scripts/stamp-release.sh`); worker via `deploy/deploy.sh` or `.github/workflows/deploy-worker.yml`; verified by `deploy/verify.sh`.
 
 ## 2. End-to-end walk-through
 
-Signal → triage → proposal → brief → vet → experiment → close → money:
+Main flow A — signal → proposal → brief (agent, no human): cron `worker/wrangler.toml:9` →
+`scheduled` (`worker/src/index.js:526`) → `runResearch(env,"cron")` (`worker/src/index.js:195`) →
+parallel `hnSignals`/`redditSignals`/`githubSignals` (`worker/src/index.js:47,76,104`, fetch via
+`timedJson` `:35`) → dedupe against D1 → Workers AI triage via `aiComplete` (`worker/src/index.js:134`,
+prompt `worker/src/index.js:561-570`, NDJSON parse `worker/src/lib.js:62-77`) → ≤2 new
+`researching` rows + versioned brief INSERT (`worker/src/index.js:501-508`) → single run-log write
+with failure markers (`worker/src/index.js:517`). Manual path: `POST /run` returns 202 with
+`briefs_skipped:true` (`worker/src/index.js:582-590`); briefs land on cron ticks only.
 
-1. Collect: cron tick → `scheduled` (`worker/src/index.js:506`) → `runResearch(env,"cron")` (`:182`); manual `POST /run` runs the same pass as `"manual"` in `waitUntil` (`:569-570`). HN/Reddit/GitHub fan out (`:217`, `:48-70`, `:72-94`, `:96-117`), one batched `INSERT OR IGNORE` (`:222-227`), one post-collect heartbeat (`:228-231`, called at `:241`).
-2. Sweep + take: 30d-stale signals → noise with count (`:235-240`); oldest 6 unprocessed taken (`:242-244`); exact-URL matches link as supports via bounded `IN (…≤6…)` selects (`:250-265`) then sequential link writes (`:267-273`); quiet ticks continue to the brief pass (`:277-280`, no early return).
-3. Triage (only `if (fresh.length)`, `:287-308`): top-60 list fetched (`:288-290`), one Mistral NDJSON call (`:303-307`; budget `MAX_AI_CALLS=4`, `:17`); `parseJsonLines` (`worker/src/lib.js:49-64`); strict validation (`worker/src/index.js:320-335`); `new` inserts a `researching` + `UNREVIEWED` row with humility clamp (`:342-343`) and capped score (`:355`), at most 2 per run with overflow left unprocessed (`:337`, `MAX_NEW_PER_RUN`, `:16`); slug collision links as supports (`:363-375`); `supports` appends evidence newest-kept (`:376-384`); else noise (`:385-387`); one `env.DB.batch` flush (`:389`).
-4. Brief: cron only (`briefDeadline`, `:215`; manual always skips); oldest-unreviewed-first past 48h (`:402-407`); one Llama call (`:419-431`); parse + insert (`:432-447`); one extra oldest bare row past 48h (`:454-494`); single run-log write carrying the brief mode (`:497`).
-5. Serve: `GET /api/opportunities` with explicit columns + `needs_review` bit + 4 correlated subqueries (`functions/api/[[path]].js:46-88`); detail + briefs + experiments in 3 sequential queries (`:90-101`); batched 10-statement health (`:372-429`); `GET /api/meta` (`:431-437`); runs (`:359-364`).
-6. Decide (all human): boot `refresh()` → `refreshTargets` (`public/app.js:1177-1221`); review queue derived client-side (`:228-234`, `:236-253`); review rows carry capital + next action + source + brief summary with inline Vet/Vet-&-starter/Kill (`:161-219`); Vet clears the marker and appends `[date vetted]`, toast offers Log experiment (`:396-427`); Vet-&-starter vets + POSTs a prefilled planned experiment + flips to testing with a Start shortcut (`:435-477`); Kill takes an inline post-mortem line (`:479-515`); Start-here strip reads the list excerpt with Vet/Kill for unreviewed top picks (`:103-127`); drawer + admin zone for rescore/status (`:765-812`, `:837-934`).
-7. Experiment: modal log with dollar→cents conversion (`:1032-1083`); board one-click Start (`:576-588`), one-click Lose (`:595-612`) and one-click Win with inline $ + source + line (`:621-638`); API create (`functions/api/[[path]].js:253-302`) and update (`:304-357`) enforce result + post-mortem on close (`:327-332`), stamp `started_at`/`ended_at`, append a `($X rev / $Y spent via {source})` outcome line to the parent on the won/lost transition (`:337-346`); drawer suggests a ±1 rescore, never auto-applied (`public/app.js:825-835`); zero-decision weeks get a read-only stale nudge that deep-links to the board card (`:665-674`, `:562-569`).
-8. Where it most often breaks or goes silent, in order: **(a)** today's live fetch shows `db:"down"` while `ok:true` (F1) — every money and funnel counter reads 0 during an outage; **(b)** the human funnel converts at zero (0 vetted, 0 decisions across snapshots; today's file cannot refresh the counts because of (a)) while the $0 spec-ad sprint (`d1/seed.sql:66-71`, `planned`, `$0 + 10 hours`, target `>=3 replies; >=1 pilot at >=$500`) sits unpressed — a human still presses Start (`public/app.js:574-575`); **(c)** 19/27 rows bare while briefs cap at 2/cron-tick, manual runs brief nothing, and failed brief writes vanish silently (F4); **(d)** silent drops: all-source outages look like quiet ticks (F3), the 30d sweep failures proceed without a marker (`worker/src/index.js:240`), malformed brief JSON is skipped without a marker (`:448`, `:491`).
+Main flow B — proposal → vetted → experiment → decision (human owns every status move):
+`GET /api/opportunities?unreviewed=1&sort=oldest` (`functions/api/[[path]].js:44-86`) renders the
+review queue and the "Start here today" strip (`public/app.js:103-127`, container `public/index.html:42`) →
+owner taps Vet/Kill/`Vet & log starter` in row, strip, or drawer → experiment `planned → running`
+(one-click Start) → close `won`/`lost` requires `result` + `post_mortem`, stamps `ended_at`
+(`functions/api/[[path]].js:306-359`) → `/api/health` counts `decisions_last_7d`/`revenue_last_7d`
+(`functions/api/[[path]].js:396-397`) → Experiments header renders the week (`public/app.js` header).
+
+Where it most often breaks or goes silent. (1) Live D1 never received the 2026-09-20 column
+migrations, so the two health SELECTs on `revenue_cents`/`spent_cents` fail; on live rev `284163c`
+the all-or-nothing `env.DB.batch(...)` turns that into `db:"down"` with every count null while
+`/api/opportunities` serves real rows (see Findings 1–2). (2) The human queue: vetting and every
+status move require an owner tap, and the lane metric sits at zero decisions (see Money first).
+(3) Agent-side, source/AI failures are contained per-source (`src_fail:`, `brief:failed` markers in
+the run log, `worker/src/index.js:517`) — that path degrades loudly, not silently.
 
 ## 3. Health signals measured here
 
-- `npm test` (this Linux checkout, exit 0): **224 pass / 0 fail, 78 suites** — per file, each run separately: `lib.test.js` 14/7 (`duration_ms 169.68`), `index.test.js` 43/16 (`245.47`), `api.test.mjs` 72/22 (`1945.53`), `tab-icon.test.mjs` 5/1 (`109.46`), `dashboard.test.mjs` 90/32 (`169.61`). Matches the `091d6cf` commit message (224/78) and the Windows baseline totals. Only warnings are the known `MODULE_TYPELESS_PACKAGE_JSON` reparsing notes and sandbox proxy notes.
-- `python3 -m compileall`: N/A — repo contains zero `*.py` files (glob `**/*.py` search returned nothing; JS-only: Pages + Functions + Worker, `node --test` suites).
-- `node --check`: exit 0 on `public/app.js`, `worker/src/index.js`, `worker/src/lib.js`. The API router's parse is proven by the green suite that imports it (`functions/api/api.test.mjs`, 72/72 green).
-- TODO density: **0** — regex search for `TODO|FIXME|XXX|HACK` across `public/`, `functions/`, `worker/`, `scripts/`, `deploy/`, `d1/` returns nothing.
-- Dead code (all verified present at HEAD): `BRIEF_DEADLINE_MS` defined but never referenced (`worker/src/index.js:21`, sole occurrence; live logic uses `briefDeadline` at `:215`); unused `scoreOf` import (`:140`, sole occurrence in file); five unreachable toast gates after modal returns (`public/app.js:412,494,579,598,624`, each self-commented "supersedes the toast gate" at `:411,493,578,597,623`); `GITHUB_QUERIES` third entry `"ai-side-project"` (`:28`) never fetched (`:116` slices `(0, 2)`); dead ternary `!fresh.length ? [] : …` inside `if (fresh.length)` (`:303`, always takes the else branch); comment-only `if (!fresh.length) {}` block (`:277-280`); `appendKeepNewest` has zero production callers (`worker/src/lib.js:36-39`, tests only).
-- Duplicated logic: `clamp10` in the API (`functions/api/[[path]].js:16-20`) vs `worker/src/lib.js:4-7` (near-identical, not shared); classify prompt text duplicated between the pass (`worker/src/index.js:291-301`) and `/debug-classify` (`:541-550`); brief-prompt + brief-insert duplicated for main (`:422-447`) and extra (`:466-490`) briefs; `inlinePostMortem` (`public/app.js:284-322`) vs `inlineWinClose` (`:328-390`) share ~50 lines of row/input/cancel/Escape shape; money formatters `centsDollars` (`functions/api/[[path]].js:24`) vs `moneyCents` (`public/app.js:53`) are an intentional commented mirror; `UNREVIEWED` appears as SQL/string literals while the exported `UNREVIEWED_MARKER` (`worker/src/lib.js:21`) is used only inside lib; the vetted tag is string-coupled (`[date vetted]` written at `public/app.js:416`, counted via `LIKE '%vetted]%'` at `functions/api/[[path]].js:384`); `deriveReviewList` (`public/app.js:233-234`) inlines the `isNeedsReview` check (`:228-231`) instead of calling it; worker token compare repeated 3x (`worker/src/index.js:517-519,532-534,563-565`) vs the API constant-time compare (`functions/api/[[path]].js:28-36`); three separate `#board` click listeners for Start/Lose/Win (`public/app.js:1088,1097,1106`).
-- Live surfaces: `_night/live/aimoney_pages_dev.html` (5514 bytes) identical to `public/index.html` (`diff --strip-trailing-cr -q` exit 0); surface rules all pass, so they expose zero findings. Live health (352 bytes) today: `{"ok":true,"rev":"091d6cf","db":"down","opportunities":0,"unreviewed":0,"bare_without_brief":0,"experiments_by_status":{},"hours_since_last_ok_run":null,"oldest_unreviewed_age_h":null,"decisions_last_7d":0,"revenue_last_7d":0,"revenue_total":0,"spent_total":0,"vetted_last_7d":0,"vetted_no_experiment":0,"noise_24h":0,"time":"2026-09-20T23:42:50.363Z"}` — `ok:true` during a `db:"down"` outage, every money counter 0 (F1).
-- Note on acceptance: `git status --short` showed every tracked file as modified before I wrote anything (`git diff --ignore-cr-at-eol --stat` is empty — CRLF line endings only, pre-existing). I created only this file and edited nothing.
+- `npm test` (`node --test worker/src/lib.test.js worker/src/index.test.js
+  functions/api/api.test.mjs public/tab-icon.test.mjs public/dashboard.test.mjs`): exit 0 —
+  `# tests 247, # suites 87, # pass 247, # fail 0, # cancelled 0, # skipped 0, # todo 0,
+  # duration_ms 2995.942509` (TAP tail, this run). Includes `health probe isolation`
+  (`functions/api/api.test.mjs:1246-1319`, 3 tests) and `health outage honesty` (`:1191-1244`).
+- `node --check public/app.js`: exit 0. Python `compileall`: not applicable — no Python
+  sources in this repo (JS-only; the suite imports all server sources, so green tests imply parse-clean).
+- Dead code: none newly found; the suite's `hygiene: dead rails gone, shared auth` case passes.
+  Duplicated logic: `centsDollars` (`functions/api/[[path]].js:24`) mirrors `moneyCents`
+  (`public/app.js:53`) — intentional, commented as a mirror; `clamp10` exists in both
+  `functions/api/[[path]].js:16` and `worker/src/lib.js:4` with near-identical logic (minor drift risk, unranked).
+- TODO density: **0** — regex `TODO|FIXME|HACK|XXX` over the repo hits only the three prior
+  audit docs in `docs/audits/`, which record the same zero.
+- Live surfaces fetched for this run: `_night/live/aimoney_pages_dev_api_health.html` =
+  `{"ok":false,"rev":"284163c","db":"down",` + thirteen nulls, no `health_probe_failures` key —
+  the exact all-or-nothing signature. `_night/live/aimoney_pages_dev.html` (5514 bytes): light
+  palette, favicon + `theme-color` + inline brand mark present (`public/index.html:9-10,16`),
+  no dark-mode query anywhere under `public/`; guard tests pass (`public/tab-icon.test.mjs`,
+  banner/badge-style case in `public/dashboard.test.mjs`).
 
 ## 4. Ranked findings (max 8)
 
-Money-first ranking basis, in numbers, from the repo's own data:
+Money first (owner directive, numbers from this project's own data): earned to date **none**
+($0 — the only experiment in repo data is the seed's `planned` row, `d1/seed.sql:67-71`, and live
+`revenue_total` is null = unknown, honestly reported); last krone arrived **never**; the single
+step between here and the next payment is one spec-ad reply converting to a paid pilot (the seed
+experiment's own target: `>=1 pilot at >=$500`, `d1/seed.sql:71`) — the code step is one tap
+(Win), the real step is sending the 10 spec ads, which is outside the code; measured conversion
+at that step **unmeasured** (zero decisions to date, `decisions_last_7d`/`vetted_last_7d` 0).
+AIMoney is a tool the owner uses, not a product he sells — so findings rank by owner minutes
+saved and queue drained, not by revenue projected.
 
-1. Money produced to date: **$0.00**. Last krone arrived: **never — none**. Evidence: live health `revenue_total:0`, `revenue_last_7d:0` (today and in the last good snapshot); `d1/seed.sql:66-71` seeds one `planned` experiment with no cents; no `won`/`lost` row exists anywhere in repo data (`experiments_by_status:{}` today, `{planned:2}` last snapshot).
-2. Single step between now and the next payment: **send the 10 finished spec ads to 10 real DTC supplement brands** (the seeded $0 experiment's hypothesis, `d1/seed.sql:68-71`; target `>=3 replies; >=1 pilot at >=$500`). The next payment is the first ≥$500 pilot.
-3. Measured conversion at that step right now: **0 attempts, 0 successes, all-time** — no experiment has ever left `planned` in repo data (`started_at` never stamped; `decisions_last_7d:0`, `vetted_last_7d:0` across four consecutive snapshots).
+### F1. Live still runs the pre-isolation health code — deploy the fix that is already committed
 
-Lane metric (aimoney): experiments reaching a decision per week = **0**; vetted proposals becoming experiments = **0**; unreviewed backlog **11, oldest 166.3h ≈ 6.9d** (last good snapshot; today's fetch is outage-zeroed and cannot refresh it).
+Evidence: live `_night/live/aimoney_pages_dev_api_health.html:1` reads
+`{"ok":false,"rev":"284163c","db":"down","opportunities":null, …}` (all null, no
+`health_probe_failures`); this clone at `e28a4e4` already carries the fallback —
+`functions/api/[[path]].js:402` (`env.DB.batch(healthStmts).catch(() => null)`),
+`:410-429` (per-probe re-run, `healthProbeFailures` named), `:479` (`db` by whether the
+database answered). The dashboard then prints `agent: db down` (`public/app.js:695-700`) from a lie.
+Why it costs: the owner opens a dashboard that says the database is dead while the ledger below
+renders real rows — every later number is distrusted, and `verify.sh`'s `"ok":true` grep
+(`deploy/verify.sh:32`) fails the rollout. Fix: deploy this HEAD to Pages (Git push to master
+auto-deploys; or `deploy/deploy.sh` + `deploy/verify.sh`). After deploy, `/api/health` must show
+the deployed rev, `db:"up"`, nine probes reporting, and `health_probe_failures` naming the cents
+probes until F2 lands. Size S (no new code). Risk: low — covered by `api.test.mjs:1246-1319`.
 
-No finding below moves question 2 directly — the bottleneck is outside the code: no code change can send the spec ads for the owner. Ranked instead by what protects the money read from lying (F1–F2), then what stops the agent failing quietly (F3–F4), then remaining per-tap/per-tick waste (F5–F8). No surface-rule findings: the served page is light-only with icon, brand mark, and a guard test (see §3).
+### F2. CI can never apply a migration, so the new columns will never reach live D1
 
-**F1 — Health answers `ok:true` with `db:"down"`, zeroing every money counter into a lie.**
-Evidence: `functions/api/[[path]].js:388` (`const healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;`) collapses a batch failure to null, and `:429` still returns `return json({ ok: true, rev, db: db ? "up" : "down", opportunities: db ? db.n : 0, … revenue_total: revenueTotalRow ? (revenueTotalRow.total || 0) : 0, …` — `ok` is unconditional and every count falls back to `0`. Today's live file proves it end to end: `"ok":true,"rev":"091d6cf","db":"down"` with `revenue_total:0`, `decisions_last_7d:0`. Downstream, `deploy/verify.sh:32` greps `'"ok":true'` for `api-health`, so the deploy gate passes during a DB outage; on the board, the outage paints `Needs review (0)` and the review tab reads `Review queue empty — every agent proposal has been vetted or killed.` (`public/app.js:206`) — an all-clear for a failure.
-Why it costs money and trust: a wrong $0 is worse than no number — during any D1 outage the project reports "earned nothing, decided nothing, nothing to review", indistinguishable from the true stall, and the rollout verifier agrees.
-Fix: when the health batch fails, return `ok:false` with `db:"down"` and every count key set to `null` (not 0), keeping key names and order; the dashboard already null-guards each consumer (`typeof … === "number"` at `public/app.js:263,275,645-649`), so it degrades to its existing fallbacks with no client change, and the unchanged verify.sh grep then fails the rollout as it should. Touch `functions/api/[[path]].js`, `functions/api/api.test.mjs`. Size S. Risk: low — value-only change on the failure path; success path byte-identical.
+Evidence: `.github/workflows/deploy-worker.yml:20` runs only
+`wrangler d1 execute aimoney --file=d1/schema.sql --remote` (`CREATE TABLE IF NOT EXISTS` adds no
+column to an existing table), while only `deploy/deploy.sh:34-38` loops `d1/migrate-*.sql` with
+duplicate-column tolerance — and CI never runs `deploy.sh`. The failing probes select
+`revenue_cents`/`spent_cents` (`functions/api/[[path]].js:396-397`), added by
+`d1/migrate-2026-09-20-experiment-cents.sql:5-6` and `d1/migrate-2026-09-20-revenue-source.sql:5`.
+Separately, the workflow needs `CF_API_TOKEN` and `CF_ACCOUNT_ID` in this repository's secrets
+(`.github/workflows/deploy-worker.yml:22-23,26-27`); without them wrangler has no credentials and
+nothing in the database path can work — that secret step is the owner's, not the agent's.
+Why it costs: every future schema change is dead on arrival; the two cents probes fail forever and
+F1's fallback permanently reports two nulls. Fix: mirror the `deploy.sh` migration loop (with the
+same tolerate-duplicate behaviour) into the workflow after the schema step, and add an early step
+that fails loudly when the secrets are empty instead of letting wrangler fall back to interactive
+login. Size M. Risk: medium — touches CI; test on a scratch branch run, keep the duplicate-column
+tolerance so re-runs stay green.
 
-**F2 — `vetted_last_7d` counts vetted rows *touched* in 7d, but the header claims "vetted this week".**
-Evidence: `functions/api/[[path]].js:384` (`SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%vetted]%' AND updated_at >= strftime(…,'-7 days')`) keys the window on `updated_at`, yet `updated_at` is bumped by non-vet writes: the outcome-ledger append on every close (`:343-345`, `SET notes = …, updated_at = …`), worker signal appends (`worker/src/index.js:272,380-384`), and admin saves. A row vetted a month ago that closes an experiment yesterday counts as "vetted this week" in `public/app.js:656` (`` `${decisions} decisions this week · ${vetted} vetted this week → …` ``).
-Why it costs money: the funnel's only progress number over-counts exactly when the owner acts on old rows — phantom vetting velocity that hides the real stall (4 straight snapshots at 0, yet one close could fake a non-zero week).
-Fix: count from the tag date, not the touch date — match `notes LIKE '%[YYYY-MM-DD vetted]%'` for each of the last 7 calendar days in the one health SELECT (no migration; the tag format at `public/app.js:416` is fixed-width and greppable). Keep the key name and order. Touch `functions/api/[[path]].js`, `functions/api/api.test.mjs`. Size S. Risk: low — success-path values only get more honest; pin old-vet-plus-fresh-touch exclusion in a test.
+### F3. Served HTML hardcodes `Needs review (0)` — first paint fabricates a zero
 
-**F3 — A total source outage is indistinguishable from a quiet tick: all three collectors swallow errors.**
-Evidence: `worker/src/index.js:66` (`} catch { /* source hiccup must not kill the run */ }`), `:90` (`} catch { /* 429s happen; HN usually carries the run */ }`), `:113` (GitHub rate-limit catch) — every per-query failure returns `[]` with no counter, `Promise.allSettled` at `:217` therefore always "fulfills", and the run finishes `"ok"` with `error` carrying only the brief mode (`:497`). Zero fresh signals from a triple outage takes the same path as a genuinely quiet tick (`:277-280`).
-Why it costs money: the queue is supposed to drain at the top via new signals; if HN/Reddit/GitHub all go dark (auth change, IP block, API sunset), the dashboard keeps showing green `ok` runs with `+0/0` and nobody learns the top of the funnel died until the backlog age screams weeks later.
-Fix: track per-source failure in `state` (a query that throws marks its source failed; a source whose queries all fail is reported), and suffix the finish-`ok` error line with e.g. `src_fail:reddit,github` alongside the existing `brief:…`/`stale:…` markers. No status moves, no retries, no behavior change on success. Touch `worker/src/index.js`, `worker/src/index.test.js`. Size S. Risk: low.
+Evidence: `public/index.html:51`
+`<button class="chip review" …>Needs review (<span id="review-count">0</span>…` — before JS loads,
+the page states the queue is empty; the agent pill at least starts neutral (`index.html:23`
+`agent: …`). A count of 0 when the truth is unknown is precisely the wrong number the money
+directive bans. Why it costs: on a slow phone connection the most important truth (11 unreviewed,
+oldest 6.5d) reads as "nothing to do" for the first seconds — the opposite of the five-second rule.
+Fix: render `…` placeholders in the static shell and let JS fill real numbers or an error banner;
+extend the existing served-page guard test to fail on a hardcoded `>0<` inside a count span.
+Files: `public/index.html`, `public/dashboard.test.mjs` (or `public/tab-icon.test.mjs`). Size S.
+Risk: low — static text only; keep the review-chip tooltip contract intact.
 
-**F4 — Failed brief writes are skipped silently and the run still logs `ok` — wasted AI spend, invisible stall.**
-Evidence: the main brief `try {` at `worker/src/index.js:432` covers both the JSON parse AND the `INSERT INTO briefs` (`:438-445`); its `} catch { /* malformed brief JSON: skip, briefs stay human-seeded */ }` (`:448`) therefore also swallows D1 insert failures, and the extra-brief `} catch { /* extra brief is best-effort; lands next run */ }` (`:491`) does the same — yet the run finishes `"ok"` (`:497`) with `briefs:0` and no marker. Each swallowed write burned a Llama call (up to 2 of the 4-call budget) against the 19/27 bare rows.
-Why it costs money: the two scarcest resources — AI budget and brief coverage for unreviewed rows — are spent and lost without a trace; a systematically failing brief path (prompt drift, column mismatch) would read as "agent healthy, humans slow" forever.
-Fix: on brief parse/insert failure, record a `brief:failed` marker in the finish-`ok` error line (same suffix idiom as `brief:top-scored`) instead of an empty catch; keep the skip-and-retry-next-tick behavior. Touch `worker/src/index.js`, `worker/src/index.test.js`. Size S. Risk: low — log-text-only change on the failure path.
+### F4. Dashboard ignores `health_probe_failures` — the owner still can't see WHICH probe fails
 
-**F5 — The exact-URL pre-pass still does up to 12 sequential D1 writes; the verdict batch skipped it.**
-Evidence: `worker/src/index.js:267-273` awaits a signal `UPDATE` plus an opportunity notes `UPDATE` per matched signal inside the loop (`await …run(); await …run().catch(() => null);`), up to 6 matches, while the verdict loop's identical write pairs were batched at `:389` (`if (verdictWrites.length) await env.DB.batch(verdictWrites);`). The second write's `.catch(() => null)` additionally swallows evidence-append failures.
-Why it costs money: up to 12 sequential round-trips inside the 30s `waitUntil` budget the whole pass is engineered for (`:7-11`); on a match-heavy tick this is the same 9s→0.5s waste the collect and verdict phases already proved batching fixes.
-Fix: accumulate the pre-pass signal-UPDATEs and notes-appends into the same `verdictWrites` array (or a sibling array flushed with it) instead of awaiting inline; keep `exactUrlTarget` matching and the no-status-move rule unchanged. Touch `worker/src/index.js`, `worker/src/index.test.js`. Size S. Risk: low — same statements, one round-trip; batch-failure semantics already accepted at `:316-318`.
+Evidence: the API now names failures (`functions/api/[[path]].js:479`
+`...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {})`), but
+`renderRuns` (`public/app.js:691-722`) only branches on `state.health.db !== "up"` (`public/app.js:695`)
+and never reads the new key — no consumer exists anywhere under `public/`.
+Why it costs: after F1 ships, the pill goes green while two money probes stay null with no visible
+reason; the owner must read raw JSON to learn the migration is missing. Fix: when
+`health_probe_failures` is present and non-empty, append the names to the pill `title` and to the
+named error banner path (one line, read-only, no new fetch); add a dashboard test asserting the
+names render and that the pill stays non-red when `db:"up"` with partial failures. Files:
+`public/app.js`, `public/dashboard.test.mjs`. Size S. Risk: low.
 
-**F6 — Detail endpoint does 3 sequential queries; every vet/kill/starter now pays it (cost added by Task 2).**
-Evidence: `getOpportunity` awaits opportunity, then briefs, then experiments (`functions/api/[[path]].js:91-99`), and since the needs_review-bit change every Vet/Vet-&-starter/Kill `GET`s detail first (`public/app.js:402,440,484`) before its PATCH — so one phone tap costs 3 sequential detail round-trips + PATCH + list refetch + health.
-Why it costs money: the under-a-minute phone clear pays 3 avoidable round-trips on the exact taps the owner must repeat 11+ times to drain the queue; D1 latency dominates each tap.
-Fix: serve the three independent detail SELECTs as one `env.DB.batch` (same queries, one round-trip), returning byte-identical `{ opportunity, briefs, experiments }`. Touch `functions/api/[[path]].js`, `functions/api/api.test.mjs`. Size S. Risk: low — read-only batching with the health-batch precedent.
+### F5. A `won` close can record $0.00 with no source — closed money isn't real
 
-**F7 — List endpoint runs 4 correlated subqueries per row, two of them against the same briefs table.**
-Evidence: `functions/api/[[path]].js:66-69` — `(SELECT COUNT(*) FROM briefs …) AS brief_count`, `(SELECT substr(b.first_steps, 1, 300) …) AS brief_first_steps`, `(SELECT substr(b.summary, 1, 200) …) AS brief_summary`, `(SELECT COUNT(*) FROM experiments …) AS experiment_count` — executed per row for up to `limit=200` rows (`public/app.js:1202`), i.e. up to 800 subquery executions per list fetch to render counts, one line, and one summary.
-Why it costs money: every decision tap refetches the list; correlated-per-row work scales with the board (which only grows — killed rows stay listed, `README.md:83`), so the phone path gets slower exactly as the project succeeds.
-Fix: rewrite the list SELECT with two `LEFT JOIN`s (latest-brief-per-opportunity via `MAX(version)`, experiment counts) plus `GROUP BY o.id`, returning the identical row shape; pin the shape and the 300/200-char caps in `api.test.mjs`. Touch `functions/api/[[path]].js`, `functions/api/api.test.mjs`. Size M. Risk: medium — SQL rewrite on the hottest read; keep bit/excerpt/count semantics byte-identical and prove equivalence in tests.
+Evidence: `updateExperiment` gates `won`/`lost` on `result` + `post_mortem` only
+(`functions/api/[[path]].js:329-334`); `revenue_cents`/`spent_cents` default to 0 (`:321-323`) and
+`revenue_source` defaults to `""` (`:326-327`), and the same applies on create (`:280-292`). A
+one-click Win with an empty $ field therefore closes as won with `($0.00 rev / $0.00 spent)` and no
+`via` bit. Why it costs: the lane's money leg (`revenue_total`, `revenue_last_7d`) can show a win
+that proves nothing — an amount, a date and a source are what make it real; `ended_at` already
+stamps automatically (`:334`), amount and source don't. Fix: on close-as-`won` via create or
+update, require a non-empty `revenue_source` unless `revenue_cents` is explicitly 0 AND a
+`result` line states why (keep the API 400 shape with `fields`, mirror in the Win modal/one-click
+Win inline input); `lost` stays as-is. Files: `functions/api/[[path]].js`,
+`functions/api/api.test.mjs`, `public/app.js`, `public/dashboard.test.mjs`. Size M. Risk: low —
+additive gate on one status; never backfill or invent a figure for existing rows.
 
-**F8 — Skipped Task 4 residue: the signals table grows forever, and dead safety rails still ship.**
-Evidence: no `DELETE` statement exists in `worker/src/index.js` or `functions/api/[[path]].js` (regex search returns nothing) — the 30d sweep marks noise but never removes rows, while collection inserts up to 72 signals/run (`:25-28`, `:222-227`) for 6 triage slots; alongside it ship `BRIEF_DEADLINE_MS` (`:21`, sole occurrence, enforces nothing — live gate is `briefDeadline` at `:215`), the unused `scoreOf` import (`:140`), five dead toast gates (`public/app.js:412,494,579,598,624`), the unfetched third GitHub query (`:28` vs `:116` `.slice(0, 2)`), the dead ternary (`:303`), and the empty `if` (`:277-280`).
-Why it costs money: unbounded table growth taxes every future scan (F4/F5's bounded reads notwithstanding, the 30d sweep and any future full-table query pay it), and dead rails teach false confidence — a reader will believe the 18s deadline is enforced.
-Fix (two halves, one task): add a retention delete gated on all three predicates (`processed = 1 AND opportunity_id IS NULL AND created_at` older than 90d; linked-evidence and unprocessed rows never touched) documented in `README.md` beside the sweep rule; delete the constant, the import name, the five dead gates, and resolve the GitHub slice-or-string mismatch (keep or drop the third query so config matches behavior). Touch `worker/src/index.js`, `worker/src/index.test.js`, `public/app.js`, `README.md`. Size S. Risk: low-medium — it is a DELETE, so pin all three predicates in a test; dead-code deletion is zero-behavior.
+### F6. The stall is owner review bandwidth, not missing UI — stop adding visibility
+
+Evidence: README documents one-tap Vet/Kill/`Vet & log starter`, one-click Start/Win/Lose, stale-first
+sorting with age chips, and the start-here strip (`README.md:69-79`; implemented at
+`public/app.js:103-127` and tested throughout `public/dashboard.test.mjs`) — yet the measured lane
+state is 11 unreviewed (oldest 6.5d), 0 decisions, 0 vetted in 7d. Every prior round made the stall
+more visible and nobody acted. Why it costs: further dashboard work cannot move decisions/week; it
+only adds code to maintain. Fix: ship no new visibility this round. The only code-side drain-top
+lever left is a reversible worker rule with the rule written down (the worker already
+link-as-supports on slug/URL match and sweeps 30d+ signals to noise, `README.md:76`) — e.g. let the
+worker pre-draft (never send, never status-move) the first spec-ad outreach text onto the seed
+experiment's `result`-draft field for one-tap owner review; anything that decides without the owner
+stays forbidden. Size M. Risk: medium — keep every auto-step reversible and status moves human-only
+(the agent "never moves status" contract, `worker/src/index.js:4-5`).
+
+Surface-rules verdict (checked, not a finding): light-only palette (`public/styles.css:4`
+`color-scheme: light`, white paper bg, no dark query); favicon 285B + icon link + theme-color
+(`public/index.html:9-10`); matching inline brand mark (`public/index.html:16`); guard tests green.
+Nothing to fix; the five-second gap is F3's fabricated zero, not the palette or brand.
 
 ## 5. What NOT to change
 
-- The scoring formula and the honest cap: `score = 100 * (value * confidence * fit) / (effort + 1)` (`README.md:56`, `worker/src/lib.js:15-16`) with `UNREVIEWED` rows clamped to ≤6000 (`worker/src/lib.js:29-32`). Make counters honest and round-trips fewer, not the math different.
-- "The agent PROPOSES; the human owns the testing workflow (it never moves status to testing/scaling/killed)." (`worker/src/index.js:4-5`; also `README.md:72`: "`researching → testing` is a human decision".) F3–F5 move no status.
-- "No auto-transitions — the human still owns every status move." (`public/app.js:664`.) Start/Win/Lose/Vet/Kill stay human-pressed, including the spec-ad sprint (`public/app.js:574-575`: "a human still presses it").
-- "Killed strategies stay on the board with their post-mortem — that is the point." (`README.md:63-64`.) Never delete killed rows or their notes; F8 deletes only unlinked noise signals.
-- The experiment closure gate: `won`/`lost` require non-empty `result` + `post_mortem` (`functions/api/[[path]].js:327-332`), `ended_at` stamped. Never mark an experiment decided without evidence, never invent a revenue figure.
-- Public-read / token-write split with constant-time compare (`functions/api/[[path]].js:28-36`); `ADMIN_TOKEN` rotation stays a human deploy step (`README.md:85-88`). No tokenless writes, no stored bypass.
-- Idempotent deploy: schema always, seed only when the table is empty (`deploy/deploy.sh:30-47`). Never reseed over live rows; do not touch deploy scripts, CI, data files, or secrets in these tasks.
-- Manual-triage-only + briefs-on-cron (`README.md:77`; `worker/src/index.js:570`). F3–F5 preserve the manual skip.
-- Anything needing a login, credential, payment, or a human decision: Cloudflare deploys, `CLOUDFLARE_API_TOKEN`, sending the spec ads, pricing a pilot, vet/kill calls, closing experiments, the 90d retention DELETE sign-off (F8 is proposed but the owner should confirm the delete). This audit changed no code and read no secrets.
+- Credentials and secrets. Never create, enter, or store one. The workflow needs `CF_API_TOKEN`
+  and `CF_ACCOUNT_ID` added to this repository's GitHub secrets by the owner
+  (`.github/workflows/deploy-worker.yml:22-23,26-27`); "nothing in the database path can work
+  until they exist." Do not read `.env`, tokens, or `localStorage` dumps.
+- The agent-never-moves-status contract: "The agent PROPOSES; the human owns the testing workflow
+  (it never moves status to testing/scaling/killed)" (`worker/src/index.js:4-5`; README review
+  flow `README.md:72`). No auto-vet, auto-start, auto-kill, auto-scale.
+- Score math and the unreviewed cap: `score = 100 * (value * confidence * fit) / (effort + 1)`
+  with `UNREVIEWED` rows capped at 6000 (`worker/src/lib.js:13-32`, `README.md:65`) — deliberate
+  honesty behaviour; rescore suggestions stay one-click human-applied, never auto-applied.
+- Closure evidence gate: `won`/`lost` require `result` + `post_mortem` (`functions/api/[[path]].js:331-333`);
+  killed rows stay listed with post-mortems (`README.md:64`). Do not loosen; F5 only tightens `won`.
+- Human decisions and money truth: never invent a revenue figure, never mark an experiment decided
+  without evidence, never present a projection as a result; the seed's `>=1 pilot at >=$500`
+  (`d1/seed.sql:71`) is a target, not revenue. No captcha solving, fabricated reviews, account
+  creation, false claims, forbidden scraping/messaging, or financial advice.
+- Data files and history: `d1/seed.sql` (runs once on empty tables), live D1 rows, and prior audit
+  docs under `docs/` are read-only references.
 
 ## 6. Proposed next tasks (2–4)
 
-Ordered so task 1 is the most valuable safe change (it stops the money read lying during outages). F7 (list JOIN rewrite) is deferred because its perf win cannot be proven without live D1 access (no network here); the F8 retention DELETE is included in task 4's worker batch only as dead-code sweep — the DELETE itself needs the owner's explicit sign-off per §5.
-
-### Task 1: Health reports ok:false with null counters when the DB batch fails
-
-- Owned files: `functions/api/[[path]].js`, `functions/api/api.test.mjs`.
-- Acceptance: (a) a failed health batch returns HTTP 200 with `ok:false`, `db:"down"`, and every count key (`opportunities`, `unreviewed`, `bare_without_brief`, `decisions_last_7d`, `revenue_last_7d`, `revenue_total`, `spent_total`, `vetted_last_7d`, `vetted_no_experiment`, `noise_24h`) set to `null`, key names and order unchanged; (b) the success path is byte-identical; (c) the unchanged `verify.sh` `'"ok":true'` grep now fails a rollout during a DB outage (asserted by a test on the payload, not by editing `verify.sh`); (d) dashboard fallbacks already null-guard each key — add a static test pinning the `typeof === "number"` guards; (e) `npm test` green.
-
-### Task 2: Count vetted_last_7d from [date vetted] tags, not updated_at
-
-- Owned files: `functions/api/[[path]].js`, `functions/api/api.test.mjs`.
-- Acceptance: (a) `vetted_last_7d` matches `notes LIKE '%[YYYY-MM-DD vetted]%'` for each of the last 7 calendar days in the one health SELECT (no migration); (b) a row vetted 30d ago but touched yesterday is excluded, a row vetted yesterday is included; (c) key name, position, and all other health keys unchanged; (d) new tests pin both cases; (e) `npm test` green.
-
-### Task 3: Worker run log names failed sources and failed brief writes
-
-- Owned files: `worker/src/index.js`, `worker/src/index.test.js`.
-- Acceptance: (a) a source whose queries all fail appends `src_fail:<name>` to the finish-`ok` error line beside the existing `brief:…`/`stale:…` markers; a genuinely quiet tick carries no such marker; (b) a malformed brief JSON or failed brief INSERT records `brief:failed` instead of an empty catch, keeping skip-and-retry-next-tick; (c) `ok`/`error` run semantics, AI budget, status rules, and manual brief-skip unchanged; (d) new tests pin both markers; (e) `npm test` green.
-
-### Task 4: Batch pre-pass writes and detail reads; sweep dead code
-
-- Owned files: `worker/src/index.js`, `worker/src/index.test.js`, `functions/api/[[path]].js`, `functions/api/api.test.mjs`, `public/app.js`.
-- Acceptance: (a) pre-pass signal-UPDATEs and notes-appends flush in the verdict batch (no inline awaits in the match loop); matching, inflow cap, AI budget, and no-status-move rules unchanged; (b) `GET /api/opportunities/:id` serves opportunity + briefs + experiments in one `env.DB.batch` with a byte-identical payload; (c) `BRIEF_DEADLINE_MS`, the unused `scoreOf` import name, the five dead toast gates, the dead ternary, and the empty `if` are gone, and the GitHub query list matches the fetch slice; (d) new tests pin single-batch behavior on both paths; (e) `npm test` green.
+1. `Ship committed health isolation to Pages so live db reads up, not down`
+   Owned files: none (deploy action) + `deploy/verify.sh` for proof. Acceptance: `GET
+   /api/health` shows the deployed rev with `"ok":true`, `db:"up"`, nine probes numeric, and
+   `health_probe_failures` naming the cents probes; `./deploy/verify.sh` passes (its `"ok":true`
+   grep, `deploy/verify.sh:32`); dashboard pill no longer reads `agent: db down`.
+2. `Teach the CI workflow to apply d1/migrate-*.sql and fail loudly without secrets`
+   Owned files: `.github/workflows/deploy-worker.yml`. Acceptance: workflow contains the
+   migrate loop with duplicate-column tolerance (mirroring `deploy/deploy.sh:34-38`); an early
+   step fails with a clear message when `CF_API_TOKEN`/`CF_ACCOUNT_ID` are empty; schema-only
+   behaviour unchanged; no secret values in the file (owner adds them in repo settings).
+3. `Surface failing health probe names in the agent pill and error banner`
+   Owned files: `public/app.js`, `public/dashboard.test.mjs`. Acceptance: with
+   `health_probe_failures:["revenue_lifetime"]` the names appear in the pill title and the named
+   banner; pill stays non-red when `db:"up"`; all 247 existing tests still pass plus the new case.
+4. `Replace hardcoded first-paint zeros with neutral placeholders plus a guard test`
+   Owned files: `public/index.html`, `public/dashboard.test.mjs`. Acceptance: served shell shows
+   `…` (not `0`) in `review-count` before JS loads; guard test fails if a count span ships a
+   hardcoded digit; no visual change after data loads.

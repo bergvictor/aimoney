@@ -830,3 +830,44 @@ describe("dead toast gates (audit 2026-09-20-round1 Task 4)", () => {
     assert.equal(js.split('return toast("Enter the admin token first.")').length - 1, 3, "only the 3 live toast gates must remain");
   });
 });
+
+describe("probe-failure disclosure (audit 2026-09-20-round2 Task 3)", () => {
+  it("agent pill title names failing health probes", () => {
+    assert.ok(js.includes("health_probe_failures"), "app.js never reads health.health_probe_failures");
+    const runs = js.slice(js.indexOf("function renderRuns"), js.indexOf("/* ---- detail drawer ---- */"));
+    assert.ok(runs.includes("failing probes: "), "pill title lost the failing-probes disclosure");
+  });
+
+  it("error banner names failing health probes without a new fetch", () => {
+    const banner = js.slice(js.indexOf("function renderApiErrors"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(banner.includes("probeFailures()"), "banner must reuse the probeFailures helper");
+    assert.ok(banner.includes("Health probes failing: "), "banner lost the failing-probes copy");
+    assert.ok(!banner.includes("api(\"/api/"), "banner must not issue a new fetch for probe names");
+  });
+
+  it("pill stays non-red on partial probe failures", () => {
+    const runs = js.slice(js.indexOf("function renderRuns"), js.indexOf("/* ---- detail drawer ---- */"));
+    assert.ok(runs.includes('pill.classList.toggle("bad", last.status === "error")'), "pill bad-toggle must key off run status only");
+    assert.equal(runs.split('"bad"').length - 1, 2, "renderRuns must add no new red path for probe failures");
+  });
+});
+
+describe("neutral first paint (audit 2026-09-20-round2 Task 4)", () => {
+  it("served shell shows … placeholders, never hardcoded digits, in count spans", () => {
+    assert.ok(html.includes('<span id="review-count">…</span>'), "review-count lost its … placeholder");
+    const hardcoded = [...html.matchAll(/<span[^>]*id="[^"]*"[^>]*>\d+/g)].map((m) => m[0]);
+    assert.deepEqual(hardcoded, [], `served shell fabricates a count before JS loads: ${hardcoded.join("; ")}`);
+  });
+
+  it("JS fills the review count from data and keeps the placeholder on fetch failure", () => {
+    const rr = js.slice(js.indexOf("async function refreshReview"), js.indexOf("const fmtAgeH"));
+    assert.ok(rr.includes('$("#review-count")'), "app.js lost the review-count fill");
+    assert.ok(rr.includes("el.textContent = state.reviewList.length"), "review count must fill from the derived review list");
+    assert.ok(rr.includes("apiFailures"), "review fill must keep the … placeholder when the opps fetch failed");
+  });
+
+  it("review-chip tooltip contract stays intact", () => {
+    assert.ok(js.includes("updateReviewChipTitle"), "app.js lost updateReviewChipTitle");
+    assert.ok(js.includes("need review"), "chip title lost the 'need review' copy");
+  });
+});
