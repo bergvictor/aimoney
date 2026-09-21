@@ -214,6 +214,28 @@ export function parseBriefJson(text) {
   return JSON.parse(repairJson(m ? m[0] : "{}"));
 }
 
+// Brief insert (audit 2026-09-20-round4 Task 4): the main and extra brief
+// passes share one guard + INSERT so the "never store an empty brief" rule
+// cannot diverge by path. Returns true when a row was written, false when
+// the parsed brief lacks summary/first_steps (retried next tick, as before).
+// A failed write throws so the caller records brief:failed. The SQL matches
+// the pre-share passes exactly (same 9 columns, same binds, same author).
+export async function insertBrief(env, opportunityId, parsed, sigs) {
+  const b = (parsed && typeof parsed === "object") ? parsed : {};
+  // Never store an empty brief (a parsed-but-keyless object once wrote
+  // five blank fields). Retry naturally on the next tick instead.
+  if (!String(b.summary || "").trim() || !String(b.first_steps || "").trim()) return false;
+  await env.DB.prepare(
+    `INSERT INTO briefs (opportunity_id, version, summary, what_works,
+     numbers_json, risks, first_steps, sources_json, author)
+     VALUES (?,1,?,?,?,?,?,?,'agent')`
+  ).bind(opportunityId, String(b.summary || ""), String(b.what_works || ""),
+    JSON.stringify(b.numbers || []), String(b.risks || ""),
+    String(b.first_steps || ""),
+    JSON.stringify((sigs || []).map((s) => ({ title: s.title, url: s.url })))).run();
+  return true;
+}
+
 // Classify prompt (round3 Task 3): the triage pass and /debug-classify share
 // one prompt builder so debug verdicts reproduce cron verdicts. The built text
 // matches the pre-share live prompt (LF joins, like buildBriefPrompt, so the
@@ -504,17 +526,7 @@ async function runResearch(env, trigger) {
       });
       try {
         const b = parseBriefJson(text);
-        // Never store an empty brief (a parsed-but-keyless object once wrote
-        // five blank fields). Retry naturally on the next tick instead.
-        if (String(b.summary || "").trim() && String(b.first_steps || "").trim()) {
-          await env.DB.prepare(
-          `INSERT INTO briefs (opportunity_id, version, summary, what_works,
-           numbers_json, risks, first_steps, sources_json, author)
-           VALUES (?,1,?,?,?,?,?,?,'agent')`
-        ).bind(bare.id, String(b.summary || ""), String(b.what_works || ""),
-          JSON.stringify(b.numbers || []), String(b.risks || ""),
-          String(b.first_steps || ""),
-          JSON.stringify(sigs.map((s) => ({ title: s.title, url: s.url })))).run();
+        if (await insertBrief(env, bare.id, b, sigs)) {
           state.briefs++;
         }
       } catch { briefFailed = true; /* malformed brief JSON or failed brief write: skip, briefs stay human-seeded */ }
@@ -551,15 +563,7 @@ async function runResearch(env, trigger) {
               messages: buildBriefPrompt(extraBare.title, extraBare.one_liner, sigs2),
             });
             const b2 = parseBriefJson(text2);
-            if (String(b2.summary || "").trim() && String(b2.first_steps || "").trim()) {
-              await env.DB.prepare(
-              `INSERT INTO briefs (opportunity_id, version, summary, what_works,
-               numbers_json, risks, first_steps, sources_json, author)
-               VALUES (?,1,?,?,?,?,?,?,'agent')`
-              ).bind(extraBare.id, String(b2.summary || ""), String(b2.what_works || ""),
-                JSON.stringify(b2.numbers || []), String(b2.risks || ""),
-                String(b2.first_steps || ""),
-                JSON.stringify(sigs2.map((s) => ({ title: s.title, url: s.url })))).run();
+            if (await insertBrief(env, extraBare.id, b2, sigs2)) {
               state.briefs++;
             }
           } catch { briefFailed = true; /* extra brief is best-effort; lands next run */ }
@@ -651,7 +655,9 @@ export default {
       // Accepted, not awaited: a research pass outlives the fetch-handler
       // wall clock, so it runs in waitUntil exactly like the cron path.
       // Watch progress at GET / and in the dashboard research log.
-      ctx.waitUntil(runResearch(env, "manual").catch(() => null));
+      ctx.waitUntil(runResearch(env, "manual").catch((e) => {
+        console.error("cron-failed", e && e.message || e);
+      }));
       return json({ status: "accepted", briefs_skipped: true, reason: "manual skips brief pass" }, 202);
     }
     return json({ error: "not found" }, 404);

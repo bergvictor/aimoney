@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker, { agentMoneyEstimates, buildBriefPrompt, buildClassifyPrompt, exactUrlTarget, flushVerdictWrites, parseBriefJson } from "./index.js";
+import worker, { agentMoneyEstimates, buildBriefPrompt, buildClassifyPrompt, exactUrlTarget, flushVerdictWrites, insertBrief, parseBriefJson } from "./index.js";
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {
@@ -760,6 +760,110 @@ describe("shared classify prompt builder (audit 2026-09-20-round3 Task 3)", () =
     assert.ok(src.includes("timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0"), "triage lost its retries/timeout gate");
     assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
     assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+  });
+});
+
+describe("manual /run failure surfaces in worker logs (audit 2026-09-20-round4 Task 2)", () => {
+  it("manual catch no longer swallows failures; the tail marker exists on the manual path", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(!src.includes('runResearch(env, "manual").catch(() => null)'), "manual run still swallows failures into silence");
+    const manualAt = src.indexOf('runResearch(env, "manual")');
+    assert.ok(manualAt !== -1, "worker lost the manual runResearch call");
+    assert.ok(src.indexOf("cron-failed", manualAt) !== -1, "manual catch lost the tail-visible cron-failed marker");
+  });
+
+  it("D1-dead manual run still 202s but logs cron-failed like cron", async () => {
+    const rejectingDB = {
+      prepare: () => ({
+        bind: () => ({
+          first: async () => { throw new Error("D1 down"); },
+          all: async () => { throw new Error("D1 down"); },
+          run: async () => { throw new Error("D1 down"); },
+        }),
+      }),
+      batch: async () => { throw new Error("D1 down"); },
+    };
+    const adminToken = "test-admin-token";
+    const req = new Request("http://localhost/run", {
+      method: "POST",
+      headers: { authorization: "Bearer " + adminToken },
+    });
+    const env = { ADMIN_TOKEN: adminToken, DB: rejectingDB, AI: null };
+    let waited = null;
+    const ctx = { waitUntil(p) { waited = p; } };
+    const logged = [];
+    const orig = console.error;
+    console.error = (...a) => { logged.push(a.map(String).join(" ")); };
+    try {
+      const res = await worker.fetch(req, env, ctx);
+      assert.equal(res.status, 202);
+      const body = await res.json();
+      assert.equal(body.status, "accepted");
+      assert.ok(waited, "manual run must schedule its pass via waitUntil");
+      await waited;
+    } finally {
+      console.error = orig;
+    }
+    assert.ok(logged.some((l) => l.includes("cron-failed")), `manual D1 death stayed silent; logged: ${JSON.stringify(logged)}`);
+  });
+});
+
+describe("shared brief-insert helper (audit 2026-09-20-round4 Task 4)", () => {
+  it("both brief passes insert through insertBrief; the guard + SQL live in one place", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("export async function insertBrief(env, opportunityId, parsed, sigs)"), "worker lost the shared brief-insert helper");
+    assert.ok(src.includes("await insertBrief(env, bare.id, b, sigs)"), "main brief must insert through the helper");
+    assert.ok(src.includes("await insertBrief(env, extraBare.id, b2, sigs2)"), "extra brief must insert through the helper");
+    assert.equal(src.split("INSERT INTO briefs (opportunity_id, version, summary, what_works,").length - 1, 1, "brief INSERT must live in exactly one place");
+  });
+
+  it("empty briefs write nothing on either path (guard inside the helper)", async () => {
+    let writes = 0;
+    const env = { DB: { prepare: () => ({ bind: () => ({ run: async () => { writes++; } }) }) } };
+    assert.equal(await insertBrief(env, 7, {}, []), false);
+    assert.equal(await insertBrief(env, 7, { summary: "s" }, []), false);
+    assert.equal(await insertBrief(env, 7, { first_steps: "f" }, []), false);
+    assert.equal(await insertBrief(env, 7, { summary: "  ", first_steps: "f" }, []), false);
+    assert.equal(await insertBrief(env, 7, { summary: "s", first_steps: "" }, []), false);
+    assert.equal(await insertBrief(env, 7, null, []), false);
+    assert.equal(writes, 0);
+  });
+
+  it("complete briefs write one row with the 9-column shape and sources JSON", async () => {
+    let sql = "";
+    let binds = null;
+    const env = { DB: { prepare: (s) => ({ bind: (...b) => ({ run: async () => { sql = s; binds = b; } }) }) } };
+    const ok = await insertBrief(env, 7,
+      { summary: "s", what_works: "w", numbers: [{ claim: "c", source: "src" }], risks: "r", first_steps: "f" },
+      [{ title: "T", url: "U", snippet: "S" }]);
+    assert.equal(ok, true);
+    assert.ok(sql.includes("INSERT INTO briefs (opportunity_id, version, summary, what_works,"), "helper lost the brief INSERT");
+    assert.ok(sql.includes("VALUES (?,1,?,?,?,?,?,?,'agent')"), "helper lost the brief VALUES shape");
+    assert.equal(binds[0], 7);
+    assert.equal(binds[1], "s");
+    assert.equal(binds[2], "w");
+    assert.deepEqual(JSON.parse(binds[3]), [{ claim: "c", source: "src" }]);
+    assert.equal(binds[4], "r");
+    assert.equal(binds[5], "f");
+    assert.deepEqual(JSON.parse(binds[6]), [{ title: "T", url: "U" }]);
+  });
+
+  it("a failed write throws so the caller records brief:failed", async () => {
+    const env = { DB: { prepare: () => { throw new Error("D1 down"); } } };
+    await assert.rejects(() => insertBrief(env, 7, { summary: "s", first_steps: "f" }, []), /D1 down/);
+  });
+
+  it("gates and budget stay inline at the call sites, untouched", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("timeoutMs: 90000, retries: 1"), "main brief lost its retries/timeout gate");
+    assert.ok(src.includes("retries: 0"), "extra brief must use retries:0 to stay in budget");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(src.includes("buildBriefPrompt(bare.title, bare.one_liner, sigs)"), "main brief lost its shared prompt builder");
+    assert.ok(src.includes("buildBriefPrompt(extraBare.title, extraBare.one_liner, sigs2)"), "extra brief lost its shared prompt builder");
+    assert.equal(src.split("briefFailed = true").length - 1, 2, "both brief catches must record the failure");
+    assert.ok(src.includes("const extraBare = bare"), "extra query lost its null-bare branch");
     assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
   });
 });
