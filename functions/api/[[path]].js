@@ -83,12 +83,14 @@ const centsDollars = (cents) => "$" + (Number(cents) / 100).toFixed(2);
 // effectiveScore shared via worker/src/lib.js (F3); scoreOf deduped (F6).
 // (local duplicate removed; see import above)
 
-// Experiment-write schema hint (audit 2026-09-20-round4 F3): a live D1 that
-// predates 2026-09-20 lacks revenue_source, which the self-migration
-// deliberately does not cover (probe-read cents only). A narrow
-// "no such column" failure on the experiment write paths answers 503 naming
-// only the column — never SQL or driver text (same regex as health detail).
-// The router awaits exactly these two write paths so their rejections land here.
+// Experiment-write schema tolerance (audit 2026-09-20-round3 finding 3): a
+// live D1 that predates 2026-09-20 lacks revenue_source, which the
+// self-migration deliberately does not cover (probe-read cents only). Each
+// experiment write path retries once without that column when the write
+// fails naming exactly it (identical to its DEFAULT ''); any other narrow
+// "no such column" failure answers 503 naming only the column — never SQL
+// or driver text (same regex as health detail). The router awaits exactly
+// these two write paths so their rejections land here.
 const missingColumnOf = (err) => {
   const msg = err instanceof Error ? err.message : String(err ?? "");
   const m = /no such column:\s*([A-Za-z_][\w.]*)/i.exec(msg);
@@ -348,17 +350,30 @@ async function createExperiment(request, env) {
   const spent_cents = cents(b.spent_cents);
   const revenue_source = String(b.revenue_source || "").slice(0, 120);
   const str = (v) => String(v || "");
-  const r = await env.DB.prepare(
-    `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
-     spent, metric, target, result, started_at, ended_at, post_mortem,
-     revenue_cents, spent_cents, revenue_source)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(b.opportunity_id, str(b.name).slice(0, 200), str(b.hypothesis).slice(0, 8000),
+  const insertArgs = [b.opportunity_id, str(b.name).slice(0, 200), str(b.hypothesis).slice(0, 8000),
     status,
     str(b.budget_cap).slice(0, 120), str(b.spent).slice(0, 120),
     str(b.metric).slice(0, 300), str(b.target).slice(0, 300),
     str(b.result).slice(0, 8000), started_at.slice(0, 30),
-    ended_at.slice(0, 30), str(b.post_mortem).slice(0, 8000), revenue_cents, spent_cents, revenue_source).run();
+    ended_at.slice(0, 30), str(b.post_mortem).slice(0, 8000), revenue_cents, spent_cents, revenue_source];
+  let r;
+  try {
+    r = await env.DB.prepare(
+      `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
+       spent, metric, target, result, started_at, ended_at, post_mortem,
+       revenue_cents, spent_cents, revenue_source)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(...insertArgs).run();
+  } catch (e) {
+    // Old-schema tolerance: retry once without revenue_source (DEFAULT '').
+    if (missingColumnOf(e) !== "revenue_source") throw e;
+    r = await env.DB.prepare(
+      `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
+       spent, metric, target, result, started_at, ended_at, post_mortem,
+       revenue_cents, spent_cents)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(...insertArgs.slice(0, 14)).run();
+  }
   if (status === "won" || status === "lost") {
     const day = nowIso.slice(0, 10);
     const oneLine = String(b.result || "").replace(/\s+/g, " ").trim().slice(0, 200);
@@ -420,14 +435,26 @@ async function updateExperiment(request, env, id) {
       ).bind("\n" + line, cur.opportunity_id).run();
     }
   }
-  await env.DB.prepare(
-    `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
-     metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
-     revenue_cents=?, spent_cents=?, revenue_source=?,
-     updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
-  ).bind(next.name, next.hypothesis, next.status, next.budget_cap, next.spent,
+  const updateArgs = [next.name, next.hypothesis, next.status, next.budget_cap, next.spent,
     next.metric, next.target, next.result, next.started_at, next.ended_at,
-    next.post_mortem, next.revenue_cents, next.spent_cents, next.revenue_source, id).run();
+    next.post_mortem, next.revenue_cents, next.spent_cents, next.revenue_source, id];
+  try {
+    await env.DB.prepare(
+      `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
+       metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
+       revenue_cents=?, spent_cents=?, revenue_source=?,
+       updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
+    ).bind(...updateArgs).run();
+  } catch (e) {
+    // Old-schema tolerance: retry once without revenue_source (DEFAULT '').
+    if (missingColumnOf(e) !== "revenue_source") throw e;
+    await env.DB.prepare(
+      `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
+       metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
+       revenue_cents=?, spent_cents=?,
+       updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
+    ).bind(...updateArgs.slice(0, 13), id).run();
+  }
   return json({ id: Number(id), status: next.status });
 }
 
@@ -454,6 +481,9 @@ export async function onRequest(context) {
       for (let i = 0; i < 7; i++) vettedDays.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
       // One batched round-trip for every independent health select (paired
       // scans merged: lifetime totals, unreviewed+oldest; decisions split from revenue).
+      // Lifetime totals sum every row regardless of status (recorded cents
+      // are recorded cents); the weekly probe stays bound to rows closed
+      // in-window via ended_at.
       // Probe names for the isolation fallback: when the batch rejects, each
       // statement re-runs individually and the failing probe is named in
       // `health_probe_failures` instead of blanking the whole report (F1).
@@ -469,7 +499,7 @@ export async function onRequest(context) {
         env.DB.prepare("SELECT finished_at, started_at FROM agent_runs WHERE status='ok' ORDER BY id DESC LIMIT 1"),
         env.DB.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
         env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
-        env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS revenue, COALESCE(SUM(spent_cents),0) AS spent FROM experiments WHERE status IN ('won','lost')"),
+        env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS revenue, COALESCE(SUM(spent_cents),0) AS spent FROM experiments"),
         env.DB.prepare(`SELECT COUNT(*) AS n FROM opportunities WHERE ${vettedDays.map((d) => `notes LIKE '%[${d} vetted]%'`).join(" OR ")}`),
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
         env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso),

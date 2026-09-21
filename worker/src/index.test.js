@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker, { agentMoneyEstimates, buildBriefPrompt, buildClassifyPrompt, exactUrlTarget, flushVerdictWrites, insertBrief, parseBriefJson, runResearch } from "./index.js";
+import worker, { agentMoneyEstimates, buildBriefPrompt, buildClassifyPrompt, exactUrlTarget, flushVerdictWrites, insertBrief, parseBriefJson, runResearch, _resetBriefSkippedForTests } from "./index.js";
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {
@@ -983,5 +983,107 @@ describe("unreviewed inflow pause (audit 2026-09-20-round2 Task 3)", () => {
     const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
     assert.ok(readme.includes("while unreviewed exceeds 10 the cap drops to 0 for that tick"), "README lost the inflow-pause gate");
     assert.ok(readme.includes("at most 2 new proposals"), "README lost the inflow cap");
+  });
+});
+
+describe("poison-row brief rotation (audit 2026-09-20-round3 Task 3)", () => {
+  // Drives the real runResearch on the cron trigger with stubbed AI that
+  // always returns "{}" (parses, but keyless — insertBrief declines). Two
+  // bare rows, fresh backlog (top-scored mode, no extra pass), zero fresh
+  // signals so classify stays skipped and the brief pass is the only AI.
+  function stubEnv() {
+    const now = new Date().toISOString();
+    const opportunities = [
+      { id: 1, title: "Top scored", one_liner: "one", score: 9000, notes: "UNREVIEWED", created_at: now },
+      { id: 2, title: "Second best", one_liner: "two", score: 8000, notes: "UNREVIEWED", created_at: now },
+    ];
+    const briefedIds = [];
+    let runError = "";
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("SELECT o.* FROM opportunities o LEFT JOIN briefs")) {
+              // Honor the NOT IN rotation exclusion (skip ids ride as the
+              // trailing numeric binds) and the top-scored order.
+              const excluded = new Set(stmt.params.filter((p) => typeof p === "number"));
+              const rows = opportunities.filter((o) => !excluded.has(o.id))
+                .sort((a, b) => b.score - a.score);
+              return rows[0] || null;
+            }
+            if (sql.includes("SELECT created_at FROM opportunities")) return { created_at: now };
+            if (sql.includes("COUNT(*)")) {
+              if (sql.includes("LEFT JOIN briefs")) return { n: 2 };
+              if (sql.includes("UNREVIEWED")) return { n: 2 };
+              return { n: 0 };
+            }
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) return { results: [] };
+            if (sql.includes("SELECT title, url, snippet FROM signals")) {
+              briefedIds.push(stmt.params[0]);
+              return { results: [] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("UPDATE agent_runs SET finished_at")) {
+              runError = String(stmt.params[6] || "");
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = { run: async () => ({ response: "{}" }) };
+    return { env: { DB, AI }, briefedIds, runError: () => runError };
+  }
+
+  async function runTick() {
+    const t = stubEnv();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    try {
+      const result = await runResearch(t.env, "cron");
+      return { result, briefedIds: t.briefedIds, runError: t.runError() };
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("names the skipped row and briefs a different row on the next tick", async () => {
+    _resetBriefSkippedForTests();
+    const first = await runTick();
+    assert.equal(first.result.status, "ok", `first tick failed: ${first.result.error || "(no error)"}`);
+    assert.equal(first.result.briefs, 0);
+    assert.deepEqual(first.briefedIds, [1], "first tick must attempt the top-scored bare row");
+    assert.ok(first.runError.includes("brief:top-scored"), `run log lost the brief mode: ${first.runError}`);
+    assert.ok(first.runError.includes("brief:skipped:1"), `run log must name the skipped row: ${first.runError}`);
+    const second = await runTick();
+    assert.equal(second.result.status, "ok", `second tick failed: ${second.result.error || "(no error)"}`);
+    assert.deepEqual(second.briefedIds, [2], "second tick must rotate past the skipped row");
+    assert.ok(second.runError.includes("brief:skipped:2"), `run log must name the newly skipped row: ${second.runError}`);
+    _resetBriefSkippedForTests();
+  });
+
+  it("falls back to the unfiltered pick when every bare row was skipped", async () => {
+    _resetBriefSkippedForTests();
+    await runTick();
+    await runTick();
+    const third = await runTick();
+    assert.equal(third.result.status, "ok", `third tick failed: ${third.result.error || "(no error)"}`);
+    assert.deepEqual(third.briefedIds, [1], "an all-skipped backlog must keep attempting, not go quiet");
+    _resetBriefSkippedForTests();
   });
 });

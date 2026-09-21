@@ -237,6 +237,33 @@ export async function insertBrief(env, opportunityId, parsed, sigs) {
   return true;
 }
 
+// Poison-row rotation (audit 2026-09-20-round3 finding 4): a brief that
+// parses but lacks summary/first_steps makes insertBrief return false —
+// without a marker the next tick selects the identical row forever. Skipped
+// ids are remembered in this bounded in-memory set (no schema change; each
+// isolate learns within one tick) AND named in the run error, so selection
+// rotates past them while the run log shows exactly which rows were passed
+// over. When every bare row is skipped, selection falls back to the
+// unfiltered pick so the pass keeps attempting instead of going quiet.
+const BRIEF_SKIP_MEMORY = 50;
+const briefSkippedIds = [];
+export function _resetBriefSkippedForTests() { briefSkippedIds.length = 0; }
+function rememberBriefSkip(id) {
+  const n = Number(id);
+  if (!Number.isInteger(n) || briefSkippedIds.includes(n)) return;
+  briefSkippedIds.push(n);
+  while (briefSkippedIds.length > BRIEF_SKIP_MEMORY) briefSkippedIds.shift();
+}
+async function selectBareRow(env, sql, binds) {
+  if (briefSkippedIds.length) {
+    const clause = ` AND o.id NOT IN (${briefSkippedIds.map(() => "?").join(",")})`;
+    const row = await env.DB.prepare(sql.replace(" ORDER BY ", clause + " ORDER BY "))
+      .bind(...binds, ...briefSkippedIds).first().catch(() => null);
+    if (row) return row;
+  }
+  return env.DB.prepare(sql).bind(...binds).first().catch(() => null);
+}
+
 // Classify prompt (round3 Task 3): the triage pass and /debug-classify share
 // one prompt builder so debug verdicts reproduce cron verdicts. The built text
 // matches the pre-share live prompt (LF joins, like buildBriefPrompt, so the
@@ -503,6 +530,7 @@ export async function runResearch(env, trigger) {
     // unless the clock is nearly spent (it lands on a later run instead).
     let briefMode = "skipped";
     let briefFailed = false; // a brief parse/insert threw: named in the run log, retried next tick
+    let briefSkipped = []; // insertBrief-false ids: named in the run log, rotated past next tick
     let bare = null;
     // Backlog age shared by the brief-mode flip and the extra-brief gate: one
     // oldest-unreviewed query per run (new proposals land newer, so the oldest
@@ -519,11 +547,11 @@ export async function runResearch(env, trigger) {
         }
       }
       if (briefMode === "oldest-first") {
-        bare = await env.DB.prepare("SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL AND o.notes LIKE ? ORDER BY o.created_at ASC LIMIT 1").bind(String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)).first().catch(() => null);
+        bare = await selectBareRow(env, "SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL AND o.notes LIKE ? ORDER BY o.created_at ASC LIMIT 1", [String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)]);
       } else {
-        bare = await env.DB.prepare(
+        bare = await selectBareRow(env,
       `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
-       WHERE b.id IS NULL ORDER BY o.score DESC LIMIT 1`).first().catch(() => null); } }
+       WHERE b.id IS NULL ORDER BY o.score DESC LIMIT 1`, []); } }
     if (bare) {
       const sigs = await env.DB.prepare(
         "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
@@ -537,6 +565,11 @@ export async function runResearch(env, trigger) {
         const b = parseBriefJson(text);
         if (await insertBrief(env, bare.id, b, sigs)) {
           state.briefs++;
+        } else {
+          // Parsed-but-keyless brief: name the row in the run log and rotate
+          // past it next tick so one poison row cannot wedge the pass.
+          rememberBriefSkip(bare.id);
+          briefSkipped.push(bare.id);
         }
       } catch { briefFailed = true; /* malformed brief JSON or failed brief write: skip, briefs stay human-seeded */ }
     }
@@ -553,14 +586,14 @@ export async function runResearch(env, trigger) {
         // oldest itself when the first pass found nothing (null-safe: no
         // exclusion bind when bare is null).
         const extraBare = bare
-          ? await env.DB.prepare(
+          ? await selectBareRow(env,
             `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
-             WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' AND o.id != ? ORDER BY o.created_at ASC LIMIT 1`
-          ).bind(bare.id).first().catch(() => null)
-          : await env.DB.prepare(
+             WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' AND o.id != ? ORDER BY o.created_at ASC LIMIT 1`,
+            [bare.id])
+          : await selectBareRow(env,
             `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
-             WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' ORDER BY o.created_at ASC LIMIT 1`
-          ).first().catch(() => null);
+             WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' ORDER BY o.created_at ASC LIMIT 1`,
+            []);
         if (extraBare && state.ai_calls < MAX_AI_CALLS) {
           try {
             const sigs2 = await env.DB.prepare(
@@ -574,6 +607,9 @@ export async function runResearch(env, trigger) {
             const b2 = parseBriefJson(text2);
             if (await insertBrief(env, extraBare.id, b2, sigs2)) {
               state.briefs++;
+            } else {
+              rememberBriefSkip(extraBare.id);
+              briefSkipped.push(extraBare.id);
             }
           } catch { briefFailed = true; /* extra brief is best-effort; lands next run */ }
         }
@@ -581,7 +617,7 @@ export async function runResearch(env, trigger) {
     }
     // Single run-log write carrying the brief mode (a bare finish used to run
     // first and be overwritten here).
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);

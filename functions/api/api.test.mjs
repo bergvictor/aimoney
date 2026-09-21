@@ -127,10 +127,13 @@ function makeDB(seed = {}) {
       return oks[0] || null;
     }
     if (sql.includes("SUM(revenue_cents)") && sql.includes("SUM(spent_cents)") && !sql.includes("-7 days")) {
+      // Mirrors the probe SQL: lifetime totals sum every row unless the
+      // statement carries a status filter.
+      const closedOnly = sql.includes("status IN");
       let revenue = 0;
       let spent = 0;
       for (const e of data.experiments) {
-        if (e.status !== "won" && e.status !== "lost") continue;
+        if (closedOnly && e.status !== "won" && e.status !== "lost") continue;
         revenue += (Number(e.revenue_cents) || 0);
         spent += (Number(e.spent_cents) || 0);
       }
@@ -213,6 +216,8 @@ function makeDB(seed = {}) {
 
   function handleRun(sql, args) {
     if (sql.includes("INSERT INTO experiments")) {
+      // Production emits two shapes: the full 15-bind INSERT and the
+      // old-schema retry without revenue_source (14 binds, DEFAULT '').
       const [opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, revenue_source] = args;
       const id = data.experiments.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0) + 1;
       const now = new Date().toISOString();
@@ -230,7 +235,12 @@ function makeDB(seed = {}) {
       return { success: true, meta: { last_row_id: row.id } };
     }
     if (sql.includes("UPDATE experiments SET")) {
-      const [name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, revenue_source, id] = args;
+      // Two shapes: the full 15-bind UPDATE and the old-schema retry
+      // without revenue_source (14 binds, id last in both).
+      const hasSource = sql.includes("revenue_source");
+      const [name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, ...rest] = args;
+      const id = hasSource ? rest[1] : rest[0];
+      const revenue_source = hasSource ? rest[0] : "";
       const row = data.experiments.find((e) => String(e.id) === String(id));
       if (row) {
         Object.assign(row, { name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, revenue_source });
@@ -1049,7 +1059,7 @@ describe("review brief summary (audit 2026-09-20-round1 Task 1)", () => {
 });
 
 describe("lifetime revenue/spend totals (audit 2026-09-20-round1 Task 3)", () => {
-  it("reports revenue_total/spent_total over all won/lost, no date bound", async () => {
+  it("reports revenue_total/spent_total over all rows, open included, no date bound", async () => {
     const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
     const db = makeDB({
       opportunities: oppSeed(),
@@ -1063,8 +1073,24 @@ describe("lifetime revenue/spend totals (audit 2026-09-20-round1 Task 3)", () =>
     });
     const r = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(r.status, 200);
-    assert.equal(r.body.revenue_total, 150810);
-    assert.equal(r.body.spent_total, 6511);
+    assert.equal(r.body.revenue_total, 163155);
+    assert.equal(r.body.spent_total, 7510);
+  });
+
+  it("counts open-row revenue in lifetime totals but not in the weekly figure (round3 Task 4)", async () => {
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "running", ended_at: "", revenue_cents: 25000, spent_cents: 4000 },
+        { id: 2, opportunity_id: 1, status: "planned", ended_at: "", revenue_cents: 100, spent_cents: 50 },
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.revenue_total, 25100);
+    assert.equal(r.body.spent_total, 4050);
+    assert.equal(r.body.revenue_last_7d, 0);
+    assert.equal(r.body.decisions_last_7d, 0);
   });
 
   it("keeps the weekly revenue figure unchanged", async () => {
@@ -1690,7 +1716,27 @@ describe("self-migration switch (audit 2026-09-20-round3 Task 1)", () => {
   });
 });
 
-describe("experiment-write missing column 503 (audit 2026-09-20-round4 Task 2)", () => {
+describe("experiment-write revenue_source tolerance (audit 2026-09-20-round3 Task 2)", () => {
+  const columnBoom = new Error("INSERT INTO experiments (...) failed: no such column: revenue_source (SQLITE_ERROR)");
+  // Old-schema table: statements touching revenue_source throw the narrow
+  // driver error; the retried statements (without that column) succeed.
+  const oldWriteDB = () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql) => {
+      if (sql.includes("revenue_source")) {
+        return {
+          _sql: sql, _args: [],
+          bind(...a) { return this; },
+          all: async () => { throw columnBoom; },
+          first: async () => { throw columnBoom; },
+          run: async () => { throw columnBoom; },
+        };
+      }
+      return realPrepare(sql);
+    };
+    return db;
+  };
   const writeFailDB = (boom) => {
     const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
     const realPrepare = db.prepare.bind(db);
@@ -1708,31 +1754,50 @@ describe("experiment-write missing column 503 (audit 2026-09-20-round4 Task 2)",
     };
     return db;
   };
-  const columnBoom = new Error("INSERT INTO experiments (...) failed: no such column: revenue_source (SQLITE_ERROR)");
 
-  it("POST /experiments on an unmigrated table 503s naming only revenue_source", async () => {
+  it("POST /experiments on an unmigrated table retries without revenue_source (201, stored '')", async () => {
+    const db = oldWriteDB();
     const r = await callApi(["experiments"], "http://localhost/api/experiments",
-      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, writeFailDB(columnBoom));
-    assert.equal(r.status, 503);
-    assert.equal(r.body.column, "revenue_source");
-    assert.ok(String(r.body.error).includes("revenue_source"), "503 must name the missing column");
-    assert.ok(!JSON.stringify(r.body).includes("INSERT"), "503 must not leak SQL text");
-    assert.ok(!JSON.stringify(r.body).includes("SQLITE_ERROR"), "503 must not leak driver verbiage");
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter", revenue_cents: 500, revenue_source: "Stripe" } }, db);
+    assert.equal(r.status, 201);
+    const stored = db.data.experiments.find((e) => e.id === r.body.id);
+    assert.equal(stored.revenue_source, "");
+    assert.equal(stored.revenue_cents, 500);
+    const list = await callApi(["experiments"], "http://localhost/api/experiments", {}, db);
+    assert.equal(list.body.experiments.find((e) => e.id === r.body.id).revenue_source, "");
   });
 
-  it("PATCH /experiments on an unmigrated table 503s naming only revenue_source", async () => {
+  it("PATCH /experiments on an unmigrated table retries without revenue_source (200, stored '')", async () => {
+    const db = oldWriteDB();
     const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
-      { method: "PATCH", token: "secret", body: { status: "running" } }, writeFailDB(columnBoom));
-    assert.equal(r.status, 503);
-    assert.equal(r.body.column, "revenue_source");
-    assert.ok(String(r.body.error).includes("revenue_source"), "503 must name the missing column");
-    assert.ok(!JSON.stringify(r.body).includes("INSERT"), "503 must not leak SQL text");
-    assert.ok(!JSON.stringify(r.body).includes("SQLITE_ERROR"), "503 must not leak driver verbiage");
+      { method: "PATCH", token: "secret", body: { status: "running", revenue_source: "Stripe" } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.status, "running");
+    assert.equal(db.data.experiments[0].status, "running");
+    assert.equal(db.data.experiments[0].revenue_source, "");
+  });
+
+  it("any other missing column still 503s naming only it", async () => {
+    const spentBoom = new Error("UPDATE experiments (...) failed: no such column: spent_cents (SQLITE_ERROR)");
+    const post = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, writeFailDB(spentBoom));
+    assert.equal(post.status, 503);
+    assert.equal(post.body.column, "spent_cents");
+    assert.ok(String(post.body.error).includes("spent_cents"), "503 must name the missing column");
+    assert.ok(!JSON.stringify(post.body).includes("UPDATE"), "503 must not leak SQL text");
+    assert.ok(!JSON.stringify(post.body).includes("SQLITE_ERROR"), "503 must not leak driver verbiage");
+    const patch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running" } }, writeFailDB(spentBoom));
+    assert.equal(patch.status, 503);
+    assert.equal(patch.body.column, "spent_cents");
+    assert.ok(String(patch.body.error).includes("spent_cents"), "503 must name the missing column");
+    assert.ok(!JSON.stringify(patch.body).includes("UPDATE"), "503 must not leak SQL text");
+    assert.ok(!JSON.stringify(patch.body).includes("SQLITE_ERROR"), "503 must not leak driver verbiage");
   });
 
   it("closure gate still 400s before any write, happy paths unchanged", async () => {
     const gate = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
-      { method: "PATCH", token: "secret", body: { status: "won", result: "r" } }, writeFailDB(columnBoom));
+      { method: "PATCH", token: "secret", body: { status: "won", result: "r" } }, oldWriteDB());
     assert.equal(gate.status, 400);
     assert.ok(gate.body.fields && gate.body.fields.post_mortem);
     const okDB = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
