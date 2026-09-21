@@ -1769,3 +1769,44 @@ describe("opportunity update bounds (audit 2026-09-20-round1 Task 4)", () => {
     assert.equal(args[16].length, 8000);
   });
 });
+
+describe("experiment update bounds (audit 2026-09-20-round3 Task 2)", () => {
+  it("PATCH truncates oversized strings exactly like create", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const seen = [];
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql) => {
+      const stmt = realPrepare(sql);
+      if (sql.includes("UPDATE experiments SET")) {
+        const realBind = stmt.bind.bind(stmt);
+        stmt.bind = (...a) => { seen.push(a); return realBind(...a); };
+      }
+      return stmt;
+    };
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      {
+        method: "PATCH",
+        token: "secret",
+        body: {
+          name: "n".repeat(300), hypothesis: "h".repeat(9000),
+          budget_cap: "b".repeat(200), spent: "s".repeat(200),
+          metric: "m".repeat(400), target: "t".repeat(400),
+          result: "r".repeat(9000), started_at: "1".repeat(100),
+          ended_at: "2".repeat(100), post_mortem: "p".repeat(9000),
+        },
+      }, db);
+    assert.equal(r.status, 200);
+    assert.equal(seen.length, 1);
+    const args = seen[0];
+    assert.equal(args[0].length, 200);
+    assert.equal(args[1].length, 8000);
+    assert.equal(args[3].length, 120);
+    assert.equal(args[4].length, 120);
+    assert.equal(args[5].length, 300);
+    assert.equal(args[6].length, 300);
+    assert.equal(args[7].length, 8000);
+    assert.equal(args[8].length, 30);
+    assert.equal(args[9].length, 30);
+    assert.equal(args[10].length, 8000);
+  });
+});

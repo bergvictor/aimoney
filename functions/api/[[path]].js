@@ -379,9 +379,13 @@ async function updateExperiment(request, env, id) {
   if (!cur) return json({ error: "not found" }, 404);
   const b = await request.json().catch(() => ({}));
   const next = { ...cur };
-  for (const f of ["name", "hypothesis", "budget_cap", "spent", "metric",
-      "target", "result", "started_at", "ended_at", "post_mortem"]) {
-    if (b[f] !== undefined) next[f] = String(b[f]);
+  // Same bounds as createExperiment: an unbounded PATCH must not write past
+  // the newest-kept idiom every other writer honors (round3 Task 2).
+  const EXP_TEXT_BOUNDS = { name: 200, hypothesis: 8000, budget_cap: 120,
+    spent: 120, metric: 300, target: 300, result: 8000, started_at: 30,
+    ended_at: 30, post_mortem: 8000 };
+  for (const f of Object.keys(EXP_TEXT_BOUNDS)) {
+    if (b[f] !== undefined) next[f] = String(b[f]).slice(0, EXP_TEXT_BOUNDS[f]);
   }
   if (b.status !== undefined && !EXP_STATUSES.has(b.status)) {
     return json({ error: `invalid status: ${String(b.status).slice(0, 40)}`, field: "status" }, 400);

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker, { agentMoneyEstimates, buildBriefPrompt, exactUrlTarget, flushVerdictWrites, parseBriefJson } from "./index.js";
+import worker, { agentMoneyEstimates, buildBriefPrompt, buildClassifyPrompt, exactUrlTarget, flushVerdictWrites, parseBriefJson } from "./index.js";
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {
@@ -101,8 +101,9 @@ describe("agent money estimates (audit 2026-09-20-round1 Task 1)", () => {
     for (const k of ["est_monthly_low", "est_monthly_high", "capital_needed", "time_to_first_dollar"]) {
       assert.ok(src.includes(`"${k}"`), `classify schema lost "${k}"`);
     }
-    // Both the live pass and /debug-classify carry the schema.
-    assert.ok(src.indexOf("est_monthly_low") !== src.lastIndexOf("est_monthly_low"), "money schema must appear in both classify prompts");
+    // The live pass and /debug-classify share one builder (round3 Task 3),
+    // so the schema text lives in exactly one place.
+    assert.equal(src.split('"est_monthly_low":0').length - 1, 1, "money schema must live in the shared classify builder only");
   });
 
   it("new-row INSERT persists the four money columns", () => {
@@ -290,11 +291,11 @@ describe("bounded pre-pass + skipped classify fetch (audit 2026-09-20-round3 Tas
   it("quiet ticks skip the top-60 list query and the prompt build", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
     // The live-pass fetch sits inside the fresh guard (the /debug-classify
-    // probe keeps its own unconditional copy later in the file).
+    // probe shares the same builder through its own call later in the file).
     const vStart = src.indexOf("let verdicts = [];");
     const guardAt = src.indexOf("if (fresh.length) {", vStart);
     const fetchAt = src.indexOf("SELECT id, slug, title, status, score", vStart);
-    const promptAt = src.indexOf("const classifyPrompt = [", vStart);
+    const promptAt = src.indexOf("buildClassifyPrompt(opps, fresh)", vStart);
     assert.ok(vStart !== -1, "worker lost the quiet-tick verdicts default");
     assert.ok(guardAt !== -1 && guardAt < fetchAt && guardAt < promptAt, "top-60 fetch and prompt build must sit inside the fresh guard");
     assert.ok(src.includes("!fresh.length ? [] : parseJsonLines(await aiComplete"), "classify AI call lost its empty-fresh guard");
@@ -717,5 +718,48 @@ describe("shared brief prompt+parse helpers (audit 2026-09-20-round1 F5)", () =>
     assert.deepEqual(parseBriefJson('{"opportunity\\_id":3}'), { opportunity_id: 3 });
     assert.deepEqual(parseBriefJson("no json here"), {});
     assert.throws(() => parseBriefJson("{not json}"), "a matched-but-invalid span must throw so the caller records brief:failed");
+  });
+});
+
+describe("shared classify prompt builder (audit 2026-09-20-round3 Task 3)", () => {
+  it("triage and debug-classify build prompts through the shared helper", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("export function buildClassifyPrompt(opps, fresh)"), "worker lost the shared classify-prompt builder");
+    assert.equal(src.split("buildClassifyPrompt(").length - 1, 3, "definition + triage + debug call sites must share buildClassifyPrompt");
+    assert.ok(src.includes("const classifyPrompt = buildClassifyPrompt(opps, fresh);"), "triage must build its prompt through the helper");
+    assert.ok(src.includes("const prompt = buildClassifyPrompt(opps, fresh);"), "debug-classify must build its prompt through the helper");
+    assert.equal(src.split("You triage money-making-with-AI leads").length - 1, 1, "prompt text must live in exactly one place");
+    assert.equal(src.split("DEFAULT TO NOISE").length - 1, 1, "prompt rules must live in exactly one place");
+  });
+
+  it("both call sites emit byte-identical prompts, rules included", () => {
+    const opps = [{ id: 7, title: "Widget rentals", status: "testing" }];
+    const fresh = [
+      { source: "hn", title: "I made $3k/mo with AI invoices", url: "https://example.com/a" },
+      { source: "reddit", title: "AI agency pricing thread", url: "https://example.com/b" },
+    ];
+    const [sys, user] = buildClassifyPrompt(opps, fresh);
+    assert.equal(sys.role, "system");
+    assert.equal(sys.content, "You triage money-making-with-AI leads. Reply with one JSON object per line (NDJSON), no prose, no array, no fences. Keep every value short.");
+    assert.equal(user.role, "user");
+    assert.equal(user.content,
+      "PRIORITY LIST (id | title | status):\n" +
+      "7 | Widget rentals | testing" +
+      "\n\nFRESH SIGNALS (n | source | title | url):\n" +
+      "0 | hn | I made $3k/mo with AI invoices | https://example.com/a\n" +
+      "1 | reddit | AI agency pricing thread | https://example.com/b" +
+      "\n\nFor each signal index 0..1 emit exactly one line:\n" +
+      '{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"est_monthly_low":0,"est_monthly_high":0,"capital_needed":"$0","time_to_first_dollar":"2-4 weeks"}\n' +
+      'Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to earn money (pricing, revenue, customers, or an obvious buyer) that is NOT on the list. A GitHub repo, tool launch, or tutorial with no business model is noise. A variant of a listed method is "supports" with its numeric id. Confidence above 6 requires named revenue/users in the signal, else 5 or less. opportunity_id must be a numeric id from the list or null, never text. For "new", also estimate est_monthly_low/high ($/mo integers, low<=high), capital_needed ("$0" style, <=120 chars) and time_to_first_dollar ("2-4 weeks" style, <=120 chars); omit any you cannot estimate (safe defaults apply).');
+    // Same inputs through the same builder: the two call sites cannot drift.
+    assert.deepEqual(buildClassifyPrompt(opps, fresh), [sys, user]);
+  });
+
+  it("gates and budget stay inline at the call sites, untouched", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0"), "triage lost its retries/timeout gate");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
   });
 });

@@ -214,6 +214,25 @@ export function parseBriefJson(text) {
   return JSON.parse(repairJson(m ? m[0] : "{}"));
 }
 
+// Classify prompt (round3 Task 3): the triage pass and /debug-classify share
+// one prompt builder so debug verdicts reproduce cron verdicts. The built text
+// matches the pre-share live prompt (LF joins, like buildBriefPrompt, so the
+// prompt bytes no longer depend on the checkout's line endings); only the
+// call-site gates (retries/timeoutMs, AI budget) stay inline. Pure for tests.
+export function buildClassifyPrompt(opps, fresh) {
+  return [
+    { role: "system", content: "You triage money-making-with-AI leads. Reply with one JSON object per line (NDJSON), no prose, no array, no fences. Keep every value short." },
+    { role: "user", content:
+      `PRIORITY LIST (id | title | status):\n` +
+      opps.map((o) => `${o.id} | ${o.title} | ${o.status}`).join("\n") +
+      `\n\nFRESH SIGNALS (n | source | title | url):\n` +
+      fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
+      `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:\n` +
+      `{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"est_monthly_low":0,"est_monthly_high":0,"capital_needed":"$0","time_to_first_dollar":"2-4 weeks"}\n` +
+      `Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to earn money (pricing, revenue, customers, or an obvious buyer) that is NOT on the list. A GitHub repo, tool launch, or tutorial with no business model is noise. A variant of a listed method is "supports" with its numeric id. Confidence above 6 requires named revenue/users in the signal, else 5 or less. opportunity_id must be a numeric id from the list or null, never text. For "new", also estimate est_monthly_low/high ($/mo integers, low<=high), capital_needed ("$0" style, <=120 chars) and time_to_first_dollar ("2-4 weeks" style, <=120 chars); omit any you cannot estimate (safe defaults apply).` },
+  ];
+}
+
 // Verdict-writes flush with isolation fallback (audit 2026-09-20-round4 F4):
 // the per-verdict signal/note writes go out as one batch; when the batch
 // rejects, each statement re-runs individually so one bad write cannot drop
@@ -351,17 +370,7 @@ async function runResearch(env, trigger) {
       const opps = await env.DB.prepare(
         "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
         .all().then((r) => r.results || []);
-      const classifyPrompt = [
-        { role: "system", content: "You triage money-making-with-AI leads. Reply with one JSON object per line (NDJSON), no prose, no array, no fences. Keep every value short." },
-        { role: "user", content:
-          `PRIORITY LIST (id | title | status):\n` +
-          opps.map((o) => `${o.id} | ${o.title} | ${o.status}`).join("\n") +
-          `\n\nFRESH SIGNALS (n | source | title | url):\n` +
-          fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
-          `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:
-{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"est_monthly_low":0,"est_monthly_high":0,"capital_needed":"$0","time_to_first_dollar":"2-4 weeks"}
-Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to earn money (pricing, revenue, customers, or an obvious buyer) that is NOT on the list. A GitHub repo, tool launch, or tutorial with no business model is noise. A variant of a listed method is "supports" with its numeric id. Confidence above 6 requires named revenue/users in the signal, else 5 or less. opportunity_id must be a numeric id from the list or null, never text. For "new", also estimate est_monthly_low/high ($/mo integers, low<=high), capital_needed ("$0" style, <=120 chars) and time_to_first_dollar ("2-4 weeks" style, <=120 chars); omit any you cannot estimate (safe defaults apply).` },
-      ];
+      const classifyPrompt = buildClassifyPrompt(opps, fresh);
       const isCron = trigger === "cron";
       verdicts = !fresh.length ? [] : parseJsonLines(await aiComplete(env, state, {
         model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
@@ -623,16 +632,7 @@ export default {
       const opps = await env.DB.prepare(
         "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
         .all().then((r) => r.results || []);
-      const prompt = [
-        { role: "system", content: "You triage money-making-with-AI leads. Reply with one JSON object per line (NDJSON), no prose, no array, no fences. Keep every value short." },
-        { role: "user", content:
-          `PRIORITY LIST (id | title | status):\n` +
-          opps.map((o) => `${o.id} | ${o.title} | ${o.status}`).join("\n") +
-          `\n\nFRESH SIGNALS (n | source | title | url):\n` +
-          fresh.map((s, i) => `${i} | ${s.source} | ${s.title} | ${s.url}`).join("\n") +
-          `\n\nFor each signal index 0..${fresh.length - 1} emit exactly one line:\n` +
-          `{"n":i,"action":"new"|"supports"|"noise","opportunity_id":id or null,"title":"short","one_liner":"under 20 words","category":"services|agency|saas|content|products|other","value":1-10,"effort":1-10,"confidence":1-10,"fit":1-10,"est_monthly_low":0,"est_monthly_high":0,"capital_needed":"$0","time_to_first_dollar":"2-4 weeks"} For "new", also estimate est_monthly_low/high ($/mo integers, low<=high), capital_needed ("$0" style, <=120 chars) and time_to_first_dollar ("2-4 weeks" style, <=120 chars); omit any you cannot estimate (safe defaults apply).` },
-      ];
+      const prompt = buildClassifyPrompt(opps, fresh);
       const t0 = Date.now();
       try {
         const r = await env.AI.run(AI_CLASSIFY, { messages: prompt, max_tokens: CLASSIFY_TOKENS });
