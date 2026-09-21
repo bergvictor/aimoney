@@ -246,11 +246,13 @@ export async function insertBrief(env, opportunityId, parsed, sigs) {
 // Poison-row rotation (audit 2026-09-20-round3 finding 4): a brief that
 // parses but lacks summary/first_steps makes insertBrief return false —
 // without a marker the next tick selects the identical row forever. Skipped
-// ids are remembered in this bounded in-memory set (no schema change; each
-// isolate learns within one tick) AND named in the run error, so selection
-// rotates past them while the run log shows exactly which rows were passed
-// over. When every bare row is skipped, selection falls back to the
-// unfiltered pick so the pass keeps attempting instead of going quiet.
+// ids are remembered in this bounded in-memory set (no schema change) AND
+// named in the run error, so selection rotates past them while the run log
+// shows exactly which rows were passed over. Each tick also re-learns the
+// recent run-log skips below, so a fresh isolate still rotates past a poison
+// row a sibling isolate already named. When every bare row is skipped,
+// selection falls back to the unfiltered pick so the pass keeps attempting
+// instead of going quiet.
 const BRIEF_SKIP_MEMORY = 50;
 const briefSkippedIds = [];
 export function _resetBriefSkippedForTests() { briefSkippedIds.length = 0; }
@@ -272,6 +274,37 @@ async function selectBareRow(env, sql, binds, onFail) {
     if (row) return row;
   }
   return env.DB.prepare(sql).bind(...binds).first().catch(fail);
+}
+
+// Cross-isolate poison memory (audit 2026-09-20-round8 Task 1): the
+// in-memory set above dies with the isolate, so a poison oldest row is
+// re-selected every tick forever. The run log already names skips
+// (brief:skipped:<ids>), so each tick re-learns recent skips from the last
+// few agent_runs error lines — one bounded read, no schema change — and
+// unions them with the in-memory set before either brief pick runs.
+// Best-effort: a failed read keeps today's in-memory behaviour (the reaper
+// UPDATE follows the same rule). Pure parse for tests.
+const BRIEF_SKIP_RUNS = 5;
+export function parseBriefSkippedIds(rows) {
+  const ids = [];
+  for (const row of (rows || [])) {
+    const m = /brief:skipped:([\d,]+)/.exec(String((row && row.error) || row || ""));
+    if (!m) continue;
+    for (const part of m[1].split(",")) {
+      const n = Number(part);
+      if (Number.isInteger(n) && n > 0 && !ids.includes(n)) ids.push(n);
+      if (ids.length >= BRIEF_SKIP_MEMORY) return ids;
+    }
+  }
+  return ids;
+}
+async function loadPersistedBriefSkips(env) {
+  try {
+    const rows = await env.DB.prepare(
+      "SELECT error FROM agent_runs WHERE agent='research-v1' ORDER BY id DESC LIMIT ?")
+      .bind(BRIEF_SKIP_RUNS).all().then((r) => r.results || []);
+    for (const id of parseBriefSkippedIds(rows)) rememberBriefSkip(id);
+  } catch { /* best-effort: in-memory rotation still applies */ }
 }
 
 // Classify prompt (round3 Task 3): the triage pass and /debug-classify share
@@ -564,6 +597,13 @@ export async function runResearch(env, trigger) {
       }
     }
     const verdictFailed = await flushVerdictWrites(env, verdictWrites);
+    // Empty-classify marker (audit 2026-09-20-round8 Task 3): when the
+    // classify call ran (fresh signals, inflow open) but every line dropped
+    // in parseJsonLines, the tick finished ok with no hint the model answered
+    // garbage. Name it so the run log tells model garbage apart from a quiet
+    // queue. A throw finishes error instead, so reaching here means no throw;
+    // paused ticks (maxNewThisRun == 0) and quiet ticks (no fresh) stay silent.
+    const classifyEmpty = fresh.length > 0 && maxNewThisRun > 0 && seen.size === 0;
 
     // 3. One AI pass: brief one bare row — top-scored, or oldest-unreviewed-first past 48h —
     // unless the clock is nearly spent (it lands on a later run instead).
@@ -579,6 +619,9 @@ export async function runResearch(env, trigger) {
     // cannot change mid-run).
     let oldestUnreviewedAgeMs = NaN;
     if (Date.now() - t0 < briefDeadline) {
+      // Re-learn poison rows a sibling isolate already named: without this,
+      // a fresh isolate re-selects the same poison oldest row every tick.
+      await loadPersistedBriefSkips(env);
       briefMode = "top-scored";
       if (trigger === "cron") {
         let oldestForBrief = null;
@@ -670,7 +713,7 @@ export async function runResearch(env, trigger) {
     }
     // Single run-log write carrying the brief mode (a bare finish used to run
     // first and be overwritten here).
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (state.src_partial.length ? ` src_partial:${state.src_partial.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : "") + (prepassFailed ? ` prepass:${prepassFailed}_failed` : "") + (staleFailed ? " stale:failed" : "") + (prepassSelectFailed ? " prepass_select:failed" : "") + (bareSelectFailed ? " bare_select:failed" : "") + (bareCountFailed ? " bare_count:failed" : "") + (unreviewedCountFailed ? " unreviewed_count:failed" : "") + (prepassNotesFailed ? ` prepass_notes:${prepassNotesFailed}_failed` : "") + (slugSelectFailed ? " slug_select:failed" : "") + (briefAgeFailed ? " brief_age:failed" : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (state.src_partial.length ? ` src_partial:${state.src_partial.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : "") + (prepassFailed ? ` prepass:${prepassFailed}_failed` : "") + (staleFailed ? " stale:failed" : "") + (prepassSelectFailed ? " prepass_select:failed" : "") + (bareSelectFailed ? " bare_select:failed" : "") + (bareCountFailed ? " bare_count:failed" : "") + (unreviewedCountFailed ? " unreviewed_count:failed" : "") + (prepassNotesFailed ? ` prepass_notes:${prepassNotesFailed}_failed` : "") + (slugSelectFailed ? " slug_select:failed" : "") + (briefAgeFailed ? " brief_age:failed" : "") + (classifyEmpty ? " classify:empty" : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);

@@ -1922,6 +1922,94 @@ describe("self-migration switch (audit 2026-09-20-round3 Task 1)", () => {
   });
 });
 
+describe("failed self-migration retry (audit 2026-09-20-round8 Task 4)", () => {
+  const wonSeed = () => ([
+    { id: 1, opportunity_id: 1, status: "won", ended_at: new Date().toISOString(), revenue_cents: 50000, spent_cents: 1200 },
+  ]);
+  // An ALTER stub that throws a non-duplicate error WITHOUT adding the
+  // column (unlike oldSchemaDB's alterError, which adds first): the first n
+  // ALTER runs fail, later runs delegate to the real old-schema stub.
+  const failAlterNTimes = (db, n) => {
+    const realPrepare = db.prepare.bind(db);
+    let left = n;
+    db.prepare = (sql) => {
+      if (sql.startsWith("ALTER TABLE experiments ADD COLUMN") && left > 0) {
+        left--;
+        return {
+          _sql: sql, _args: [],
+          bind(...a) { return this; },
+          all: async () => ({ results: [] }),
+          first: async () => null,
+          run: async () => { throw new Error("D1 busy, retry later"); },
+        };
+      }
+      return realPrepare(sql);
+    };
+    return db;
+  };
+
+  it("ALTER fails once then heals: first call names the failed line, next call retries and reports numbers", async () => {
+    _resetSchemaMigrationForTests();
+    const db = failAlterNTimes(oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() }), 1);
+    const env = { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } };
+    const first = await callApi(["health"], "http://localhost/api/health", env, db);
+    assert.equal(first.status, 200);
+    assert.equal(first.body.ok, true);
+    assert.equal(first.body.revenue_total, null, "a partially migrated table still reports null money");
+    assert.deepEqual(first.body.health_probe_failures, ["revenue_week", "revenue_lifetime"]);
+    assert.deepEqual(first.body.schema_missing_columns, ["revenue_cents"], "the failed call must name exactly the still-missing column");
+    assert.ok(first.body.schema_migration.includes("failed"), "payload must carry the failed line");
+    assert.ok(first.body.schema_migration.includes("retry"), "failed line must say the attempt retries");
+    assert.ok(!first.body.schema_migration.includes("disabled"), "failed line must stay distinct from the disabled line");
+    assert.equal(db._oldSchema.pragmaCalls(), 1);
+    const second = await callApi(["health"], "http://localhost/api/health", env, db);
+    assert.equal(db._oldSchema.pragmaCalls(), 2, "a failed ALTER set must not cache: the next call re-PRAGMAs");
+    assert.deepEqual(db._oldSchema.writes, [
+      "ALTER TABLE experiments ADD COLUMN spent_cents INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE experiments ADD COLUMN revenue_cents INTEGER NOT NULL DEFAULT 0",
+    ], "the retry must add exactly the still-missing column");
+    assert.equal(second.body.revenue_last_7d, 50000);
+    assert.equal(second.body.revenue_total, 50000);
+    assert.equal(second.body.spent_total, 1200);
+    assert.ok(!("health_probe_failures" in second.body), "the retried ALTER heals the probes");
+    assert.ok(!("schema_missing_columns" in second.body) && !("schema_migration" in second.body), "a healed table reports no schema keys");
+  });
+
+  it("ALTER always fails: every call names the columns plus the failed line and keeps retrying", async () => {
+    _resetSchemaMigrationForTests();
+    const db = failAlterNTimes(oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() }), 1000000);
+    const env = { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } };
+    const first = await callApi(["health"], "http://localhost/api/health", env, db);
+    assert.equal(first.body.revenue_total, null);
+    assert.deepEqual(first.body.health_probe_failures, ["revenue_week", "revenue_lifetime"]);
+    assert.deepEqual(first.body.schema_missing_columns, ["revenue_cents", "spent_cents"]);
+    assert.ok(first.body.schema_migration.includes("failed"), "payload must carry the failed line");
+    assert.ok(first.body.schema_migration.includes("retry"), "failed line must say the attempt retries");
+    const second = await callApi(["health"], "http://localhost/api/health", env, db);
+    assert.equal(second.body.revenue_total, null, "a still-failing table keeps reporting null money, not zeros");
+    assert.deepEqual(second.body.schema_missing_columns, ["revenue_cents", "spent_cents"]);
+    assert.ok(second.body.schema_migration.includes("failed"), "the retry must keep naming the failure");
+    assert.equal(db._oldSchema.pragmaCalls(), 2, "every failed call re-PRAGMAs instead of caching the shrug");
+    assert.deepEqual(db._oldSchema.writes, [], "no ALTER may record success while every run throws");
+    assert.ok(!db._oldSchema.columns.has("revenue_cents") && !db._oldSchema.columns.has("spent_cents"), "no column may exist while every ALTER throws");
+  });
+
+  it("the failed line stays distinct from the disabled line", async () => {
+    _resetSchemaMigrationForTests();
+    const unsetDb = oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() });
+    const unset = await callApi(["health"], "http://localhost/api/health", {}, unsetDb);
+    assert.ok(unset.body.schema_migration.includes("disabled"), "unset must keep the disabled line");
+    assert.ok(!unset.body.schema_migration.includes("failed"), "disabled line must name no failure");
+    assert.ok(!unset.body.schema_migration.includes("retry"), "disabled line must promise no retry");
+    _resetSchemaMigrationForTests();
+    const failDb = failAlterNTimes(oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() }), 1000000);
+    const failed = await callApi(["health"], "http://localhost/api/health",
+      { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } }, failDb);
+    assert.ok(failed.body.schema_migration.includes("failed"), "set-but-failed must carry the failed line");
+    assert.ok(!failed.body.schema_migration.includes("disabled"), "failed line must stay distinct from the disabled line");
+  });
+});
+
 describe("experiment-write revenue_source tolerance (audit 2026-09-20-round3 Task 2)", () => {
   const columnBoom = new Error("INSERT INTO experiments (...) failed: no such column: revenue_source (SQLITE_ERROR)");
   // Old-schema table: statements touching revenue_source throw the narrow

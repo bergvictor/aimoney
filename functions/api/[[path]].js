@@ -23,8 +23,8 @@ let cachedHealthRev = null;
 // endpoint). Default-off: unset changes nothing; the health payload then
 // names the missing columns plus the disabled line. Decided outcomes are
 // cached below (at most one PRAGMA per isolate once decided); inconclusive
-// answers (PRAGMA throw, empty table_info) are never cached, so the next
-// call retries. Tests reset via _resetSchemaMigrationForTests.
+// answers (PRAGMA throw, empty table_info, failed ALTER) are never cached,
+// so the next call retries. Tests reset via _resetSchemaMigrationForTests.
 const MONEY_PROBE_COLUMNS = ["revenue_cents", "spent_cents"];
 const MONEY_COLUMN_DDL = {
   revenue_cents: "ALTER TABLE experiments ADD COLUMN revenue_cents INTEGER NOT NULL DEFAULT 0",
@@ -71,7 +71,12 @@ async function ensureMoneyColumns(env) {
       if (!/duplicate column|already exists/i.test(msg)) stillMissing.push(col);
     }
   }
-  const done = { missing: stillMissing, migrated: stillMissing.length < missing.length, disabled: false };
+  // A set-but-failed ALTER set is never cached (audit 2026-09-20-round8
+  // Task 4): like the PRAGMA path above, an inconclusive answer retries —
+  // the next call re-PRAGMAs and re-runs the missing ALTERs. The payload
+  // names the failure via `failed` below instead of staying silent.
+  const done = { missing: stillMissing, migrated: stillMissing.length < missing.length, disabled: false, failed: stillMissing.length > 0 };
+  if (stillMissing.length) return done;
   schemaMigrationState = done;
   return done;
 }
@@ -706,7 +711,7 @@ export async function onRequest(context) {
           if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
         }
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status: (healthDown || probeFailed(3)) ? null : experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(6)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(7)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(7)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(8)) ? null : (vettedRow ? vettedRow.n : 0), last_vetted: (healthDown || probeFailed(11)) ? null : last_vetted, last_verdict: (healthDown || probeFailed(11)) ? null : last_verdict, vetted_no_experiment: (healthDown || probeFailed(9)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(10)) ? null : (noiseRow ? noiseRow.n : 0), inflow_paused, time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}) });
+      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status: (healthDown || probeFailed(3)) ? null : experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(6)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(7)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(7)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(8)) ? null : (vettedRow ? vettedRow.n : 0), last_vetted: (healthDown || probeFailed(11)) ? null : last_vetted, last_verdict: (healthDown || probeFailed(11)) ? null : last_verdict, vetted_no_experiment: (healthDown || probeFailed(9)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(10)) ? null : (noiseRow ? noiseRow.n : 0), inflow_paused, time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}), ...(schemaNote && !schemaNote.disabled && schemaNote.failed && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "failed (migration attempted but columns are still missing; will retry on the next call)" } : {}) });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

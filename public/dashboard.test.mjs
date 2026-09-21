@@ -2361,3 +2361,36 @@ describe("experiment modal revenue received-only (audit 2026-09-20-round7 Task 1
     assert.ok(readme.includes("only money actually received"), "README lost the received-only rule");
   });
 });
+
+describe("experiment modal measured-spend labels (audit 2026-09-20-round8 Task 2)", () => {
+  it("Precise spend carries a lifetime-spend hint and the legacy field reads as uncounted", () => {
+    const modal = js.slice(js.indexOf("function openExperimentModal"), js.indexOf('$("#btn-add-exp")'));
+    assert.ok(modal.includes("function openExperimentModal"), "app.js lost the openExperimentModal block boundary");
+    assert.ok(modal.includes('>Precise spend ($)<input id="m-spend"'), "measured-spend field lost its label or input id");
+    assert.ok(modal.includes("Only money actually spent"), "measured-spend field lost its actually-spent hint");
+    assert.ok(modal.includes("counts toward lifetime spend on save"), "measured-spend hint must name the lifetime-spend effect");
+    assert.ok(modal.includes("Spent (free text, not counted)"), "legacy Spent field must read as uncounted free text");
+    assert.ok(!modal.includes('>Spent<input id="m-spent"'), "bare Spent label must be gone from the modal");
+  });
+
+  it("request shapes and payload keys stay byte-identical", () => {
+    const modal = js.slice(js.indexOf("function openExperimentModal"), js.indexOf('$("#btn-add-exp")'));
+    assert.ok(modal.includes('spent_cents: Math.max(0, Math.round(Number($("#m-spend").value.trim()) * 100) || 0)'), "modal lost its spend payload key or clamp");
+    assert.ok(modal.includes('spent: $("#m-spent").value.trim()'), "modal lost its legacy spent payload key");
+  });
+
+  it("README states the spend rule beside the money-column docs", () => {
+    const readme = readFileSync(join(ROOT, "..", "README.md"), "utf8");
+    assert.ok(readme.includes("legacy `Spent` field is uncounted free text"), "README lost the uncounted-Spent rule");
+    assert.ok(readme.includes("only `Precise spend ($)` counts toward lifetime spend"), "README lost the measured-spend rule");
+  });
+
+  it("drawer spend display already shows the measured value (no modal-style ambiguity)", () => {
+    const drawerStart = js.indexOf("async function openDrawer");
+    assert.ok(drawerStart !== -1, "app.js lost openDrawer");
+    const drawerEnd = js.indexOf("/* ---- modals ---- */", drawerStart);
+    assert.ok(drawerEnd !== -1 && drawerEnd > drawerStart, "app.js lost the drawer block boundary");
+    const drawer = js.slice(drawerStart, drawerEnd);
+    assert.ok(drawer.includes("moneyCents(e.spent_cents || 0)} spent"), "drawer must keep rendering measured spent_cents");
+  });
+});

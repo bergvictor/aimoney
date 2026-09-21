@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker, { agentMoneyEstimates, buildBriefPrompt, buildClassifyPrompt, exactUrlTarget, flushVerdictWrites, insertBrief, parseBriefJson, runResearch, _resetBriefSkippedForTests } from "./index.js";
+import worker, { agentMoneyEstimates, buildBriefPrompt, buildClassifyPrompt, exactUrlTarget, flushVerdictWrites, insertBrief, parseBriefJson, parseBriefSkippedIds, runResearch, _resetBriefSkippedForTests } from "./index.js";
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {
@@ -2283,5 +2283,299 @@ describe("worker never vets (audit 2026-09-20-round7 Task 2)", () => {
     assert.ok(src.includes("runResearch"), "positive control: worker source must still own runResearch");
     assert.ok(!/vetted/i.test(src), "worker must never record a vetted verdict (verdicts are human-only)");
     assert.ok(!/\.replace(All)?\([^)]*UNREVIEWED/.test(src), "worker must never clear the UNREVIEWED marker with a replace");
+  });
+});
+
+describe("cross-isolate poison memory (audit 2026-09-20-round8 Task 1)", () => {
+  // Drives the real runResearch on the cron trigger: two bare rows (a poison
+  // top-scored row whose brief parses keyless, a healthy second row), fresh
+  // backlog (top-scored mode, no extra pass), zero fresh signals so classify
+  // stays skipped. The stubbed agent_runs history stands in for the run log a
+  // sibling isolate already wrote; _resetBriefSkippedForTests between ticks
+  // simulates the fresh isolate that forgets the in-memory set.
+  const BRIEF_JSON = JSON.stringify({
+    summary: "Terse summary of the opportunity.", what_works: "Do X.",
+    numbers: [], risks: "Low.", first_steps: "1. Ship the smallest test.",
+  });
+
+  function stubEnv({ history, historyThrows = false }) {
+    const now = new Date().toISOString();
+    const opportunities = [
+      { id: 1, title: "Poison row", one_liner: "one", score: 9000, notes: "UNREVIEWED", created_at: now },
+      { id: 2, title: "Fresh row", one_liner: "two", score: 8000, notes: "UNREVIEWED", created_at: now },
+    ];
+    const briefedIds = [];
+    let runError = "";
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("SELECT o.* FROM opportunities o LEFT JOIN briefs")) {
+              const excluded = new Set(stmt.params.filter((p) => typeof p === "number"));
+              const rows = opportunities.filter((o) => !excluded.has(o.id))
+                .sort((a, b) => b.score - a.score);
+              return rows[0] || null;
+            }
+            if (sql.includes("SELECT created_at FROM opportunities")) return { created_at: now };
+            if (sql.includes("COUNT(*)")) {
+              if (sql.includes("LEFT JOIN briefs")) return { n: 2 };
+              if (sql.includes("UNREVIEWED")) return { n: 2 };
+              return { n: 0 };
+            }
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT error FROM agent_runs")) {
+              if (historyThrows) throw new Error("D1 down");
+              return { results: (history || []).map((error) => ({ error })) };
+            }
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) return { results: [] };
+            if (sql.includes("SELECT title, url, snippet FROM signals")) {
+              briefedIds.push(stmt.params[0]);
+              return { results: [] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("UPDATE agent_runs SET finished_at")) {
+              runError = String(stmt.params[6] || "");
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = {
+      run: async (_model, opts) => (JSON.stringify((opts && opts.messages) || []).includes("Poison row")
+        ? { response: "{}" }
+        : { response: BRIEF_JSON }),
+    };
+    return { env: { DB, AI }, briefedIds, runError: () => runError };
+  }
+
+  async function runTick(opts) {
+    const t = stubEnv(opts);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    try {
+      const result = await runResearch(t.env, "cron");
+      return { result, briefedIds: t.briefedIds, runError: t.runError() };
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("a poison row named in the run log is skipped on the next tick under a fresh isolate while a new bare row still briefs", async () => {
+    _resetBriefSkippedForTests();
+    const first = await runTick({ history: [] });
+    assert.equal(first.result.status, "ok", `first tick failed: ${first.result.error || "(no error)"}`);
+    assert.equal(first.result.briefs, 0);
+    assert.deepEqual(first.briefedIds, [1], "first tick must attempt the top-scored bare row");
+    assert.ok(first.runError.includes("brief:skipped:1"), `run log must name the skipped row: ${first.runError}`);
+    _resetBriefSkippedForTests(); // fresh isolate: the in-memory set is forgotten
+    const second = await runTick({ history: [first.runError] });
+    assert.equal(second.result.status, "ok", `second tick failed: ${second.result.error || "(no error)"}`);
+    assert.deepEqual(second.briefedIds, [2], "second tick must rotate past the history-named poison row");
+    assert.equal(second.result.briefs, 1, "the new bare row must still brief");
+    assert.ok(second.runError.includes("brief:top-scored"), `run log lost the brief mode: ${second.runError}`);
+    assert.ok(!second.runError.includes("brief:skipped"), `a clean brief must name no skip: ${second.runError}`);
+    _resetBriefSkippedForTests();
+  });
+
+  it("falls back to the unfiltered pick when history skips every bare row", async () => {
+    _resetBriefSkippedForTests();
+    const t = await runTick({ history: ["brief:top-scored brief:skipped:1,2"] });
+    assert.equal(t.result.status, "ok", `tick failed: ${t.result.error || "(no error)"}`);
+    assert.deepEqual(t.briefedIds, [1], "an all-skipped backlog must keep attempting, not go quiet");
+    assert.ok(t.runError.includes("brief:skipped:1"), `run log must still name the skip: ${t.runError}`);
+    _resetBriefSkippedForTests();
+  });
+
+  it("a failed history read keeps the in-memory behaviour (best-effort, tick stays ok)", async () => {
+    _resetBriefSkippedForTests();
+    const t = await runTick({ history: [], historyThrows: true });
+    assert.equal(t.result.status, "ok", `tick failed: ${t.result.error || "(no error)"}`);
+    assert.deepEqual(t.briefedIds, [1], "a failed history read must not change the pick");
+    assert.ok(t.runError.includes("brief:skipped:1"), `run log must still name the skip: ${t.runError}`);
+    _resetBriefSkippedForTests();
+  });
+
+  it("parseBriefSkippedIds parses recent lines, dedupes, ignores noise, caps at 50", () => {
+    assert.deepEqual(parseBriefSkippedIds([
+      { error: "brief:top-scored brief:skipped:1,2" },
+      { error: "brief:oldest-first src_fail:hn brief:skipped:2,3" },
+      { error: "phase:collected" },
+      null,
+    ]), [1, 2, 3]);
+    assert.deepEqual(parseBriefSkippedIds([]), []);
+    assert.deepEqual(parseBriefSkippedIds(null), []);
+    const many = [{ error: `brief:top-scored brief:skipped:${Array.from({ length: 60 }, (_, i) => i + 1).join(",")}` }];
+    assert.equal(parseBriefSkippedIds(many).length, 50, "parsed ids must cap at the in-memory bound");
+  });
+});
+
+describe("empty classify marker (audit 2026-09-20-round8 Task 3)", () => {
+  // Drives the real runResearch on the cron trigger: two unprocessed signals,
+  // inflow open, a classify reply that is pure model garbage (no brace spans,
+  // so parseJsonLines yields zero verdicts), and one bare row with a healthy
+  // brief so the brief pass still runs. The AI router counts classify vs
+  // brief calls by their prompt bytes (FRESH SIGNALS only appears in classify).
+  const GARBAGE_REPLY = "Sorry, I cannot help with that request.\nPlease rephrase and try again later.\n";
+  const BRIEF_JSON = JSON.stringify({
+    summary: "Terse summary of the opportunity.", what_works: "Do X.",
+    numbers: [], risks: "Low.", first_steps: "1. Ship the smallest test.",
+  });
+
+  function stubEnv({ bare, unreviewed, emptyFresh = false, classifyThrows = false }) {
+    const now = new Date().toISOString();
+    const signals = [
+      { id: 101, source: "hn", title: "Signal A", url: "https://example.com/a", snippet: "s", processed: 0, opportunity_id: null },
+      { id: 102, source: "hn", title: "Signal B", url: "https://example.com/b", snippet: "s", processed: 0, opportunity_id: null },
+    ];
+    const bareRow = { id: 7, title: "Bare row", one_liner: "needs evidence", score: 9000, notes: "UNREVIEWED", created_at: now };
+    const inserted = [];
+    const briefedIds = [];
+    const calls = { classify: 0, brief: 0 };
+    let runError = "";
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("SELECT o.* FROM opportunities o LEFT JOIN briefs")) return bareRow;
+            if (sql.includes("SELECT created_at FROM opportunities")) return { created_at: now };
+            if (sql.includes("LEFT JOIN briefs")) return { n: bare };
+            if (sql.includes("FROM opportunities WHERE notes LIKE")) return { n: unreviewed };
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT error FROM agent_runs")) return { results: [] };
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) {
+              if (emptyFresh) return { results: [] };
+              const limit = Number(stmt.params[0]) || signals.length;
+              return { results: signals.filter((s) => s.processed === 0).slice(0, limit) };
+            }
+            if (sql.includes("SELECT title, url, snippet FROM signals")) {
+              briefedIds.push(stmt.params[0]);
+              return { results: [] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("INSERT INTO opportunities")) {
+              inserted.push({ sql, params: stmt.params });
+              return { meta: { last_row_id: 1000 + inserted.length } };
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1, opportunity_id")) {
+              const [oppId, sigId] = stmt.params;
+              const s = signals.find((x) => x.id === sigId);
+              if (s) { s.processed = 1; s.opportunity_id = oppId; }
+              return {};
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1 WHERE id")) {
+              const s = signals.find((x) => x.id === stmt.params[0]);
+              if (s) s.processed = 1;
+              return {};
+            }
+            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) {
+              return { meta: { changes: 0 } };
+            }
+            if (sql.includes("UPDATE agent_runs SET finished_at")) {
+              runError = String(stmt.params[6] || "");
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = {
+      run: async (_model, opts) => {
+        const text = JSON.stringify((opts && opts.messages) || []);
+        if (text.includes("FRESH SIGNALS")) {
+          calls.classify++;
+          if (classifyThrows) throw new Error("model overloaded");
+          return { response: GARBAGE_REPLY };
+        }
+        calls.brief++;
+        return { response: BRIEF_JSON };
+      },
+    };
+    return { env: { DB, AI }, signals, inserted, briefedIds, calls, runError: () => runError };
+  }
+
+  async function runTick(opts) {
+    _resetBriefSkippedForTests();
+    const t = stubEnv(opts);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    const origError = console.error;
+    console.error = () => {};
+    try {
+      const result = await runResearch(t.env, "cron");
+      return { result, signals: t.signals, inserted: t.inserted, briefedIds: t.briefedIds, calls: t.calls, runError: t.runError() };
+    } finally {
+      globalThis.fetch = realFetch;
+      console.error = origError;
+      _resetBriefSkippedForTests();
+    }
+  }
+
+  it("garbage classify output finishes ok with classify:empty and leaves signals unprocessed for retry", async () => {
+    const t = await runTick({ bare: 0, unreviewed: 2 });
+    assert.equal(t.result.status, "ok", `run failed: ${t.result.error || "(no error)"}`);
+    assert.equal(t.calls.classify, 1, "classify must have run exactly once");
+    assert.ok(t.runError.includes("classify:empty"), `run log must name the empty classify: ${t.runError}`);
+    assert.deepEqual(t.signals.map((s) => s.processed), [0, 0], "garbage verdicts must leave signals unprocessed for retry");
+    assert.equal(t.inserted.length, 0, "garbage must insert no rows");
+    assert.deepEqual(t.briefedIds, [7], "the brief pass must still run when classify yields nothing");
+  });
+
+  it("paused tick carries inflow:paused and no classify:empty (negative control)", async () => {
+    const t = await runTick({ bare: 0, unreviewed: 11 });
+    assert.equal(t.result.status, "ok", `run failed: ${t.result.error || "(no error)"}`);
+    assert.equal(t.calls.classify, 0, "paused tick must make 0 classify AI calls");
+    assert.ok(t.runError.includes("inflow:paused"), `paused tick lost its marker: ${t.runError}`);
+    assert.ok(!t.runError.includes("classify:empty"), `paused tick must carry no classify marker: ${t.runError}`);
+  });
+
+  it("quiet tick carries no classify:empty (negative control)", async () => {
+    const t = await runTick({ bare: 0, unreviewed: 2, emptyFresh: true });
+    assert.equal(t.result.status, "ok", `run failed: ${t.result.error || "(no error)"}`);
+    assert.equal(t.calls.classify, 0, "quiet tick must make 0 classify AI calls");
+    assert.ok(t.runError.includes("brief:top-scored"), `quiet tick must keep its brief mode: ${t.runError}`);
+    assert.ok(!t.runError.includes("classify:empty"), `quiet tick must carry no classify marker: ${t.runError}`);
+  });
+
+  it("error tick finishes error with no classify:empty (a throw is named, not empty)", async () => {
+    const t = await runTick({ bare: 0, unreviewed: 2, classifyThrows: true });
+    assert.equal(t.result.status, "error", "an AI throw must finish error");
+    assert.ok(!String(t.result.error || "").includes("classify:empty"), "an error tick must carry no classify marker");
+  });
+
+  it("finish line carries the conditional marker and README names it", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    const finishLine = src.split("\n").find((l) => l.includes('await finish("ok"'));
+    assert.ok(finishLine.includes('classifyEmpty ? " classify:empty"'), "finish lost the classify:empty marker");
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("classify:empty"), "README lost the classify:empty marker");
   });
 });
