@@ -468,3 +468,29 @@ describe("hygiene: dead rails gone, shared auth (audit 2026-09-20-round1 Task 4)
   // "manual run disclosure (/run)" above: it passes the same token the
   // shared compare now checks, so no second copy is kept here.
 });
+
+describe("extra brief ungated from first pass (audit 2026-09-20-round3 Task 3)", () => {
+  it("extra gate drops the bare requirement but keeps cron, budget, clock, and 48h gates", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(!src.includes('trigger === "cron" && bare &&'), "extra gate still requires the first-pass bare row");
+    assert.ok(src.includes('if (trigger === "cron" && state.ai_calls < MAX_AI_CALLS && Date.now() - t0 < briefDeadline)'), "extra gate lost cron/budget/clock");
+    assert.ok(src.includes("oldestUnreviewedAgeMs > 48 * 3600000"), "extra gate lost the 48h backlog check");
+  });
+
+  it("null bare briefs the oldest row; non-null bare excludes it (second-oldest)", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("const extraBare = bare"), "extra query lost its null-bare branch");
+    assert.ok(src.includes("AND o.id != ? ORDER BY o.created_at ASC LIMIT 1"), "non-null bare must still exclude the first-pass row");
+    assert.ok(src.includes("WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' ORDER BY o.created_at ASC LIMIT 1"), "null bare must fall back to the oldest unreviewed bare row");
+  });
+
+  it("same AI budget, no status moves, one oldest query, manual skip intact", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(src.includes("retries: 0"), "extra brief must use retries:0 to stay in budget");
+    assert.equal(src.split("SELECT created_at FROM opportunities WHERE notes LIKE").length - 1, 1, "oldest-unreviewed must be queried once per run");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+  });
+});

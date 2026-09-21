@@ -424,7 +424,10 @@ export async function onRequest(context) {
         }
         if (perProbe.some((r) => r !== null)) {
           healthRes = perProbe;
-          healthProbeFailures = failed;
+          // A spuriously-rejected batch whose probes all answer attaches no
+          // key: presence of health_probe_failures means at least one probe
+          // actually failed (an empty array is truthy, so [] would leak).
+          healthProbeFailures = failed.length ? failed : null;
         }
       }
       // A batch with zero answering probes reads as an outage, not as zeros:

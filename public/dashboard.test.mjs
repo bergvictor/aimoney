@@ -871,3 +871,56 @@ describe("neutral first paint (audit 2026-09-20-round2 Task 4)", () => {
     assert.ok(js.includes("need review"), "chip title lost the 'need review' copy");
   });
 });
+
+describe("last-good first paint (audit 2026-09-20-round3 Task 2)", () => {
+  it("persists the painted surfaces to localStorage on each successful refresh", () => {
+    assert.ok(js.includes('const LAST_GOOD_KEY = "aimoney_last_good"'), "app.js lost the last-good cache key");
+    assert.ok(js.includes("function saveLastGood"), "app.js lost saveLastGood");
+    assert.ok(js.includes("localStorage.setItem(LAST_GOOD_KEY"), "saveLastGood never writes the cache");
+    const rt = js.slice(js.indexOf("async function refreshTargets"));
+    assert.ok(rt.includes("saveLastGood({"), "refreshTargets never persists the last-good snapshot");
+    assert.ok(rt.includes("opps: fetchOpps"), "save must know which parts this round refetched");
+    assert.ok(js.includes("topOpportunity(state.opportunities)"), "snapshot must carry the #1 pick");
+    assert.ok(js.includes("state.reviewList.length"), "snapshot must carry the review count");
+  });
+
+  it("paints pill/strip/review chip from cache synchronously before the live refresh", () => {
+    assert.ok(js.includes("function paintLastGood"), "app.js lost paintLastGood");
+    assert.ok(js.includes("localStorage.getItem(LAST_GOOD_KEY"), "paintLastGood never reads the cache");
+    const paintAt = js.indexOf("paintLastGood();");
+    const refreshAt = js.indexOf("refresh().catch");
+    assert.ok(paintAt !== -1 && refreshAt !== -1 && paintAt < refreshAt, "cache paint must run before the live refresh");
+    const paint = js.slice(js.indexOf("function paintLastGood"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(paint.includes('$("#agent-text")'), "cache paint must fill the agent pill");
+    assert.ok(paint.includes('$("#start-here")'), "cache paint must fill the Start-here strip");
+    assert.ok(paint.includes('$("#review-count")'), "cache paint must fill the review chip");
+    assert.ok(paint.includes("Start here today"), "cached strip must keep the strip copy");
+    assert.ok(paint.includes("openDrawer(cachedTop.id)"), "cached strip must deep-link via openDrawer");
+    assert.ok(!paint.includes('api("/api/'), "cache paint must not issue a fetch");
+  });
+
+  it("stale-marks cache older than one 6h cron tick; unknown age reads stale", () => {
+    assert.ok(js.includes("const LAST_GOOD_MAX_AGE_MS = 6 * 3600000"), "cache lost the one-cron-tick bound");
+    assert.ok(js.includes("LAST_GOOD_STALE_MARK"), "cache lost the stale mark");
+    const constAt = js.indexOf("const LAST_GOOD_MAX_AGE_MS");
+    const fnAt = js.indexOf("const isSnapshotStale");
+    assert.ok(constAt !== -1 && fnAt !== -1, "app.js lost the staleness helper");
+    const isSnapshotStale = new Function(
+      `${js.slice(constAt, js.indexOf(";", constAt) + 1)} ${js.slice(fnAt, js.indexOf(";", fnAt) + 1)} return isSnapshotStale;`)();
+    const now = Date.now();
+    assert.equal(isSnapshotStale(now - 1000, now), false, "fresh cache must paint unmarked");
+    assert.equal(isSnapshotStale(now - 6 * 3600000 - 1, now), true, "cache past one tick must stale-mark");
+    assert.equal(isSnapshotStale(undefined, now), true, "undated cache must read stale");
+    assert.equal(isSnapshotStale(null, now), true, "null age must read stale");
+    const paint = js.slice(js.indexOf("function paintLastGood"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(paint.split("LAST_GOOD_STALE_MARK").length - 1 >= 4, "stale mark must reach pill, chip, and strip");
+  });
+
+  it("live data always wins; failures keep the cache instead of wiping", () => {
+    const strip = js.slice(js.indexOf("function renderStartHere"), js.indexOf("/* ---- priority list ---- */"));
+    assert.ok(strip.includes('includes("/api/opportunities")'), "failed refresh must keep the cached strip");
+    assert.ok(strip.includes("el.innerHTML ="), "live strip must still repaint on success");
+    const rr = js.slice(js.indexOf("async function refreshReview"), js.indexOf("const fmtAgeH"));
+    assert.ok(rr.includes("el.textContent = state.reviewList.length"), "review count must still fill from live data");
+  });
+});

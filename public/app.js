@@ -104,7 +104,13 @@ function renderStartHere() {
   const el = $("#start-here");
   if (!el) return;
   const top = topOpportunity(state.opportunities);
-  if (!top) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  if (!top) {
+    // A failed opps fetch must not wipe the last-good cached strip (painted
+    // synchronously at boot): keep it until live data wins. Without a cache
+    // the strip stays hidden, exactly as today.
+    if ((state.apiFailures || []).includes("/api/opportunities")) return;
+    el.classList.add("hidden"); el.innerHTML = ""; return;
+  }
   const excerpt = firstStepsFirstLine({ first_steps: top.brief_first_steps });
   const nextAction = excerpt || "No brief yet — open the drawer for facts.";
   const needsReview = isNeedsReview(top);
@@ -250,7 +256,9 @@ async function refreshReview() {
   // would fabricate an empty queue); the error banner names the failure.
   if (el && !(state.apiFailures || []).includes("/api/opportunities")) el.textContent = state.reviewList.length;
   const ageEl = $("#review-age");
-  if (ageEl) ageEl.textContent = oldestReviewAge();
+  // Mirror the count guard above: on an opps-fetch failure keep the last-good
+  // cached age instead of wiping it to "".
+  if (ageEl && !(state.apiFailures || []).includes("/api/opportunities")) ageEl.textContent = oldestReviewAge();
   updateReviewChipTitle();
 }
 
@@ -1178,6 +1186,118 @@ function renderApiErrors() {
   if (dismiss) dismiss.addEventListener("click", () => el.classList.add("hidden"));
 }
 
+/* ---- last-good cache: instant first paint, live data always wins ---- */
+// The owner's first five seconds used to be placeholders ("agent: …",
+// "Needs review (…"). Each successful refresh now persists the painted
+// surfaces (pill run, Start-here top pick, review count/age, health bits) to
+// localStorage, and boot repaints them synchronously before the first fetch.
+// Parts carry their own savedAt so a scoped refresh never re-stamps data it
+// did not refetch; anything older than one 6h cron tick paints with a stale
+// mark. Read-only: every live render overwrites unconditionally on success,
+// and a failed refresh keeps the cache (marked) instead of blanking.
+const LAST_GOOD_KEY = "aimoney_last_good";
+const LAST_GOOD_MAX_AGE_MS = 6 * 3600000; // one cron tick
+const LAST_GOOD_STALE_MARK = " · stale";
+// Pure: unknown age reads stale (never paint undated data as fresh).
+const isSnapshotStale = (savedAt, now) => !(typeof savedAt === "number" && Number.isFinite(savedAt)) || (Number(now) - savedAt) > LAST_GOOD_MAX_AGE_MS;
+
+const readLastGood = () => {
+  try {
+    const snap = JSON.parse(localStorage.getItem(LAST_GOOD_KEY) || "null");
+    return snap && typeof snap === "object" ? snap : null;
+  } catch { return null; }
+};
+
+// Merge only the parts this round actually refetched (fresh flags from
+// refreshTargets); a part keeps its own savedAt so staleness stays honest.
+function saveLastGood(fresh) {
+  if (!fresh || (!fresh.opps && !fresh.health && !fresh.runs)) return;
+  const snap = readLastGood() || {};
+  const now = Date.now();
+  if (fresh.health) {
+    const h = state.health || {};
+    snap.health = {
+      noise_24h: (typeof h.noise_24h === "number" ? h.noise_24h : null),
+      bare_without_brief: (typeof h.bare_without_brief === "number" ? h.bare_without_brief : null),
+      savedAt: now,
+    };
+  }
+  if (fresh.opps) {
+    const top = topOpportunity(state.opportunities);
+    snap.top = top ? {
+      id: top.id, title: top.title,
+      est_monthly_low: top.est_monthly_low, est_monthly_high: top.est_monthly_high,
+      capital_needed: top.capital_needed, brief_first_steps: top.brief_first_steps,
+      needs_review: isNeedsReview(top) ? 1 : 0, savedAt: now,
+    } : { id: null, savedAt: now };
+    snap.review = { count: state.reviewList.length, age: oldestReviewAge(), savedAt: now };
+  }
+  if (fresh.runs) {
+    const last = (state.runs || [])[0] || null;
+    snap.run = last ? {
+      status: last.status, added: last.added, updated: last.updated, briefs: last.briefs,
+      finished_at: last.finished_at || "", started_at: last.started_at || "", savedAt: now,
+    } : { status: null, savedAt: now };
+  }
+  try { localStorage.setItem(LAST_GOOD_KEY, JSON.stringify(snap)); } catch { /* private mode: boot just paints placeholders */ }
+}
+
+function paintLastGood() {
+  const snap = readLastGood();
+  if (!snap) return;
+  // Pill: same shape as renderRuns, stale-marked past one tick.
+  const run = snap.run;
+  if (run && run.status && $("#agent-text")) {
+    const when = String(run.finished_at || run.started_at || "").slice(0, 16).replace("T", " ");
+    const noise = snap.health && typeof snap.health.noise_24h === "number" ? snap.health.noise_24h : null;
+    $("#agent-text").textContent =
+      `agent: ${run.status} · +${run.added}/${run.updated}/${run.briefs} · ${when}` +
+      (noise !== null ? ` · ${noise} noise` : "") +
+      (isSnapshotStale(run.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "");
+    const pill = $("#agent-pill");
+    if (pill) pill.title = (noise !== null ? `Latest research run: +${run.added}/${run.updated} · ${noise} noise` : "Latest research run") +
+      (isSnapshotStale(run.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "");
+  }
+  // Review chip: count + age + tooltip, stale-marked past one tick.
+  const review = snap.review;
+  if (review && typeof review.count === "number") {
+    const staleMark = isSnapshotStale(review.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "";
+    if ($("#review-count")) $("#review-count").textContent = review.count;
+    if ($("#review-age")) $("#review-age").textContent = String(review.age || "") + staleMark;
+    const chip = document.querySelector('.filters .chip[data-review="1"]');
+    if (chip) {
+      const bare = snap.health && typeof snap.health.bare_without_brief === "number" ? snap.health.bare_without_brief : null;
+      chip.title = `${review.count} need review` + (bare !== null ? ` · ${bare} without briefs` : "") + staleMark;
+    }
+  }
+  // Strip: same copy and actions as renderStartHere, stale-marked past one
+  // tick. Vet/Kill re-fetch detail before writing, so a cached id is safe.
+  const cachedTop = snap.top;
+  const el = $("#start-here");
+  if (cachedTop && cachedTop.id !== null && cachedTop.id !== undefined && el) {
+    const staleMark = isSnapshotStale(cachedTop.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "";
+    const excerpt = firstStepsFirstLine({ first_steps: cachedTop.brief_first_steps });
+    const nextAction = excerpt || "No brief yet — open the drawer for facts.";
+    const needsReview = Number(cachedTop.needs_review) === 1;
+    el.classList.remove("hidden");
+    el.innerHTML =
+      `<div style="background:var(--green-wash);border:1px solid var(--green);border-radius:8px;padding:10px 12px;margin-bottom:12px">` +
+      `<p style="margin:0 0 4px"><b>Start here today:</b> ${esc(cachedTop.title)}${staleMark}</p>` +
+      `<p class="muted" style="margin:0 0 8px;font-size:13px"><span class="mono">${money(cachedTop.est_monthly_low, cachedTop.est_monthly_high)}/mo</span>` +
+      ` · <span>Capital: ${esc(cachedTop.capital_needed || "—")}</span>` +
+      ` · <span>Next: ${esc(nextAction)}</span></p>` +
+      `<p style="margin:0"><button id="start-here-open" class="btn small" type="button">Open in drawer</button>` +
+      (needsReview ? ` <button id="start-here-vet" class="btn small" type="button">Vet</button> <button id="start-here-kill" class="btn small ghost danger" type="button">Kill</button>` : "") +
+      `</p>` +
+      `</div>`;
+    $("#start-here-open").addEventListener("click", () => openDrawer(cachedTop.id));
+    if (needsReview) {
+      $("#start-here-vet").addEventListener("click", () => vetOpportunity(cachedTop.id));
+      $("#start-here-kill").addEventListener("click", (ev) => killOpportunity(cachedTop.id, ev.currentTarget));
+    }
+  }
+}
+
 /* ---- boot ---- */
 // refresh() stays the full repaint (boot, banner Retry, delayed post-triage
 // refresh): it delegates to refreshTargets with every endpoint enabled.
@@ -1225,7 +1345,17 @@ async function refreshTargets(want = {}) {
   renderLedger();
   renderExperiments();
   renderRuns();
+  // Persist the painted surfaces for the next boot's instant paint. Only the
+  // parts this round actually refetched are saved (scoped refreshes merge).
+  saveLastGood({
+    opps: fetchOpps && !(state.apiFailures || []).includes("/api/opportunities"),
+    health: fetchHealth && !(state.apiFailures || []).includes("/api/health"),
+    runs: fetchRuns && !(state.apiFailures || []).includes("/api/runs"),
+  });
 }
+// Instant first paint from the last-good cache (placeholders stay when there
+// is no cache); the live refresh below always wins.
+paintLastGood();
 refresh().catch((e) => {
   $("#ledger-body").innerHTML = `<tr><td colspan="10">API unreachable: ${esc(e.message)} — is the D1 binding attached?</td></tr>`;
 });

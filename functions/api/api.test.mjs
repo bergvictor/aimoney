@@ -1316,6 +1316,28 @@ describe("health probe isolation (audit 2026-09-20-round1 Task 1)", () => {
     assert.equal(r.body.unreviewed, 2);
     assert.deepEqual(r.body.health_probe_failures, ["opportunities"]);
   });
+
+  it("spurious batch rejection with all probes answering attaches no failures key", async () => {
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: new Date().toISOString(), revenue_cents: 50000, spent_cents: 1200 },
+      ],
+    });
+    const flakyBatch = { ...db, batch: async () => { throw new Error("spurious batch reject"); } };
+    const r = await callApi(["health"], "http://localhost/api/health", {}, flakyBatch);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.db, "up");
+    assert.ok(!("health_probe_failures" in r.body), "a batch that rejects spuriously must not attach an empty failures key");
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "time"]);
+    assert.equal(r.body.opportunities, 3);
+    assert.equal(r.body.unreviewed, 2);
+    assert.equal(r.body.decisions_last_7d, 1);
+    assert.equal(r.body.revenue_last_7d, 50000);
+    assert.equal(r.body.revenue_total, 50000);
+    assert.equal(r.body.spent_total, 1200);
+  });
 });
 
 describe("vetted tag-date SELECT (audit 2026-09-20-round2 Task 2)", () => {

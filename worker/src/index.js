@@ -470,14 +470,24 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
 
     // When the review backlog is old (>48h), brief one extra oldest-unreviewed
     // bare row per cron tick. Mirrors the brief pass above (retries:0 to stay
-    // within MAX_AI_CALLS); best-effort, lands next run on failure.
-    if (trigger === "cron" && bare && state.ai_calls < MAX_AI_CALLS && Date.now() - t0 < briefDeadline) {
+    // within MAX_AI_CALLS); best-effort, lands next run on failure. Ungated
+    // from the first pass: when the first pass came up empty (bare is null)
+    // the oldest row is still briefed here instead of skipping the tick.
+    if (trigger === "cron" && state.ai_calls < MAX_AI_CALLS && Date.now() - t0 < briefDeadline) {
       // Reuses the backlog age from the brief-mode check above: no second query.
       if (Number.isFinite(oldestUnreviewedAgeMs) && oldestUnreviewedAgeMs > 48 * 3600000) {
-        const extraBare = await env.DB.prepare(
-          `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
-           WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' AND o.id != ? ORDER BY o.created_at ASC LIMIT 1`
-        ).bind(bare.id).first().catch(() => null);
+        // Second-oldest when the first pass already took the oldest; the
+        // oldest itself when the first pass found nothing (null-safe: no
+        // exclusion bind when bare is null).
+        const extraBare = bare
+          ? await env.DB.prepare(
+            `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
+             WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' AND o.id != ? ORDER BY o.created_at ASC LIMIT 1`
+          ).bind(bare.id).first().catch(() => null)
+          : await env.DB.prepare(
+            `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
+             WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' ORDER BY o.created_at ASC LIMIT 1`
+          ).first().catch(() => null);
         if (extraBare && state.ai_calls < MAX_AI_CALLS) {
           try {
             const sigs2 = await env.DB.prepare(
