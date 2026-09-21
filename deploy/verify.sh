@@ -37,6 +37,7 @@ check "api-runs"            "$PAGES/api/runs?$CB"          '"runs"'
 
 echo "==> verifying ${WORKER}"
 check "worker-status"       "$WORKER/?$CB"                 '"agent":"research-v1"'
+check "worker-status-ok"    "$WORKER/?$CB"                 '"ok":true'
 
 # Live-revision gate: the edge must serve the deployed commit. release.json
 # is stamped at build time (Pages build command `scripts/stamp-release.sh`;

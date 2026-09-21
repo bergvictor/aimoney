@@ -562,6 +562,21 @@ const stalestOpenExp = (exps) => {
   return open[0] || null;
 };
 
+// Fallback decisions/week from the already-loaded experiments list (no new
+// request): won/lost rows with ended_at inside 7d. Mirrors the API's
+// decisions_last_7d window so the header stays honest when the money probes
+// fail; health numbers win whenever present (see renderExperiments).
+const fallbackDecisions = (exps) => {
+  const cutoff = Date.now() - 7 * 86400000;
+  let n = 0;
+  for (const e of (exps || [])) {
+    if (e.status !== "won" && e.status !== "lost") continue;
+    const ms = Date.parse(String(e.ended_at || ""));
+    if (Number.isFinite(ms) && ms >= cutoff) n++;
+  }
+  return n;
+};
+
 // Nudge deep-link (read-only): switch to the Experiments tab and
 // highlight/scroll to the stalest card so the next move is one tap away.
 // No auto-transitions — the human still presses Start.
@@ -642,11 +657,15 @@ function renderExperiments() {
   $("#exp-count").textContent = exps.length || "";
   const running = exps.filter((e) => e.status === "running").length;
   const won = exps.filter((e) => e.status === "won").length;
-  const decisions = state.health && typeof state.health.decisions_last_7d === "number" ? state.health.decisions_last_7d : null;
+  const healthDecisions = state.health && typeof state.health.decisions_last_7d === "number" ? state.health.decisions_last_7d : null;
   const vetted = state.health && typeof state.health.vetted_last_7d === "number" ? state.health.vetted_last_7d : null;
   const vettedNoExp = state.health && typeof state.health.vetted_no_experiment === "number" ? state.health.vetted_no_experiment : null;
   const revenue = state.health && typeof state.health.revenue_last_7d === "number" ? state.health.revenue_last_7d : null;
   const revenueTotal = state.health && typeof state.health.revenue_total === "number" ? state.health.revenue_total : null;
+  // Fallback: when the money probes fail (null), count decisions from the
+  // already-loaded list so the week line and the stall nudge survive the
+  // outage. Health wins whenever present; no new request is made.
+  const decisions = healthDecisions !== null ? healthDecisions : fallbackDecisions(exps);
   let summary = exps.length
     ? `${exps.length} experiments · ${running} running · ${won} won`
     : (state.apiFailures.includes("/api/experiments")

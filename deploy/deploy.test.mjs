@@ -134,6 +134,16 @@ describe("shared D1 migration script (audit 2026-09-20-round2 Task 1)", () => {
   });
 });
 
+describe("worker-status gate requires ok:true (audit 2026-09-20-round3 Task 3)", () => {
+  it("fails a D1-dead worker root that still serves its agent marker", () => {
+    const workerChecks = lines(read("deploy/verify.sh")).filter((l) => l.includes("$WORKER/"));
+    assert.ok(workerChecks.length >= 1, "verify.sh lost the worker-status check");
+    const joined = workerChecks.join("\n");
+    assert.ok(joined.includes('"agent":"research-v1"'), "worker-status gate must keep the agent marker");
+    assert.ok(joined.includes('"ok":true'), 'worker-status gate must require "ok":true so a D1-dead worker (ok:false) fails verification');
+  });
+});
+
 describe("verify.sh requires live revision == deployed commit (audit 2026-09-20-round1 Task 3)", () => {
   it("takes an expected SHA, defaulting to the current short HEAD", () => {
     const verify = read("deploy/verify.sh");

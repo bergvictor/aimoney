@@ -496,6 +496,45 @@ describe("bare-backlog inflow gate (audit 2026-09-20-round2 Task 3)", () => {
   });
 });
 
+describe("worker root health honesty (audit 2026-09-20-round3 Task 3)", () => {
+  const getRoot = (env) => worker.fetch(new Request("http://localhost/"), env, {});
+
+  it("reports ok:false (503) when the last-run read fails", async () => {
+    const failingDB = { prepare: () => ({ first: async () => { throw new Error("D1 down"); } }) };
+    const res = await getRoot({ DB: failingDB });
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.equal(body.agent, "research-v1");
+    assert.equal(body.last_run, null);
+  });
+
+  it("reports ok:false (503) when DB is unbound", async () => {
+    for (const DB of [null, undefined]) {
+      const res = await getRoot({ DB });
+      assert.equal(res.status, 503);
+      assert.equal((await res.json()).ok, false);
+    }
+  });
+
+  it("keeps the healthy shape unchanged, including an empty run log", async () => {
+    const row = { id: 1, status: "ok" };
+    const okDB = { prepare: () => ({ first: async () => row }) };
+    const res = await getRoot({ DB: okDB });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(Object.keys(body), ["ok", "agent", "last_run"]);
+    assert.equal(body.ok, true);
+    assert.equal(body.agent, "research-v1");
+    assert.deepEqual(body.last_run, row);
+    // An empty table (null row, answering database) is healthy, not down.
+    const emptyDB = { prepare: () => ({ first: async () => null }) };
+    const res2 = await getRoot({ DB: emptyDB });
+    assert.equal(res2.status, 200);
+    assert.equal((await res2.json()).ok, true);
+  });
+});
+
 describe("extra brief ungated from first pass (audit 2026-09-20-round3 Task 3)", () => {
   it("extra gate drops the bare requirement but keeps cron, budget, clock, and 48h gates", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");

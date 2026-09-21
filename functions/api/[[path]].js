@@ -13,6 +13,64 @@ import { effectiveScore, tokensMatch } from "../../worker/src/lib.js";
 // reused by every later /api/health call (a failed fetch retries next call).
 let cachedHealthRev = null;
 
+// Self-migration switch (audit 2026-09-20-round3 Finding 1): live D1 may
+// predate the money columns the health probes read. On first need — a failed
+// money probe — the health handler calls ensureMoneyColumns, which compares
+// PRAGMA table_info(experiments) ONLY against the columns the probes read.
+// When columns are missing AND the owner set ALLOW_SCHEMA_MIGRATION=1, it
+// applies exactly the ADD COLUMN statements from
+// d1/migrate-2026-09-20-experiment-cents.sql, one at a time (ADD-only, no
+// endpoint). Default-off: unset changes nothing; the health payload then
+// names the missing columns plus the disabled line. At most once per
+// isolate (cached below); tests reset via _resetSchemaMigrationForTests.
+const MONEY_PROBE_COLUMNS = ["revenue_cents", "spent_cents"];
+const MONEY_COLUMN_DDL = {
+  revenue_cents: "ALTER TABLE experiments ADD COLUMN revenue_cents INTEGER NOT NULL DEFAULT 0",
+  spent_cents: "ALTER TABLE experiments ADD COLUMN spent_cents INTEGER NOT NULL DEFAULT 0",
+};
+let schemaMigrationState = null;
+export function _resetSchemaMigrationForTests() { schemaMigrationState = null; }
+
+async function ensureMoneyColumns(env) {
+  if (schemaMigrationState) return schemaMigrationState;
+  const none = { missing: [], migrated: false, disabled: false };
+  if (!env.DB) { schemaMigrationState = none; return none; }
+  let have;
+  try {
+    const info = await env.DB.prepare("PRAGMA table_info(experiments)").all();
+    have = new Set((info.results || []).map((c) => c.name));
+  } catch {
+    // PRAGMA unsupported or the database unreachable: leave the probes to
+    // report (unset behaviour stays byte-identical to today).
+    schemaMigrationState = none;
+    return none;
+  }
+  // An empty table_info (an unknown stub shape) means "cannot tell": report
+  // nothing rather than guessing the table is old.
+  if (!have.size) { schemaMigrationState = none; return none; }
+  const missing = MONEY_PROBE_COLUMNS.filter((c) => !have.has(c));
+  if (!missing.length) { schemaMigrationState = none; return none; }
+  if (String(env.ALLOW_SCHEMA_MIGRATION || "") !== "1") {
+    const disabled = { missing, migrated: false, disabled: true };
+    schemaMigrationState = disabled;
+    return disabled;
+  }
+  const stillMissing = [];
+  for (const col of missing) {
+    try {
+      await env.DB.prepare(MONEY_COLUMN_DDL[col]).run();
+    } catch (e) {
+      // Duplicate-column means a sibling isolate already added it: no-op.
+      // Any other failure keeps the column missing (the probes name it).
+      const msg = String((e && e.message) || e || "");
+      if (!/duplicate column|already exists/i.test(msg)) stillMissing.push(col);
+    }
+  }
+  const done = { missing: stillMissing, migrated: stillMissing.length < missing.length, disabled: false };
+  schemaMigrationState = done;
+  return done;
+}
+
 const clamp10 = (v, dflt) => {
   const n = Number(v);
   if (!Number.isFinite(n)) return dflt;
@@ -438,6 +496,31 @@ export async function onRequest(context) {
           healthProbeDetail = Object.keys(failedDetail).length ? failedDetail : null;
         }
       }
+      // Lazy self-migration (Finding 1): only when a money probe actually
+      // failed (the old-schema signal) does the handler PRAGMA the table
+      // and, when the owner enabled ALLOW_SCHEMA_MIGRATION=1, ADD the
+      // missing money columns, then re-run the failed money probes so this
+      // same call reports numbers. Default-off: unset leaves the table
+      // untouched and the payload names the missing columns plus the
+      // disabled line below. At most once per isolate; ADD-only.
+      let schemaNote = null;
+      if (healthProbeFailures && (healthProbeFailures.includes("decisions_revenue_week") || healthProbeFailures.includes("revenue_lifetime"))) {
+        schemaNote = await ensureMoneyColumns(env);
+        if (schemaNote.migrated) {
+          for (const i of [5, 6]) {
+            if (!healthProbeFailures.includes(healthProbeNames[i])) continue;
+            try {
+              const row = await healthStmts[i].first();
+              healthRes[i] = { results: row ? [row] : [] };
+              healthProbeFailures = healthProbeFailures.filter((n) => n !== healthProbeNames[i]);
+              if (healthProbeDetail) delete healthProbeDetail[healthProbeNames[i]];
+            } catch {
+              // Still failing: keep today's null + failure naming.
+            }
+          }
+          if (!healthProbeFailures.length) { healthProbeFailures = null; healthProbeDetail = null; }
+        }
+      }
       // A batch with zero answering probes reads as an outage, not as zeros:
       // ok flips to false (so the unchanged verify.sh '"ok":true' grep fails
       // the rollout) and every count key goes null — the dashboard
@@ -487,7 +570,7 @@ export async function onRequest(context) {
           if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
         }
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(5)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(6)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(6)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(7)) ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: (healthDown || probeFailed(8)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(9)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}) });
+      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(5)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(6)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(6)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(7)) ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: (healthDown || probeFailed(8)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(9)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}) });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

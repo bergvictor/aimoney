@@ -872,6 +872,49 @@ describe("neutral first paint (audit 2026-09-20-round2 Task 4)", () => {
   });
 });
 
+describe("decisions fallback on probe failure (audit 2026-09-20-round3 Task 2)", () => {
+  // The helper is extracted from the shipped source (not copied) so these
+  // cases fail if app.js miscounts the window or drops the fallback wiring.
+  const fbStart = js.indexOf("const fallbackDecisions");
+  assert.ok(fbStart !== -1, "app.js lost the fallbackDecisions helper");
+  const fallbackDecisions = new Function(
+    `${js.slice(fbStart, js.indexOf("\n};", fbStart) + 3)} return fallbackDecisions;`)();
+
+  it("counts won/lost closed in 7d from the loaded list, ignoring open and stale rows", () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const exps = [
+      { status: "won", ended_at: daysAgo(2) },
+      { status: "lost", ended_at: daysAgo(6) },
+      { status: "won", ended_at: daysAgo(10) },
+      { status: "planned", ended_at: "" },
+      { status: "running", ended_at: daysAgo(1) },
+      { status: "paused", ended_at: daysAgo(1) },
+      { status: "lost", ended_at: "" },
+      { status: "won", ended_at: "not-a-date" },
+    ];
+    assert.equal(fallbackDecisions(exps), 2);
+  });
+
+  it("is null-safe and counts the 7d boundary like the API window", () => {
+    assert.equal(fallbackDecisions(null), 0);
+    assert.equal(fallbackDecisions([]), 0);
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    assert.equal(fallbackDecisions([{ status: "won", ended_at: daysAgo(6.99) }]), 1);
+    assert.equal(fallbackDecisions([{ status: "lost", ended_at: daysAgo(7.01) }]), 0);
+  });
+
+  it("health wins whenever present; the fallback feeds the week line and the nudge", () => {
+    assert.ok(js.includes("decisions_last_7d"), "fallback must not drop the health read");
+    assert.ok(js.includes("healthDecisions !== null ? healthDecisions : fallbackDecisions(exps)"), "health decisions must win; fallback only on null probes");
+    const line = js.indexOf("const decisions = healthDecisions");
+    const nudge = js.indexOf("const nudge = (decisions === 0)");
+    assert.ok(line !== -1 && nudge !== -1 && line < nudge, "the nudge must gate on the post-fallback decisions count");
+    assert.ok(js.includes("decisions this week"), "the week line must survive the fallback path");
+    assert.ok(js.includes("exp-nudge-start"), "the fallback nudge must keep its Start button");
+    assert.ok(js.includes("Nudge:"), "the fallback nudge must keep its copy");
+  });
+});
+
 describe("last-good first paint (audit 2026-09-20-round3 Task 2)", () => {
   it("persists the painted surfaces to localStorage on each successful refresh", () => {
     assert.ok(js.includes('const LAST_GOOD_KEY = "aimoney_last_good"'), "app.js lost the last-good cache key");

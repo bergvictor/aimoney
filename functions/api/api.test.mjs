@@ -3,7 +3,7 @@
 // Run: npm test (node --test, no framework)
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { onRequest } from "./[[path]].js";
+import { onRequest, _resetSchemaMigrationForTests } from "./[[path]].js";
 import { effectiveScore as workerEffectiveScore } from "../../worker/src/lib.js";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -277,7 +277,7 @@ function makeDB(seed = {}) {
   return db;
 }
 
-async function callApi(pathParts, url, { method = "GET", token = null, body = undefined } = {}, db) {
+async function callApi(pathParts, url, { method = "GET", token = null, body = undefined, extraEnv = null } = {}, db) {
   const headers = {};
   if (token) headers.authorization = `Bearer ${token}`;
   const init = { method, headers };
@@ -286,10 +286,81 @@ async function callApi(pathParts, url, { method = "GET", token = null, body = un
     init.body = JSON.stringify(body);
   }
   const request = new Request(url, init);
-  const env = { DB: db, ADMIN_TOKEN: "secret", RESEARCH_WORKER_URL: "" };
+  const env = { DB: db, ADMIN_TOKEN: "secret", RESEARCH_WORKER_URL: "", ...(extraEnv || {}) };
   const res = await onRequest({ request, env, params: { path: pathParts } });
   const json = await res.json().catch(() => ({}));
   return { status: res.status, body: json };
+}
+
+// Pre-migration experiments table: every base column except the two money
+// columns the health probes read. PRAGMA reports the live column set, ALTER
+// ADD COLUMN extends it (like real D1), and any SUM over a missing cents
+// column throws "no such column" — checked at call time so a mid-test
+// migration flips later statements from failing to answering, like live D1.
+function oldSchemaDB(seed = {}, opts = {}) {
+  const db = makeDB(seed);
+  const columns = new Set(["id", "opportunity_id", "name", "hypothesis",
+    "status", "budget_cap", "spent", "metric", "target", "result",
+    "started_at", "ended_at", "post_mortem", "revenue_source",
+    "created_at", "updated_at"]);
+  const writes = [];
+  let pragmaCalls = 0;
+  const realPrepare = db.prepare.bind(db);
+  db.prepare = (sql) => {
+    if (sql.startsWith("PRAGMA table_info")) {
+      pragmaCalls++;
+      const rows = [...columns].map((name) => ({ name }));
+      return {
+        _sql: sql, _args: [],
+        bind(...a) { return this; },
+        all: async () => ({ results: rows }),
+        first: async () => rows[0] || null,
+        run: async () => ({ success: true }),
+      };
+    }
+    if (sql.startsWith("ALTER TABLE experiments ADD COLUMN")) {
+      return {
+        _sql: sql, _args: [],
+        bind(...a) { return this; },
+        all: async () => ({ results: [] }),
+        first: async () => null,
+        run: async () => {
+          writes.push(sql);
+          const m = /ADD COLUMN (\w+)/.exec(sql);
+          if (m) columns.add(m[1]);
+          if (opts.alterError) throw opts.alterError;
+          return { success: true };
+        },
+      };
+    }
+    const stmt = realPrepare(sql);
+    if (sql.includes("SUM(revenue_cents)") || sql.includes("SUM(spent_cents)")) {
+      const realFirst = stmt.first.bind(stmt);
+      const realAll = stmt.all.bind(stmt);
+      stmt.first = async () => {
+        if (!columns.has("revenue_cents") || !columns.has("spent_cents")) {
+          throw new Error("no such column: " + (!columns.has("revenue_cents") ? "revenue_cents" : "spent_cents"));
+        }
+        return realFirst();
+      };
+      stmt.all = async () => {
+        if (!columns.has("revenue_cents") || !columns.has("spent_cents")) {
+          throw new Error("no such column: " + (!columns.has("revenue_cents") ? "revenue_cents" : "spent_cents"));
+        }
+        return realAll();
+      };
+    }
+    return stmt;
+  };
+  const realBatch = db.batch.bind(db);
+  db.batch = async (stmts) => {
+    if (!columns.has("revenue_cents") || !columns.has("spent_cents")) {
+      throw new Error("no such column: revenue_cents");
+    }
+    return realBatch(stmts);
+  };
+  db._oldSchema = { columns, writes, pragmaCalls: () => pragmaCalls };
+  return db;
 }
 
 function oppSeed() {
@@ -1455,6 +1526,113 @@ describe("one-click Lose (audit 2026-09-20-round2 Task 2)", () => {
     assert.ok(noPm.body.fields && noPm.body.fields.post_mortem);
     assert.equal(db.data.experiments[0].status, "planned");
     assert.equal(db.data.experiments[0].ended_at, "");
+  });
+});
+
+describe("self-migration switch (audit 2026-09-20-round3 Task 1)", () => {
+  const wonSeed = () => ([
+    { id: 1, opportunity_id: 1, status: "won", ended_at: new Date().toISOString(), revenue_cents: 50000, spent_cents: 1200 },
+  ]);
+
+  it("old schema + ALLOW_SCHEMA_MIGRATION=1 ends with every probed money column and reports numbers", async () => {
+    _resetSchemaMigrationForTests();
+    const db = oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() });
+    const r = await callApi(["health"], "http://localhost/api/health",
+      { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } }, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.ok(db._oldSchema.columns.has("revenue_cents"), "revenue_cents must exist after the check");
+    assert.ok(db._oldSchema.columns.has("spent_cents"), "spent_cents must exist after the check");
+    assert.equal(r.body.decisions_last_7d, 1);
+    assert.equal(r.body.revenue_last_7d, 50000);
+    assert.equal(r.body.revenue_total, 50000);
+    assert.equal(r.body.spent_total, 1200);
+    assert.ok(!("health_probe_failures" in r.body), "migrated probes must not report failures");
+    assert.ok(!("schema_missing_columns" in r.body) && !("schema_migration" in r.body), "a converged table reports no schema keys");
+    // ADD-only, one at a time, in probe-column order:
+    assert.deepEqual(db._oldSchema.writes, [
+      "ALTER TABLE experiments ADD COLUMN revenue_cents INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE experiments ADD COLUMN spent_cents INTEGER NOT NULL DEFAULT 0",
+    ]);
+    // Byte-pinned against the shipped migration file (modulo the trailing ;):
+    const mig = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "d1", "migrate-2026-09-20-experiment-cents.sql"), "utf8");
+    for (const stmt of db._oldSchema.writes) {
+      assert.ok(mig.includes(stmt + ";"), `migration file must own exactly: ${stmt}`);
+    }
+  });
+
+  it("var unset leaves the old table unchanged and names the missing columns plus the disabled line", async () => {
+    _resetSchemaMigrationForTests();
+    const db = oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.db, "up");
+    assert.deepEqual(db._oldSchema.writes, [], "unset must run zero writes");
+    assert.ok(!db._oldSchema.columns.has("revenue_cents") && !db._oldSchema.columns.has("spent_cents"), "unset must not add columns");
+    assert.equal(r.body.decisions_last_7d, null);
+    assert.equal(r.body.revenue_last_7d, null);
+    assert.equal(r.body.revenue_total, null);
+    assert.equal(r.body.spent_total, null);
+    assert.deepEqual(r.body.health_probe_failures, ["decisions_revenue_week", "revenue_lifetime"]);
+    assert.deepEqual(r.body.schema_missing_columns, ["revenue_cents", "spent_cents"]);
+    assert.ok(r.body.schema_migration.includes("disabled"), "payload must carry the disabled line");
+    assert.ok(r.body.schema_migration.includes("ALLOW_SCHEMA_MIGRATION=1"), "disabled line must name the exact variable");
+  });
+
+  it("second run is a clean no-op: no re-PRAGMA, no re-ALTER, numbers stay", async () => {
+    _resetSchemaMigrationForTests();
+    const db = oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() });
+    const first = await callApi(["health"], "http://localhost/api/health",
+      { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } }, db);
+    assert.equal(first.body.decisions_last_7d, 1);
+    assert.equal(db._oldSchema.writes.length, 2);
+    const pragmaAfterFirst = db._oldSchema.pragmaCalls();
+    const second = await callApi(["health"], "http://localhost/api/health",
+      { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } }, db);
+    assert.equal(db._oldSchema.writes.length, 2, "second run must add no columns");
+    assert.equal(db._oldSchema.pragmaCalls(), pragmaAfterFirst, "second run must not re-run PRAGMA");
+    assert.equal(second.body.decisions_last_7d, 1);
+    assert.ok(!("schema_missing_columns" in second.body), "second run must not report schema keys");
+  });
+
+  it("unset checks PRAGMA at most once per isolate, then reuses the report", async () => {
+    _resetSchemaMigrationForTests();
+    const db = oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() });
+    const first = await callApi(["health"], "http://localhost/api/health", {}, db);
+    const second = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(db._oldSchema.pragmaCalls(), 1, "PRAGMA must run at most once per isolate");
+    assert.deepEqual(db._oldSchema.writes, []);
+    assert.deepEqual(second.body.schema_missing_columns, ["revenue_cents", "spent_cents"]);
+    assert.equal(second.body.schema_migration, first.body.schema_migration);
+  });
+
+  it("tolerates a duplicate-column race (a sibling isolate already added it)", async () => {
+    _resetSchemaMigrationForTests();
+    const db = oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() },
+      { alterError: new Error("duplicate column name: revenue_cents") });
+    const r = await callApi(["health"], "http://localhost/api/health",
+      { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } }, db);
+    assert.equal(r.body.decisions_last_7d, 1, "a duplicate-column race must still converge to numbers");
+    assert.equal(r.body.revenue_total, 50000);
+    assert.ok(!("schema_missing_columns" in r.body));
+  });
+
+  it("ships exactly the two ADD COLUMN statements, PRAGMA-gated, default-off, no endpoint", async () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "[[path]].js"), "utf8");
+    assert.ok(src.includes("PRAGMA table_info(experiments)"), "migration check must PRAGMA the live table");
+    assert.ok(src.includes("ALLOW_SCHEMA_MIGRATION"), "switch must read ALLOW_SCHEMA_MIGRATION");
+    assert.equal(src.split("ALTER TABLE").length - 1, 2, "only the two ADD COLUMN statements may exist (ADD-only)");
+    assert.ok(src.includes("ADD COLUMN revenue_cents INTEGER NOT NULL DEFAULT 0"), "revenue_cents DDL diverged from the migration file");
+    assert.ok(src.includes("ADD COLUMN spent_cents INTEGER NOT NULL DEFAULT 0"), "spent_cents DDL diverged from the migration file");
+    assert.ok(!src.includes("DROP TABLE") && !src.includes("DROP COLUMN"), "migration must never DROP");
+    assert.ok(!src.includes("CREATE TABLE"), "migration must never CREATE");
+    assert.ok(src.includes("for (const col of missing)"), "columns must apply one at a time, not batched");
+    assert.ok(src.includes("schemaMigrationState"), "the switch must run at most once per isolate");
+    _resetSchemaMigrationForTests();
+    const db = makeDB({ opportunities: oppSeed() });
+    assert.equal((await callApi(["migrate"], "http://localhost/api/migrate", {}, db)).status, 404);
+    assert.equal((await callApi(["migrate"], "http://localhost/api/migrate", { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } }, db)).status, 404);
   });
 });
 

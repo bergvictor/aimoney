@@ -24,7 +24,8 @@
     "ai_binding": "AI (Workers AI, worker only)",
     "env_vars": {
       "ADMIN_TOKEN": "secret — Pages env var + worker secret; one value drives dashboard writes and manual research runs",
-      "RESEARCH_WORKER_URL": "plain — Pages env var pointing at the worker origin (manual trigger button)"
+      "RESEARCH_WORKER_URL": "plain — Pages env var pointing at the worker origin (manual trigger button)",
+      "ALLOW_SCHEMA_MIGRATION": "plain — Pages env var; when 1, /api/health self-adds missing money columns (once per isolate; default off)"
     },
     "credentials": "Named external CLOUDFLARE_API_TOKEN (Pages + Workers + D1 + AI edit); never version credential values"
   },

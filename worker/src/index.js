@@ -548,8 +548,17 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/") {
-      const last = await env.DB.prepare(
-        "SELECT * FROM agent_runs ORDER BY id DESC LIMIT 1").first().catch(() => null);
+      // A dead database must read as unhealthy: ok:false (503) when the
+      // last-run read fails or DB is unbound, so the surface and the
+      // verify.sh worker-status gate fail closed instead of passing green.
+      if (!env.DB) return json({ ok: false, agent: "research-v1", last_run: null }, 503);
+      let last;
+      try {
+        last = await env.DB.prepare(
+          "SELECT * FROM agent_runs ORDER BY id DESC LIMIT 1").first();
+      } catch {
+        return json({ ok: false, agent: "research-v1", last_run: null }, 503);
+      }
       return json({ ok: true, agent: "research-v1", last_run: last });
     }
     if (request.method === "GET" && url.pathname === "/ping-ai") {
