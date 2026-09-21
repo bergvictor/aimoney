@@ -2121,6 +2121,75 @@ describe("vetting path Vet-PATCH-health (audit 2026-09-20-round2 Task 1)", () =>
   });
 });
 
+describe("impossible verdict-tag dates (audit 2026-09-20-round4 Task 2)", () => {
+  const unreviewedOpp = (id) => ({ id, slug: `s${id}`, title: `T${id}`, status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" });
+
+  it("a digit-shaped-but-impossible tag 400s naming the tag and leaves the row queued", async () => {
+    const db = makeDB({ opportunities: [unreviewedOpp(1)] });
+    for (const bad of ["[2026-13-40 vetted] month 13", "[2026-00-10 vetted] month 00",
+      "[2026-12-00 vetted] day 00", "[2026-01-32 vetted] day 32", "[2026-13-01 killed] bad kill"]) {
+      const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+        { method: "PATCH", token: "secret", body: { notes: `Agent proposal\n${bad}` } }, db);
+      assert.equal(patch.status, 400, `impossible tag must 400: ${bad}`);
+      assert.equal(patch.body.field, "notes");
+      assert.ok(String(patch.body.error).includes("verdict tag"), `400 must name the verdict tag, got: ${patch.body.error}`);
+    }
+    const detail = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1", {}, db);
+    assert.ok(String(detail.body.opportunity.notes).includes("UNREVIEWED"), "rejected clears must leave the row in the queue");
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.body.unreviewed, 1);
+    assert.equal(health.body.vetted_last_7d, 0);
+    assert.equal(health.body.last_vetted, null);
+    assert.equal(health.body.last_verdict, null);
+  });
+
+  it("calendar-edge tags still pass the guard (month 01/12, day 01/31)", async () => {
+    const db = makeDB({ opportunities: [unreviewedOpp(1), unreviewedOpp(2)] });
+    const vet = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      { method: "PATCH", token: "secret", body: { notes: "Agent proposal\n[2026-01-01 vetted] Human vetted; cap lifted." } }, db);
+    assert.equal(vet.status, 200, "Jan 1 must stay a valid verdict date");
+    const kill = await callApi(["opportunities", "2"], "http://localhost/api/opportunities/2",
+      { method: "PATCH", token: "secret", body: { status: "killed", notes: "Agent proposal\n[2026-12-31 killed] no demand" } }, db);
+    assert.equal(kill.status, 200, "Dec 31 must stay a valid verdict date");
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.body.unreviewed, 0);
+    assert.equal(health.body.last_vetted, "2026-01-01");
+    assert.equal(health.body.last_verdict, "2026-12-31");
+  });
+
+  it("a stored impossible tag never wins the max in last_vetted/last_verdict", async () => {
+    const mk = (id, notes) => ({ id, slug: `s${id}`, title: `T${id}`, status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes, created_at: "2026-08-01T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" });
+    const db = makeDB({
+      opportunities: [
+        mk(1, "legacy typo [2026-13-99 vetted] oops"),
+        mk(2, "x [2026-09-01 vetted] Human vetted; cap lifted."),
+        mk(3, "legacy typo [2026-13-99 killed] oops"),
+        mk(4, "y [2026-08-15 killed] no demand"),
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.last_vetted, "2026-09-01", "impossible vetted tag must not win the string-max");
+    assert.equal(r.body.last_verdict, "2026-09-01", "impossible tags must not win the verdict max");
+    assert.equal(r.body.vetted_last_7d, 0, "old real tag plus impossible tags must count no fake velocity");
+  });
+
+  it("impossible-only rows report null verdict dates", async () => {
+    const mk = (id, notes) => ({ id, slug: `s${id}`, title: `T${id}`, status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes, created_at: "2026-08-01T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" });
+    const db = makeDB({
+      opportunities: [
+        mk(1, "legacy typo [2026-13-99 vetted] oops"),
+        mk(2, "legacy typo [2026-13-99 killed] oops"),
+      ],
+    });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.last_vetted, null);
+    assert.equal(r.body.last_verdict, null);
+    assert.equal(r.body.vetted_last_7d, 0);
+  });
+});
+
 describe("experiments_by_status null on probe failure (audit 2026-09-20-round2 Task 4)", () => {
   // One bad probe (the GROUP BY status SELECT): the batch rejects and that
   // statement fails individually too, while the other eleven answer. Mirrors

@@ -1515,3 +1515,200 @@ describe("stale running badge (audit 2026-09-20-round3 Task 2)", () => {
     assert.ok(!runsSlice.includes('method: "PATCH"') && !runsSlice.includes("POST /run"), "badge must stay read-only (no status writes)");
   });
 });
+
+describe("retry-safe Vet-&-starter (audit 2026-09-20-round4 Task 1)", () => {
+  // Shipped resume block extracted from app.js (not copied): the pure scan,
+  // the state-first/one-GET resume, and the inner tap. The tap's other free
+  // names arrive as stubs so the retry below runs the shipped write order.
+  function shippedStarterTap() {
+    const resumeStart = js.indexOf("const findPlannedStarter");
+    assert.ok(resumeStart !== -1, "app.js lost findPlannedStarter");
+    const resumeEnd = js.indexOf("async function killOpportunity", resumeStart);
+    assert.ok(resumeEnd !== -1 && resumeEnd > resumeStart, "app.js lost the starter-tap block boundary");
+    const vettedStart = js.indexOf("function cleanUnreviewed");
+    assert.ok(vettedStart !== -1, "app.js lost cleanUnreviewed");
+    const vettedEnd = js.indexOf("const DETAIL_CACHE_TTL_MS", vettedStart);
+    assert.ok(vettedEnd !== -1 && vettedEnd > vettedStart, "app.js lost the vetted-notes block boundary");
+    const moneyStart = js.indexOf("const money = ");
+    assert.ok(moneyStart !== -1, "app.js lost money");
+    const moneyEnd = js.indexOf("const moneyCents", moneyStart);
+    assert.ok(moneyEnd !== -1 && moneyEnd > moneyStart, "app.js lost the money block boundary");
+    const stepsStart = js.indexOf("const firstStepsFirstLine");
+    assert.ok(stepsStart !== -1, "app.js lost firstStepsFirstLine");
+    const stepsEnd = js.indexOf("function renderStartHere", stepsStart);
+    assert.ok(stepsEnd !== -1 && stepsEnd > stepsStart, "app.js lost the first-steps block boundary");
+    const src = js.slice(vettedStart, vettedEnd) + js.slice(moneyStart, moneyEnd) +
+      js.slice(stepsStart, stepsEnd) + js.slice(resumeStart, resumeEnd);
+    return new Function("state", "api", "toast", "openAdminModal", "startExperiment",
+      "refreshTargets", "refreshReview", "renderLedger", "Date",
+      `${src}; return { vetAndLogStarterInner, findPlannedStarter };`);
+  }
+
+  // Fake server behind the tap: counts experiment POSTs, fails the status
+  // flip on demand, and serves the resume GET from its own rows.
+  function starterServer() {
+    const server = {
+      opp: { status: "researching", notes: "proposal — UNREVIEWED" },
+      experiments: [], nextId: 101, posts: 0, gets: 0, failStatusPatch: true,
+    };
+    const api = async (path, opts = {}) => {
+      const method = String(opts.method || "GET").toUpperCase();
+      if (method === "PATCH" && path === "/api/opportunities/7") {
+        const body = JSON.parse(opts.body);
+        if (body.notes !== undefined) server.opp.notes = body.notes;
+        if (body.status !== undefined) {
+          if (server.failStatusPatch) throw new Error("boom");
+          server.opp.status = body.status;
+        }
+        return { id: 7 };
+      }
+      if (method === "POST" && path === "/api/experiments") {
+        server.posts++;
+        const row = { id: server.nextId++, ...JSON.parse(opts.body) };
+        server.experiments.push(row);
+        return row;
+      }
+      if (method === "GET" && path.startsWith("/api/experiments")) {
+        server.gets++;
+        return { experiments: server.experiments.filter((e) => String(e.opportunity_id) === "7") };
+      }
+      throw new Error(`unexpected ${method} ${path}`);
+    };
+    return { server, api };
+  }
+
+  function starterState(experiments = []) {
+    const row = { id: 7, title: "X", notes: "proposal — UNREVIEWED", one_liner: "one",
+      brief_first_steps: null, est_monthly_low: 0, est_monthly_high: 100 };
+    return { token: "t", reviewList: [row], opportunities: [row], experiments, reviewOnly: false };
+  }
+
+  function runTap(factory, state, api, toasts) {
+    const { vetAndLogStarterInner } = factory(state, api, (m) => toasts.push(m),
+      () => { throw new Error("must not open the admin modal with a token"); },
+      () => {}, async () => {}, async () => {}, () => {}, Date);
+    return vetAndLogStarterInner(7);
+  }
+
+  it("findPlannedStarter matches only the planned same-name starter for the row", () => {
+    const factory = shippedStarterTap();
+    const { findPlannedStarter } = factory(starterState(), async () => ({}), () => {},
+      () => {}, () => {}, async () => {}, async () => {}, () => {}, Date);
+    const exps = [
+      { id: 1, opportunity_id: 7, status: "planned", name: "Starter: X" },
+      { id: 2, opportunity_id: 7, status: "running", name: "Starter: X" },
+      { id: 3, opportunity_id: 8, status: "planned", name: "Starter: X" },
+      { id: 4, opportunity_id: 7, status: "planned", name: "Something else" },
+    ];
+    assert.equal(findPlannedStarter(exps, 7, "Starter: X").id, 1, "must match the planned same-name starter");
+    assert.equal(findPlannedStarter(exps, 8, "Starter: X").id, 3, "must scope the match to the row");
+    assert.equal(findPlannedStarter(exps, 7, "Starter: Y"), null, "a renamed starter must not match");
+    assert.equal(findPlannedStarter([exps[1]], 7, "Starter: X"), null, "a running experiment must never resume");
+    assert.equal(findPlannedStarter([], 7, "Starter: X"), null, "an empty list must read null");
+    assert.equal(findPlannedStarter(null, 7, "Starter: X"), null, "an unloaded list must read null");
+  });
+
+  it("a failed status PATCH retries into exactly one starter and the row reaches testing", async () => {
+    const { server, api } = starterServer();
+    const toasts = [];
+    const factory = shippedStarterTap();
+    await runTap(factory, starterState(), api, toasts);
+    assert.equal(server.posts, 1, "first tap must POST one starter");
+    assert.equal(server.experiments.length, 1, "first tap must leave one planned starter behind");
+    assert.equal(server.opp.status, "researching", "failed status PATCH must not flip the row");
+    assert.ok(toasts.some((m) => String(m).startsWith("Starter failed:")), "failed tap must keep its toast");
+    server.failStatusPatch = false;
+    await runTap(factory, starterState(), api, toasts);
+    assert.equal(server.posts, 1, "retry must resume, not POST a second starter");
+    assert.equal(server.experiments.length, 1, "retry must leave exactly one planned starter");
+    assert.equal(server.opp.status, "testing", "retry must still reach testing");
+    assert.ok(server.gets >= 1, "resume must consult the server when state misses");
+    assert.ok(toasts.some((m) => String(m).includes("starter logged, moved to testing")), "retry must keep the success toast");
+  });
+
+  it("a state-visible starter resumes with no GET and no POST", async () => {
+    const { server, api } = starterServer();
+    server.failStatusPatch = false;
+    const toasts = [];
+    const state = starterState([{ id: 55, opportunity_id: 7, status: "planned", name: "Starter: X" }]);
+    await runTap(shippedStarterTap(), state, api, toasts);
+    assert.equal(server.posts, 0, "state hit must skip the POST");
+    assert.equal(server.gets, 0, "state hit must skip the GET");
+    assert.equal(server.opp.status, "testing", "resume must still reach testing");
+    assert.ok(toasts.some((m) => String(m).includes("starter logged, moved to testing")), "resume must keep the success toast");
+  });
+
+  it("the tap consults the resume helper before the POST and still flips to testing after", () => {
+    const inner = js.slice(js.indexOf("async function vetAndLogStarterInner"), js.indexOf("async function killOpportunity"));
+    const resumeAt = inner.indexOf("findStarterForResume(id, starterName)");
+    const postAt = inner.indexOf('api("/api/experiments",');
+    const flipAt = inner.indexOf('JSON.stringify({ status: "testing" })');
+    assert.ok(resumeAt !== -1, "tap must consult findStarterForResume");
+    assert.ok(postAt !== -1 && flipAt !== -1, "tap lost its POST or its testing flip");
+    assert.ok(resumeAt < postAt, "resume check must precede the POST");
+    assert.ok(postAt < flipAt, "status flip must stay after the experiment write");
+    assert.ok(inner.includes("resumed ||"), "a found starter must skip the POST");
+  });
+
+  // testingIdleBadge extracted from the shipped source (not copied) so these
+  // cases fail if the stuck-mid-handoff contract drifts.
+  function shippedIdleBadge() {
+    const start = js.indexOf("const testingIdleBadge");
+    assert.ok(start !== -1, "app.js lost testingIdleBadge");
+    const end = js.indexOf("const noBriefBadge", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the idle-badge block boundary");
+    return new Function("state", `${js.slice(start, end)}; return testingIdleBadge;`);
+  }
+
+  it("testing badge renders for testing-with-only-planned and nowhere else", () => {
+    const badge = shippedIdleBadge();
+    const planned = [{ opportunity_id: 7, status: "planned" }];
+    const withRunning = [...planned, { opportunity_id: 7, status: "running" }];
+    const testing = { id: 7, status: "testing", experiment_count: 1 };
+    const html = badge({ experiments: planned })(testing);
+    assert.ok(html.includes("nothing running"), "testing-with-only-planned must badge");
+    assert.ok(html.includes("warn-badge"), "badge must reuse the existing warn-badge style (no new CSS)");
+    assert.equal(badge({ experiments: withRunning })(testing), "", "a running experiment must clear the badge");
+    assert.equal(badge({ experiments: [] })(testing), "", "zero experiments is testingBadge's case, not this one");
+    assert.equal(badge({ experiments: [{ opportunity_id: 9, status: "planned" }] })(testing), "", "another row's experiments must not badge this row");
+    assert.equal(badge({ experiments: planned })({ id: 7, status: "researching" }), "", "non-testing rows never badge");
+    assert.equal(badge({})(testing), "", "an unloaded list is unknown, not stuck");
+    assert.equal(badge({ experiments: planned })(null), "", "a null row never badges");
+  });
+
+  it("ledger renders the idle badge beside testingBadge", () => {
+    const ledger = js.slice(js.indexOf("function renderLedger"), js.indexOf("const reviewDecisionLine"));
+    assert.ok(ledger.includes("${testingBadge(o)}${testingIdleBadge(o)}"), "ledger row must render the idle badge beside testingBadge");
+  });
+});
+
+describe("guarded drawer skills parse (audit 2026-09-20-round4 Task 3)", () => {
+  // parseSkillsList extracted from the shipped source (not copied) so these
+  // cases fail if the parse-or-empty contract drifts.
+  function shippedSkillsParse() {
+    const start = js.indexOf("const parseSkillsList");
+    assert.ok(start !== -1, "app.js lost parseSkillsList");
+    const end = js.indexOf("async function openDrawer", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the skills-parse block boundary");
+    return new Function(`${js.slice(start, end)}; return parseSkillsList;`)();
+  }
+
+  it("parses lists, empties everything else (never throws)", () => {
+    const parseSkillsList = shippedSkillsParse();
+    assert.deepEqual(parseSkillsList('["python","ads"]'), ["python", "ads"], "valid skills must parse unchanged");
+    assert.deepEqual(parseSkillsList("not json"), [], "malformed JSON must read empty");
+    assert.deepEqual(parseSkillsList("{oops"), [], "truncated JSON must read empty");
+    assert.deepEqual(parseSkillsList('"just a string"'), [], "non-list JSON must read empty");
+    assert.deepEqual(parseSkillsList("null"), [], "null JSON must read empty");
+    assert.deepEqual(parseSkillsList(undefined), [], "missing skills must read empty");
+    assert.deepEqual(parseSkillsList(""), [], "empty skills must read empty");
+  });
+
+  it("drawer renders skills through the guard with the — fallback, no unguarded parse left", () => {
+    const drawer = js.slice(js.indexOf("async function openDrawer"), js.indexOf("function closeDrawer"));
+    assert.ok(drawer.includes("parseSkillsList(o.skills_needed).join(\", \")"), "drawer must render skills through parseSkillsList");
+    assert.ok(drawer.includes('|| "—"'), "malformed skills must render —");
+    assert.ok(!drawer.includes("JSON.parse(o.skills_needed"), "drawer must keep no unguarded skills parse");
+    assert.ok(!js.includes("JSON.parse(o.skills_needed"), "no shipped path may parse skills unguarded");
+  });
+});

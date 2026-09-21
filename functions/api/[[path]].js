@@ -80,8 +80,11 @@ const clamp10 = (v, dflt) => {
 // Review-queue verdict tag (audit 2026-09-20-round4 F4): the dated marker a
 // notes PATCH must append when it clears UNREVIEWED. Same shape the health
 // probes count (vetted_7d SELECT, last_vetted/last_verdict parse) — a
-// malformed date matches nothing, so it can never fake velocity.
-const VERDICT_TAG = /\[\d{4}-\d{2}-\d{2} (vetted|killed)\]/;
+// malformed date matches nothing, so it can never fake velocity. Month/day
+// ranges are constrained (round4 Task 2): a digit-shaped-but-impossible date
+// such as month 13 or day 40 is not a verdict — it 400s at the guard and
+// never wins the string-max in last_vetted/last_verdict.
+const VERDICT_TAG = /\[\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]) (vetted|killed)\]/;
 
 // Ledger money: integer cents to fixed-2dp dollars ($10.50, never $10.5).
 // Mirrors public/app.js moneyCents so drawer and ledger agree.
@@ -628,11 +631,11 @@ export async function onRequest(context) {
       if (!healthDown && !probeFailed(11)) {
         for (const r of lastVettedRows) {
           const text = String((r && r.notes) || "");
-          for (const m of text.matchAll(/\[(\d{4}-\d{2}-\d{2}) vetted\]/g)) {
+          for (const m of text.matchAll(/\[(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])) vetted\]/g)) {
             if (!last_vetted || m[1] > last_vetted) last_vetted = m[1];
             if (!last_verdict || m[1] > last_verdict) last_verdict = m[1];
           }
-          for (const m of text.matchAll(/\[(\d{4}-\d{2}-\d{2}) killed\]/g)) {
+          for (const m of text.matchAll(/\[(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])) killed\]/g)) {
             if (!last_verdict || m[1] > last_verdict) last_verdict = m[1];
           }
         }

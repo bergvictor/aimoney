@@ -181,7 +181,7 @@ function renderLedger() {
     <tr class="row" data-id="${o.id}">
       <td class="num rank">${i + 1}</td>
       <td><div class="opp-title">${esc(o.title)} <span class="cat muted">· ${esc(o.category)}</span></div>
-        <div class="opp-sub">${esc(o.one_liner || "")}</div>${testingBadge(o)}</td>
+        <div class="opp-sub">${esc(o.one_liner || "")}</div>${testingBadge(o)}${testingIdleBadge(o)}</td>
       <td>${statusPill(o.status)}</td>
       <td class="score-cell"><span class="score-num">${esc(o.score)}</span>${noBriefBadge(o)}
         <div class="score-bar"><i style="width:${Math.round(100 * (o.score || 0) / max)}%"></i></div></td>
@@ -572,6 +572,30 @@ async function vetOpportunityInner(id) {
 // makes today (Vet PATCH, Log experiment POST, admin status PATCH), composed
 // behind one tap. Token-gated like vetOpportunity; the toast carries a Start
 // shortcut for the created experiment. Human-pressed, one decision.
+// Planned-starter resume (audit 2026-09-20-round4 Task 1): a tap that dies
+// after the POST leaves a planned starter behind, and createExperiment
+// enforces no name uniqueness — so a retry resumes the starter it finds
+// instead of POSTing a second identical row. Pure scan: matches a planned
+// experiment for this row carrying the exact starter name; running/won/lost
+// rows never match (a retry resumes only the unstarted row it may have left,
+// never a live experiment).
+const findPlannedStarter = (experiments, opportunityId, starterName) =>
+  (experiments || []).find((e) =>
+    String(e.opportunity_id) === String(opportunityId) &&
+    e.status === "planned" &&
+    String(e.name || "") === String(starterName)) || null;
+
+// State first (fresh after any refresh), one GET when the in-memory list
+// misses: the failed tap never refreshed, so state.experiments cannot see
+// the starter it just left. A failed GET aborts the tap with the existing
+// "Starter failed" toast — never POST blind.
+async function findStarterForResume(id, starterName) {
+  const inState = findPlannedStarter(state.experiments, id, starterName);
+  if (inState) return inState;
+  const d = await api(`/api/experiments?opportunity_id=${id}`);
+  return findPlannedStarter((d && d.experiments) || [], id, starterName);
+}
+
 async function vetAndLogStarter(id) {
   if (!await fetchDetailForWrite(id, "Starter")) return;
   return vetAndLogStarterInner(id);
@@ -589,7 +613,10 @@ async function vetAndLogStarterInner(id) {
       method: "PATCH", headers: { "content-type": "application/json" },
       body: JSON.stringify({ notes }),
     });
-    const created = await api("/api/experiments", {
+    // Retry-safe: resume the planned starter a failed tap left behind
+    // instead of POSTing a second identical row.
+    const resumed = await findStarterForResume(id, starterName);
+    const created = resumed || await api("/api/experiments", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
         opportunity_id: id, name: starterName, hypothesis: starterHypothesis,
@@ -998,6 +1025,18 @@ function briefHtml(b) {
     <p class="muted mono">brief v${b.version} · ${esc(b.author)} · ${esc((b.created_at || "").slice(0, 10))}</p>`;
 }
 
+// Drawer skills (audit 2026-09-20-round4 Task 3): skills_needed is
+// writer-stringified JSON, but hand/legacy rows can carry anything.
+// Parse-or-empty mirroring the brief numbers/sources parses above —
+// malformed (or non-list) JSON renders "—" instead of bricking the drawer
+// into the "Could not open" toast.
+const parseSkillsList = (raw) => {
+  try {
+    const v = JSON.parse(raw || "[]");
+    return Array.isArray(v) ? v : [];
+  } catch { return []; }
+};
+
 async function openDrawer(id, focusExp = null) {
   try {
     const d = await api(`/api/opportunities/${id}`);
@@ -1014,7 +1053,7 @@ async function openDrawer(id, focusExp = null) {
         <dt>Revenue range</dt><dd class="mono">${money(o.est_monthly_low, o.est_monthly_high)}/mo</dd>
         <dt>Time to first $</dt><dd>${esc(o.time_to_first_dollar || "—")}</dd>
         <dt>Capital needed</dt><dd>${esc(o.capital_needed || "—")}</dd>
-        <dt>Skills</dt><dd>${esc((JSON.parse(o.skills_needed || "[]") || []).join(", ") || "—")}</dd>
+        <dt>Skills</dt><dd>${esc(parseSkillsList(o.skills_needed).join(", ") || "—")}</dd>
         <dt>Value/effort/conf/fit</dt><dd class="mono">${o.value} / ${o.effort} / ${o.confidence} / ${o.fit}</dd>
         <dt>Source</dt><dd>${o.source_url ? `<a href="${esc(o.source_url)}" target="_blank" rel="noreferrer">${esc(o.source)}</a>` : esc(o.source)}</dd>
       </dl>
@@ -1374,6 +1413,18 @@ const testingBadge = (o) =>
   o.status === "testing" && !(Number(o.experiment_count) > 0)
     ? ` <span class="warn-badge" title="Status is testing but no experiments are logged">testing · 0 experiments</span>`
     : "";
+
+// A testing row whose experiments exist but none is running is stuck
+// mid-handoff (e.g. a Vet-&-starter tap that died after the POST — a retry
+// resumes it; see findStarterForResume). Read-only: the human still owns
+// every status move. Empty lists stay quiet — zero experiments is
+// testingBadge's case, and an unloaded list is unknown, not stuck.
+const testingIdleBadge = (o) => {
+  if (!o || o.status !== "testing") return "";
+  const mine = (state.experiments || []).filter((e) => String(e.opportunity_id) === String(o.id));
+  if (!mine.length || mine.some((e) => e.status === "running")) return "";
+  return ` <span class="warn-badge" title="Status is testing but no experiment is running">testing · nothing running</span>`;
+};
 
 // A score with no evidence behind it must say so: pill in the score cell
 // when the row's returned brief_count is zero. Read-only.
