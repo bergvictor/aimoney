@@ -501,8 +501,7 @@ describe("vet & log starter (audit 2026-09-20-round3 Task 1)", () => {
   it("one tap vets, POSTs a prefilled planned experiment, and flips to testing", () => {
     assert.ok(js.includes("async function vetAndLogStarter"), "app.js lost the vetAndLogStarter handler");
     const fn = js.slice(js.indexOf("async function vetAndLogStarter"), js.indexOf("async function killOpportunity"));
-    assert.ok(fn.includes("cleanUnreviewed(o.notes)"), "starter must clear UNREVIEWED like vetOpportunity");
-    assert.ok(fn.includes("[${day} vetted]"), "starter must append the vetted tag");
+    assert.ok(fn.includes("vettedNotes(o.notes)"), "starter must vet via the shared vettedNotes helper");
     assert.ok(fn.includes('api("/api/experiments",'), "starter must POST the experiment");
     assert.ok(fn.includes('status: "planned"'), "starter experiment must enter as planned");
     assert.ok(fn.includes("Starter: ${o.title}"), "starter name must prefill from the row title");
@@ -518,6 +517,26 @@ describe("vet & log starter (audit 2026-09-20-round3 Task 1)", () => {
     assert.ok(fn.includes("startExperiment(created.id)"), "starter toast must carry a Start shortcut for the created experiment");
     assert.ok(fn.includes('openAdminModal("Enter the admin token first.")'), "starter must open the admin modal without a token");
     assert.ok(fn.includes("await refreshTargets({ runs: false })"), "starter must refetch opportunities+experiments+health (runs only change on triage)");
+  });
+});
+
+describe("shared vetted-notes helper (audit 2026-09-20-round1 Task 4)", () => {
+  it("vettedNotes owns the tag, the UNREVIEWED clear, and the 8000-char cap", () => {
+    assert.ok(js.includes("function vettedNotes(notes)"), "app.js lost the vettedNotes helper");
+    const helper = js.slice(js.indexOf("function vettedNotes(notes)"), js.indexOf("async function fetchDetailForWrite"));
+    assert.ok(helper.includes("[${day} vetted] Human vetted; cap lifted."), "helper lost the vetted tag");
+    assert.ok(helper.includes("cleanUnreviewed(notes)"), "helper must clear UNREVIEWED");
+    assert.ok(helper.includes(".slice(-8000)"), "helper must keep the 8000-char cap");
+  });
+
+  it("Vet and Vet-&-starter both call vettedNotes with no inline tag left", () => {
+    const vetInner = js.slice(js.indexOf("async function vetOpportunityInner"), js.indexOf("async function vetAndLogStarter"));
+    const starterInner = js.slice(js.indexOf("async function vetAndLogStarterInner"), js.indexOf("async function killOpportunity"));
+    for (const [name, fn] of [["vet", vetInner], ["starter", starterInner]]) {
+      assert.ok(fn.includes("vettedNotes(o.notes)"), `${name} must vet via the shared vettedNotes helper`);
+      assert.ok(!fn.includes("[${day} vetted]"), `${name} must not keep an inline vetted tag beside the helper`);
+    }
+    assert.equal(js.split("[${day} vetted] Human vetted; cap lifted.").length - 1, 1, "vetted tag must live in exactly one place");
   });
 });
 

@@ -459,7 +459,8 @@ export async function onRequest(context) {
       // `health_probe_failures` instead of blanking the whole report (F1).
       const healthProbeNames = ["opportunities", "unreviewed", "bare_without_brief",
         "experiments_by_status", "last_ok_run", "decisions_week",
-        "revenue_week", "revenue_lifetime", "vetted_7d", "vetted_no_experiment", "noise_24h"];
+        "revenue_week", "revenue_lifetime", "vetted_7d", "vetted_no_experiment", "noise_24h",
+        "last_vetted"];
       const healthStmts = env.DB ? [
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities"),
         env.DB.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM opportunities WHERE notes LIKE '%UNREVIEWED%'"),
@@ -472,10 +473,11 @@ export async function onRequest(context) {
         env.DB.prepare(`SELECT COUNT(*) AS n FROM opportunities WHERE ${vettedDays.map((d) => `notes LIKE '%[${d} vetted]%'`).join(" OR ")}`),
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
         env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso),
+        env.DB.prepare("SELECT notes FROM opportunities WHERE notes LIKE '%vetted]%'"),
       ] : [];
       let healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;
       // Isolation fallback (F1): one bad probe (e.g. a SELECT touching a
-      // column a migration never applied) must not fail the other ten. When
+      // column a migration never applied) must not fail the other eleven. When
       // the batch rejects, each statement re-runs individually: the healthy
       // probes still report, only the failing counts go null, and `db` reads
       // by whether the database answered at all. A total outage keeps the
@@ -488,7 +490,7 @@ export async function onRequest(context) {
         const failedDetail = {};
         for (let i = 0; i < healthStmts.length; i++) {
           try {
-            if (i === 3) perProbe.push(await healthStmts[i].all());
+            if (i === 3 || healthProbeNames[i] === "last_vetted") perProbe.push(await healthStmts[i].all());
             else {
               const row = await healthStmts[i].first();
               perProbe.push({ results: row ? [row] : [] });
@@ -558,6 +560,19 @@ export async function onRequest(context) {
       const vettedRow = firstRow(8);
       const vettedNoExpRow = firstRow(9);
       const noiseRow = firstRow(10);
+      // Last-verdict date (finding 2): max [YYYY-MM-DD vetted] tag across all
+      // rows, null when no vetted row exists. Parsed in JS (not SQL) so every
+      // tag in a row counts and a stall shows its age without a told count.
+      const lastVettedRows = (healthRes && healthRes[11] && healthRes[11].results) || [];
+      let last_vetted = null;
+      if (!healthDown && !probeFailed(11)) {
+        for (const r of lastVettedRows) {
+          const text = String((r && r.notes) || "");
+          for (const m of text.matchAll(/\[(\d{4}-\d{2}-\d{2}) vetted\]/g)) {
+            if (!last_vetted || m[1] > last_vetted) last_vetted = m[1];
+          }
+        }
+      }
       // Lane metric, read-only from existing columns (no migration): decisions
       // are won/lost rows closed in the window; vetted counts rows carrying
       // the "[YYYY-MM-DD vetted]" tag (see vetOpportunity) dated in the last 7 calendar days.
@@ -587,7 +602,7 @@ export async function onRequest(context) {
           if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
         }
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(6)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(7)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(7)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(8)) ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: (healthDown || probeFailed(9)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(10)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}) });
+      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(6)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(7)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(7)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(8)) ? null : (vettedRow ? vettedRow.n : 0), last_vetted: (healthDown || probeFailed(11)) ? null : last_vetted, vetted_no_experiment: (healthDown || probeFailed(9)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(10)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}) });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

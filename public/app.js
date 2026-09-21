@@ -403,6 +403,14 @@ function cleanUnreviewed(notes) {
   return String(notes || "").replace(/UNREVIEWED,?\s*/g, "").replace(/UNREVIEWED/g, "").trim();
 }
 
+// Shared vetted tag (finding 6): the [YYYY-MM-DD vetted] tag is the health
+// contract vetted_last_7d counts, so both Vet paths build it here — one edit
+// point, no silent divergence.
+function vettedNotes(notes) {
+  const day = new Date().toISOString().slice(0, 10);
+  return `${cleanUnreviewed(notes)}\n[${day} vetted] Human vetted; cap lifted.`.trim().slice(-8000);
+}
+
 // Detail-before-write (F2): list rows no longer ship notes, so Vet, Starter,
 // and Kill share one token-gated detail fetch that stashes full notes on the
 // list row for the write below. Returns the row, or null (after the modal or
@@ -427,8 +435,7 @@ async function vetOpportunityInner(id) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
   const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
   if (!o) return;
-  const day = new Date().toISOString().slice(0, 10);
-  const notes = `${cleanUnreviewed(o.notes)}\n[${day} vetted] Human vetted; cap lifted.`.trim().slice(-8000);
+  const notes = vettedNotes(o.notes);
   try {
     await api(`/api/opportunities/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
@@ -456,8 +463,7 @@ async function vetAndLogStarterInner(id) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
   const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
   if (!o) return;
-  const day = new Date().toISOString().slice(0, 10);
-  const notes = `${cleanUnreviewed(o.notes)}\n[${day} vetted] Human vetted; cap lifted.`.trim().slice(-8000);
+  const notes = vettedNotes(o.notes);
   const starterName = `Starter: ${o.title}`.slice(0, 200);
   const starterHypothesis = String(o.one_liner || firstStepsFirstLine({ first_steps: o.brief_first_steps }) || `Smallest paid test of ${o.title}`).slice(0, 8000);
   try {
