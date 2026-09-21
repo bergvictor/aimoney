@@ -138,6 +138,33 @@ const firstStepsFirstLine = (brief) =>
 // into the drawer via openDrawer. When the top pick still carries UNREVIEWED,
 // the strip also shows Vet/Kill reusing vetOpportunity / killOpportunity
 // (same toasts + refresh); vetted picks keep the drawer link only.
+// One Start-here strip builder + binder (round7 Task 3, F5): the live
+// renderStartHere and the boot paintLastGood strip used to build the same
+// copy, buttons, and handlers by hand, so the next copy change could diverge
+// the cold-load paint from the live strip. Both call sites now share these;
+// only the data source (live `top` vs cached `cachedTop`) and the stale mark
+// differ. The live path passes "" so its output is byte-identical to before.
+function startHereHtml(top, needsReview, staleMark) {
+  const excerpt = firstStepsFirstLine({ first_steps: top.brief_first_steps });
+  const nextAction = excerpt || "No brief yet — open the drawer for facts.";
+  return (
+    `<div style="background:var(--green-wash);border:1px solid var(--green);border-radius:8px;padding:10px 12px;margin-bottom:12px">` +
+    `<p style="margin:0 0 4px"><b>Start here today:</b> ${esc(top.title)}${staleMark}</p>` +
+    `<p class="muted" style="margin:0 0 8px;font-size:13px"><span class="mono">${money(top.est_monthly_low, top.est_monthly_high)}/mo</span>` +
+    ` · <span>Capital: ${esc(top.capital_needed || "—")}</span>` +
+    ` · <span>Next: ${esc(nextAction)}</span></p>` +
+    `<p style="margin:0"><button id="start-here-open" class="btn small" type="button">Open in drawer</button>` +
+    (needsReview ? ` <button id="start-here-vet" class="btn small" type="button">Vet</button> <button id="start-here-kill" class="btn small ghost danger" type="button">Kill</button>` : "") +
+    `</p>` +
+    `</div>`);
+}
+function bindStartHere(top, needsReview) {
+  $("#start-here-open").addEventListener("click", () => openDrawer(top.id));
+  if (needsReview) {
+    $("#start-here-vet").addEventListener("click", () => vetOpportunity(top.id));
+    $("#start-here-kill").addEventListener("click", (ev) => killOpportunity(top.id, ev.currentTarget));
+  }
+}
 function renderStartHere() {
   const el = $("#start-here");
   if (!el) return;
@@ -149,25 +176,10 @@ function renderStartHere() {
     if ((state.apiFailures || []).includes("/api/opportunities")) return;
     el.classList.add("hidden"); el.innerHTML = ""; return;
   }
-  const excerpt = firstStepsFirstLine({ first_steps: top.brief_first_steps });
-  const nextAction = excerpt || "No brief yet — open the drawer for facts.";
   const needsReview = isNeedsReview(top);
   el.classList.remove("hidden");
-  el.innerHTML =
-    `<div style="background:var(--green-wash);border:1px solid var(--green);border-radius:8px;padding:10px 12px;margin-bottom:12px">` +
-    `<p style="margin:0 0 4px"><b>Start here today:</b> ${esc(top.title)}</p>` +
-    `<p class="muted" style="margin:0 0 8px;font-size:13px"><span class="mono">${money(top.est_monthly_low, top.est_monthly_high)}/mo</span>` +
-    ` · <span>Capital: ${esc(top.capital_needed || "—")}</span>` +
-    ` · <span>Next: ${esc(nextAction)}</span></p>` +
-    `<p style="margin:0"><button id="start-here-open" class="btn small" type="button">Open in drawer</button>` +
-    (needsReview ? ` <button id="start-here-vet" class="btn small" type="button">Vet</button> <button id="start-here-kill" class="btn small ghost danger" type="button">Kill</button>` : "") +
-    `</p>` +
-    `</div>`;
-  $("#start-here-open").addEventListener("click", () => openDrawer(top.id));
-  if (needsReview) {
-    $("#start-here-vet").addEventListener("click", () => vetOpportunity(top.id));
-    $("#start-here-kill").addEventListener("click", (ev) => killOpportunity(top.id, ev.currentTarget));
-  }
+  el.innerHTML = startHereHtml(top, needsReview, "");
+  bindStartHere(top, needsReview);
 }
 
 /* ---- priority list ---- */
@@ -1453,31 +1465,17 @@ function paintLastGood() {
       chip.title = `${review.count} need review` + (bare !== null ? ` · ${bare} without briefs` : "") + staleMark;
     }
   }
-  // Strip: same copy and actions as renderStartHere, stale-marked past one
-  // tick. Vet/Kill re-fetch detail before writing, so a cached id is safe.
+  // Strip: shared startHereHtml/bindStartHere with renderStartHere, so the
+  // cold-load paint cannot diverge from the live strip; stale-marked past
+  // one tick. Vet/Kill re-fetch detail before writing, so a cached id is safe.
   const cachedTop = snap.top;
   const el = $("#start-here");
   if (cachedTop && cachedTop.id !== null && cachedTop.id !== undefined && el) {
     const staleMark = isSnapshotStale(cachedTop.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "";
-    const excerpt = firstStepsFirstLine({ first_steps: cachedTop.brief_first_steps });
-    const nextAction = excerpt || "No brief yet — open the drawer for facts.";
     const needsReview = Number(cachedTop.needs_review) === 1;
     el.classList.remove("hidden");
-    el.innerHTML =
-      `<div style="background:var(--green-wash);border:1px solid var(--green);border-radius:8px;padding:10px 12px;margin-bottom:12px">` +
-      `<p style="margin:0 0 4px"><b>Start here today:</b> ${esc(cachedTop.title)}${staleMark}</p>` +
-      `<p class="muted" style="margin:0 0 8px;font-size:13px"><span class="mono">${money(cachedTop.est_monthly_low, cachedTop.est_monthly_high)}/mo</span>` +
-      ` · <span>Capital: ${esc(cachedTop.capital_needed || "—")}</span>` +
-      ` · <span>Next: ${esc(nextAction)}</span></p>` +
-      `<p style="margin:0"><button id="start-here-open" class="btn small" type="button">Open in drawer</button>` +
-      (needsReview ? ` <button id="start-here-vet" class="btn small" type="button">Vet</button> <button id="start-here-kill" class="btn small ghost danger" type="button">Kill</button>` : "") +
-      `</p>` +
-      `</div>`;
-    $("#start-here-open").addEventListener("click", () => openDrawer(cachedTop.id));
-    if (needsReview) {
-      $("#start-here-vet").addEventListener("click", () => vetOpportunity(cachedTop.id));
-      $("#start-here-kill").addEventListener("click", (ev) => killOpportunity(cachedTop.id, ev.currentTarget));
-    }
+    el.innerHTML = startHereHtml(cachedTop, needsReview, staleMark);
+    bindStartHere(cachedTop, needsReview);
   }
 }
 

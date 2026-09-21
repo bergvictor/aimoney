@@ -88,9 +88,14 @@ function makeDB(seed = {}) {
       const rows = data.runs.slice().sort((a, b) => b.id - a.id).slice(0, limit);
       return { results: rows };
     }
-    if (sql.includes("FROM opportunities") && sql.includes("vetted]%") && !sql.includes("COUNT(*)") && (sql.includes("substr(notes, -500)") || sql.includes("SELECT notes FROM opportunities"))) {
+    if (sql.includes("FROM opportunities") && sql.includes("vetted]%") && !sql.includes("COUNT(*)") && (sql.includes("substr(notes, -") || sql.includes("SELECT notes FROM opportunities"))) {
       const wantKilled = sql.includes("killed]%");
-      return { results: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]") || (wantKilled && String(o.notes || "").includes("killed]"))).map((o) => ({ notes: String(o.notes || "").slice(-500) })) };
+      // Honor the probe's own tail width (round7 Task 4): substr(notes, -N)
+      // transfers the last N chars like D1, so a too-narrow tail really hides
+      // a buried tag here instead of failing to route.
+      const tailWidth = (/substr\(notes, -(\d+)\)/.exec(sql) || [])[1];
+      const tail = (notes) => tailWidth ? String(notes || "").slice(-Number(tailWidth)) : String(notes || "");
+      return { results: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]") || (wantKilled && String(o.notes || "").includes("killed]"))).map((o) => ({ notes: tail(o.notes) })) };
     }
     return { results: [] };
   }
@@ -288,7 +293,7 @@ function makeDB(seed = {}) {
         const sql = (s && s._sql) || "";
         const args = (s && s._args) || [];
         if (sql.includes("GROUP BY status")) return handleAll(sql, args);
-        if (sql.includes("FROM opportunities") && sql.includes("vetted]%") && !sql.includes("COUNT(*)") && (sql.includes("substr(notes, -500)") || sql.includes("SELECT notes FROM opportunities"))) return handleAll(sql, args);
+        if (sql.includes("FROM opportunities") && sql.includes("vetted]%") && !sql.includes("COUNT(*)") && (sql.includes("substr(notes, -") || sql.includes("SELECT notes FROM opportunities"))) return handleAll(sql, args);
         const row = handleFirst(sql, args);
         return { results: row ? [row] : [] };
       });
@@ -1592,7 +1597,7 @@ describe("health last-verdict date (audit 2026-09-20-round1 Task 2)", () => {
     assert.equal(fresh.body.last_vetted, today);
   });
 
-  it("bounds the probe to a 500-char tail while still reporting the newest tag", async () => {
+  it("bounds the probe to a 2000-char tail while still reporting the newest tag", async () => {
     const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
     const oldDay = daysAgo(30).slice(0, 10);
     const today = new Date().toISOString().slice(0, 10);
@@ -1608,11 +1613,11 @@ describe("health last-verdict date (audit 2026-09-20-round1 Task 2)", () => {
     assert.equal(long.body.last_vetted, today, "8000-char notes must still report the newest tag from the bounded tail");
     const probeSql = (longDb._prepared || []).filter((s) => s.includes("vetted]%") && !s.includes("COUNT(*)") && !s.includes("NOT EXISTS"));
     assert.equal(probeSql.length, 1, "health must carry exactly one last_vetted SELECT");
-    assert.ok(probeSql[0].includes("substr(notes, -500)"), "last_vetted probe must select the bounded substr tail");
+    assert.ok(probeSql[0].includes("substr(notes, -2000)"), "last_vetted probe must select the bounded substr tail");
     assert.ok(!probeSql[0].includes("SELECT notes FROM opportunities"), "last_vetted probe must not select full bodies");
     const tailRows = await longDb.prepare(probeSql[0]).all();
     for (const row of (tailRows.results || [])) {
-      assert.ok(String(row.notes || "").length <= 500, "transferred tail must stay within 500 chars");
+      assert.ok(String(row.notes || "").length <= 2000, "transferred tail must stay within 2000 chars");
     }
     const shortDb = makeDB({ opportunities: [mkOpp(shortNotes, created)] });
     const short = await callApi(["health"], "http://localhost/api/health", {}, shortDb);
@@ -2234,13 +2239,43 @@ describe("kill verdicts in health verdict date (audit 2026-09-20-round3 Task 2)"
     assert.equal(r.body.last_verdict, daysAgo(2));
   });
 
-  it("probe stays bounded to a 500-char tail while matching killed rows", async () => {
+  it("probe stays bounded to a 2000-char tail while matching killed rows", async () => {
     const db = makeDB({ opportunities: oppSeed() });
     await callApi(["health"], "http://localhost/api/health", {}, db);
     const probeSql = (db._prepared || []).filter((s) => s.includes("vetted]%") && !s.includes("COUNT(*)") && !s.includes("NOT EXISTS"));
     assert.equal(probeSql.length, 1, "health must carry exactly one verdict-date SELECT");
-    assert.ok(probeSql[0].includes("substr(notes, -500)"), "verdict probe must select the bounded substr tail");
+    assert.ok(probeSql[0].includes("substr(notes, -2000)"), "verdict probe must select the bounded substr tail");
     assert.ok(probeSql[0].includes("killed]%"), "verdict probe must match killed rows");
+  });
+});
+
+describe("verdict date survives outcome appends (audit 2026-09-20-round7 Task 4)", () => {
+  it("vet tag + two outcome closes still reports the vet date on both dates", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const tag = "[" + today + " vetted]";
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "testing", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x " + tag + " Human vetted; cap lifted.", created_at: "2026-09-10T00:00:00Z", updated_at: new Date().toISOString() },
+      ],
+    });
+    // Two real closes through the create path, each appending its
+    // outcome-ledger line after the vet tag via the shipped handler.
+    for (const [name, status, result] of [
+      ["Landing page headline test, first variant run to a decision", "won", "R1 " + "r".repeat(197)],
+      ["Cold outreach sprint, second variant run to a decision", "lost", "R2 " + "s".repeat(197)],
+    ]) {
+      const close = await callApi(["experiments"], "http://localhost/api/experiments",
+        { method: "POST", token: "secret", body: { opportunity_id: 1, name, status, result, post_mortem: "pm " + name, revenue_cents: 50000, spent_cents: 1250, revenue_source: "Stripe" } }, db);
+      assert.equal(close.status, 201);
+    }
+    const notes = db.data.opportunities[0].notes;
+    const buried = notes.slice(notes.indexOf(tag) + tag.length).length;
+    assert.ok(buried > 600, `two outcome lines must bury the vet tag >600 chars deep (a 500-char tail would miss it), got ${buried}`);
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.last_vetted, today, "outcome appends must not hide the vet date");
+    assert.equal(r.body.last_verdict, today, "outcome appends must not hide the verdict date");
+    assert.equal(r.body.vetted_last_7d, 1, "count and date must agree on the vetted row");
   });
 });
 

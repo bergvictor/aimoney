@@ -743,7 +743,9 @@ describe("targeted refresh per action (audit 2026-09-20-round2 Task 1)", () => {
 });
 
 describe("start-here list excerpt (audit 2026-09-20-round2 Task 3)", () => {
-  const strip = js.slice(js.indexOf("function renderStartHere"), js.indexOf("/* ---- priority list ---- */"));
+  // Round7 Task 3: the strip body moved into the shared startHereHtml builder
+  // (renderStartHere calls it), so the slice starts at the builder.
+  const strip = js.slice(js.indexOf("function startHereHtml"), js.indexOf("/* ---- priority list ---- */"));
 
   it("reads the next action from the list payload, with the bare-row fallback", () => {
     assert.ok(strip.includes("firstStepsFirstLine({ first_steps: top.brief_first_steps })"), "strip must reuse the list-API brief excerpt");
@@ -1007,8 +1009,8 @@ describe("last-good first paint (audit 2026-09-20-round3 Task 2)", () => {
     assert.ok(paint.includes('$("#agent-text")'), "cache paint must fill the agent pill");
     assert.ok(paint.includes('$("#start-here")'), "cache paint must fill the Start-here strip");
     assert.ok(paint.includes('$("#review-count")'), "cache paint must fill the review chip");
-    assert.ok(paint.includes("Start here today"), "cached strip must keep the strip copy");
-    assert.ok(paint.includes("openDrawer(cachedTop.id)"), "cached strip must deep-link via openDrawer");
+    assert.ok(paint.includes("startHereHtml(cachedTop"), "cached strip must render via the shared startHereHtml builder");
+    assert.ok(paint.includes("bindStartHere(cachedTop"), "cached strip must bind via the shared bindStartHere binder");
     assert.ok(!paint.includes('api("/api/'), "cache paint must not issue a fetch");
   });
 
@@ -1035,6 +1037,35 @@ describe("last-good first paint (audit 2026-09-20-round3 Task 2)", () => {
     assert.ok(strip.includes("el.innerHTML ="), "live strip must still repaint on success");
     const rr = js.slice(js.indexOf("async function refreshReview"), js.indexOf("const fmtAgeH"));
     assert.ok(rr.includes("el.textContent = state.reviewList.length"), "review count must still fill from live data");
+  });
+});
+
+describe("shared start-here builder (audit 2026-09-20-round7 Task 3)", () => {
+  it("exactly one builder + binder serve the live strip and the cached paint", () => {
+    assert.equal(js.split("function startHereHtml").length - 1, 1, "exactly one startHereHtml builder");
+    assert.equal(js.split("function bindStartHere").length - 1, 1, "exactly one bindStartHere binder");
+    assert.equal(js.split("Start here today:</b>").length - 1, 1, "strip copy must live in one place");
+    const live = js.slice(js.indexOf("function renderStartHere"), js.indexOf("/* ---- priority list ---- */"));
+    assert.ok(live.includes("startHereHtml(top, needsReview"), "live strip must render via the shared builder");
+    assert.ok(live.includes("bindStartHere(top, needsReview)"), "live strip must bind via the shared binder");
+    const paint = js.slice(js.indexOf("function paintLastGood"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(paint.includes("startHereHtml(cachedTop, needsReview, staleMark)"), "cached strip must render via the shared builder");
+    assert.ok(paint.includes("bindStartHere(cachedTop, needsReview)"), "cached strip must bind via the shared binder");
+  });
+
+  it("live and cached call sites render identical HTML apart from the stale mark", () => {
+    const src = js.slice(js.indexOf("function startHereHtml"), js.indexOf("function bindStartHere"));
+    const startHereHtml = new Function("esc", "money", "firstStepsFirstLine",
+      `${src} return startHereHtml;`)((s) => `[${s}]`, (lo, hi) => `$${lo}-$${hi}`, () => "NEXT STEP");
+    const row = { title: "T", brief_first_steps: "x", est_monthly_low: 100, est_monthly_high: 200, capital_needed: "$0" };
+    const live = startHereHtml(row, true, "");
+    const cached = startHereHtml(row, true, " (stale)");
+    assert.equal(cached, live.replace("[T]</p>", "[T] (stale)</p>"), "cached strip must equal the live strip plus the stale mark");
+    assert.ok(live.includes("Start here today"), "builder lost the strip copy");
+    assert.ok(live.includes('id="start-here-vet"') && live.includes('id="start-here-kill"'), "unreviewed pick must carry Vet/Kill");
+    const vetted = startHereHtml(row, false, "");
+    assert.ok(!vetted.includes("start-here-vet") && !vetted.includes("start-here-kill"), "vetted picks must keep drawer-link-only");
+    assert.ok(vetted.includes("NEXT STEP"), "builder must render the brief next action");
   });
 });
 
