@@ -83,6 +83,17 @@ const centsDollars = (cents) => "$" + (Number(cents) / 100).toFixed(2);
 // effectiveScore shared via worker/src/lib.js (F3); scoreOf deduped (F6).
 // (local duplicate removed; see import above)
 
+// Experiment-write schema hint (audit 2026-09-20-round4 F3): a live D1 that
+// predates 2026-09-20 lacks revenue_source, which the self-migration
+// deliberately does not cover (probe-read cents only). A narrow
+// "no such column" failure on the experiment write paths answers 503 naming
+// only the column — never SQL or driver text (same regex as health detail).
+// The router awaits exactly these two write paths so their rejections land here.
+const missingColumnOf = (err) => {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  const m = /no such column:\s*([A-Za-z_][\w.]*)/i.exec(msg);
+  return m ? m[1] : null;
+};
 function authed(request, env) {
   const want = (env.ADMIN_TOKEN || "").trim();
   if (!want) return { ok: false, reason: "writes disabled (ADMIN_TOKEN not set)" };
@@ -438,20 +449,21 @@ export async function onRequest(context) {
       const vettedDays = [];
       for (let i = 0; i < 7; i++) vettedDays.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
       // One batched round-trip for every independent health select (paired
-      // scans merged: decisions+revenue, lifetime totals, unreviewed+oldest).
+      // scans merged: lifetime totals, unreviewed+oldest; decisions split from revenue).
       // Probe names for the isolation fallback: when the batch rejects, each
       // statement re-runs individually and the failing probe is named in
       // `health_probe_failures` instead of blanking the whole report (F1).
       const healthProbeNames = ["opportunities", "unreviewed", "bare_without_brief",
-        "experiments_by_status", "last_ok_run", "decisions_revenue_week",
-        "revenue_lifetime", "vetted_7d", "vetted_no_experiment", "noise_24h"];
+        "experiments_by_status", "last_ok_run", "decisions_week",
+        "revenue_week", "revenue_lifetime", "vetted_7d", "vetted_no_experiment", "noise_24h"];
       const healthStmts = env.DB ? [
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities"),
         env.DB.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM opportunities WHERE notes LIKE '%UNREVIEWED%'"),
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL"),
         env.DB.prepare("SELECT status, COUNT(*) AS n FROM experiments GROUP BY status"),
         env.DB.prepare("SELECT finished_at, started_at FROM agent_runs WHERE status='ok' ORDER BY id DESC LIMIT 1"),
-        env.DB.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
+        env.DB.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
+        env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
         env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS revenue, COALESCE(SUM(spent_cents),0) AS spent FROM experiments WHERE status IN ('won','lost')"),
         env.DB.prepare(`SELECT COUNT(*) AS n FROM opportunities WHERE ${vettedDays.map((d) => `notes LIKE '%[${d} vetted]%'`).join(" OR ")}`),
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
@@ -459,7 +471,7 @@ export async function onRequest(context) {
       ] : [];
       let healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;
       // Isolation fallback (F1): one bad probe (e.g. a SELECT touching a
-      // column a migration never applied) must not fail the other nine. When
+      // column a migration never applied) must not fail the other ten. When
       // the batch rejects, each statement re-runs individually: the healthy
       // probes still report, only the failing counts go null, and `db` reads
       // by whether the database answered at all. A total outage keeps the
@@ -504,10 +516,10 @@ export async function onRequest(context) {
       // untouched and the payload names the missing columns plus the
       // disabled line below. At most once per isolate; ADD-only.
       let schemaNote = null;
-      if (healthProbeFailures && (healthProbeFailures.includes("decisions_revenue_week") || healthProbeFailures.includes("revenue_lifetime"))) {
+      if (healthProbeFailures && (healthProbeFailures.includes("revenue_week") || healthProbeFailures.includes("revenue_lifetime"))) {
         schemaNote = await ensureMoneyColumns(env);
         if (schemaNote.migrated) {
-          for (const i of [5, 6]) {
+          for (const i of [6, 7]) {
             if (!healthProbeFailures.includes(healthProbeNames[i])) continue;
             try {
               const row = await healthStmts[i].first();
@@ -536,16 +548,17 @@ export async function onRequest(context) {
       const bareRow = firstRow(2);
       const expRows = { results: (healthRes && healthRes[3] && healthRes[3].results) || [] };
       const lastOk = firstRow(4);
-      const weekRow = firstRow(5);
-      const lifetimeRow = firstRow(6);
-      const vettedRow = firstRow(7);
-      const vettedNoExpRow = firstRow(8);
-      const noiseRow = firstRow(9);
+      const decisionsWeekRow = firstRow(5);
+      const revenueWeekRow = firstRow(6);
+      const lifetimeRow = firstRow(7);
+      const vettedRow = firstRow(8);
+      const vettedNoExpRow = firstRow(9);
+      const noiseRow = firstRow(10);
       // Lane metric, read-only from existing columns (no migration): decisions
       // are won/lost rows closed in the window; vetted counts rows carrying
       // the "[YYYY-MM-DD vetted]" tag (see vetOpportunity) dated in the last 7 calendar days.
-      const decisionsRow = weekRow ? { n: weekRow.n } : null;
-      const revenueRow = weekRow ? { total: weekRow.total } : null;
+      const decisionsRow = decisionsWeekRow ? { n: decisionsWeekRow.n } : null;
+      const revenueRow = revenueWeekRow ? { total: revenueWeekRow.total } : null;
       const revenueTotalRow = lifetimeRow ? { total: lifetimeRow.revenue } : null;
       const spentTotalRow = lifetimeRow ? { total: lifetimeRow.spent } : null;
       const oldestUnreviewed = unreviewedRow && unreviewedRow.oldest ? { created_at: unreviewedRow.oldest } : null;
@@ -570,7 +583,7 @@ export async function onRequest(context) {
           if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
         }
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(5)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(6)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(6)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(7)) ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: (healthDown || probeFailed(8)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(9)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}) });
+      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(6)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(7)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(7)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(8)) ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: (healthDown || probeFailed(9)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(10)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}) });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({
@@ -592,12 +605,13 @@ export async function onRequest(context) {
     if (parts[0] === "experiments" && parts.length === 1 && method === "GET")
       return listExperiments(env, url);
     if (parts[0] === "experiments" && parts.length === 1 && method === "POST")
-      return createExperiment(request, env);
+      return await createExperiment(request, env);
     if (parts[0] === "experiments" && parts.length === 2 && (method === "PATCH" || method === "PUT"))
-      return updateExperiment(request, env, parts[1]);
+      return await updateExperiment(request, env, parts[1]);
     if (parts[0] === "runs" && method === "GET") return listRuns(env, url);
     return json({ error: "not found" }, 404);
   } catch (e) {
+    const col = missingColumnOf(e); if (col) return json({ error: "missing column: " + col, column: col }, 503);
     return json({ error: String(e && e.message || e).slice(0, 500) }, 500);
   }
 }

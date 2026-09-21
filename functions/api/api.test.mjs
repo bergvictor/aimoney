@@ -1171,8 +1171,9 @@ describe("health batch + rev cache (audit 2026-09-20-round2 Task 2)", () => {
     assert.equal(r.status, 200);
     assert.equal(db._batchCalls, 1, "health must issue exactly one DB.batch");
     const prepared = db._prepared || [];
-    assert.equal(prepared.length, 10, `health must prepare 10 statements, got ${prepared.length}`);
-    assert.ok(prepared.some((s) => s.includes("COUNT(*)") && s.includes("SUM(revenue_cents)") && s.includes("-7 days")), "decisions+revenue must merge to one scan");
+    assert.equal(prepared.length, 11, `health must prepare 11 statements, got ${prepared.length}`);
+    assert.ok(prepared.some((s) => s.includes("COUNT(*)") && s.includes("FROM experiments") && s.includes("-7 days") && !s.includes("SUM(")), "decisions COUNT must run without any money column");
+    assert.ok(prepared.some((s) => s.includes("SUM(revenue_cents)") && s.includes("-7 days") && !s.includes("COUNT(*)")), "revenue week SUM must run as its own probe");
     assert.ok(prepared.some((s) => s.includes("SUM(revenue_cents)") && s.includes("SUM(spent_cents)")), "lifetime totals must merge to one scan");
     assert.ok(prepared.some((s) => s.includes("UNREVIEWED") && s.includes("MIN(created_at)")), "unreviewed count+oldest must merge to one scan");
   });
@@ -1570,11 +1571,11 @@ describe("self-migration switch (audit 2026-09-20-round3 Task 1)", () => {
     assert.equal(r.body.db, "up");
     assert.deepEqual(db._oldSchema.writes, [], "unset must run zero writes");
     assert.ok(!db._oldSchema.columns.has("revenue_cents") && !db._oldSchema.columns.has("spent_cents"), "unset must not add columns");
-    assert.equal(r.body.decisions_last_7d, null);
+    assert.equal(r.body.decisions_last_7d, 1);
     assert.equal(r.body.revenue_last_7d, null);
     assert.equal(r.body.revenue_total, null);
     assert.equal(r.body.spent_total, null);
-    assert.deepEqual(r.body.health_probe_failures, ["decisions_revenue_week", "revenue_lifetime"]);
+    assert.deepEqual(r.body.health_probe_failures, ["revenue_week", "revenue_lifetime"]);
     assert.deepEqual(r.body.schema_missing_columns, ["revenue_cents", "spent_cents"]);
     assert.ok(r.body.schema_migration.includes("disabled"), "payload must carry the disabled line");
     assert.ok(r.body.schema_migration.includes("ALLOW_SCHEMA_MIGRATION=1"), "disabled line must name the exact variable");
@@ -1633,6 +1634,102 @@ describe("self-migration switch (audit 2026-09-20-round3 Task 1)", () => {
     const db = makeDB({ opportunities: oppSeed() });
     assert.equal((await callApi(["migrate"], "http://localhost/api/migrate", {}, db)).status, 404);
     assert.equal((await callApi(["migrate"], "http://localhost/api/migrate", { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } }, db)).status, 404);
+  });
+});
+
+describe("experiment-write missing column 503 (audit 2026-09-20-round4 Task 2)", () => {
+  const writeFailDB = (boom) => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql) => {
+      if (sql.includes("INSERT INTO experiments") || sql.includes("UPDATE experiments SET")) {
+        return {
+          _sql: sql, _args: [],
+          bind(...a) { return this; },
+          all: async () => { throw boom; },
+          first: async () => { throw boom; },
+          run: async () => { throw boom; },
+        };
+      }
+      return realPrepare(sql);
+    };
+    return db;
+  };
+  const columnBoom = new Error("INSERT INTO experiments (...) failed: no such column: revenue_source (SQLITE_ERROR)");
+
+  it("POST /experiments on an unmigrated table 503s naming only revenue_source", async () => {
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, writeFailDB(columnBoom));
+    assert.equal(r.status, 503);
+    assert.equal(r.body.column, "revenue_source");
+    assert.ok(String(r.body.error).includes("revenue_source"), "503 must name the missing column");
+    assert.ok(!JSON.stringify(r.body).includes("INSERT"), "503 must not leak SQL text");
+    assert.ok(!JSON.stringify(r.body).includes("SQLITE_ERROR"), "503 must not leak driver verbiage");
+  });
+
+  it("PATCH /experiments on an unmigrated table 503s naming only revenue_source", async () => {
+    const r = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running" } }, writeFailDB(columnBoom));
+    assert.equal(r.status, 503);
+    assert.equal(r.body.column, "revenue_source");
+    assert.ok(String(r.body.error).includes("revenue_source"), "503 must name the missing column");
+    assert.ok(!JSON.stringify(r.body).includes("INSERT"), "503 must not leak SQL text");
+    assert.ok(!JSON.stringify(r.body).includes("SQLITE_ERROR"), "503 must not leak driver verbiage");
+  });
+
+  it("closure gate still 400s before any write, happy paths unchanged", async () => {
+    const gate = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "won", result: "r" } }, writeFailDB(columnBoom));
+    assert.equal(gate.status, 400);
+    assert.ok(gate.body.fields && gate.body.fields.post_mortem);
+    const okDB = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const created = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, okDB);
+    assert.equal(created.status, 201);
+    const started = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running" } }, okDB);
+    assert.equal(started.status, 200);
+  });
+
+  it("non-column write errors still 500 (narrow catch only)", async () => {
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, writeFailDB(new Error("D1 down")));
+    assert.equal(r.status, 500);
+  });
+});
+
+describe("decisions COUNT split from revenue SUM (audit 2026-09-20-round4 Task 1)", () => {
+  it("failed revenue-week SUM still reports decisions_last_7d with the probe named", async () => {
+    _resetSchemaMigrationForTests();
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: new Date().toISOString(), revenue_cents: 50000, spent_cents: 1200 },
+      ],
+    });
+    const realPrepare = db.prepare.bind(db);
+    const revenueWeekDown = {
+      ...db,
+      batch: async () => { throw new Error("no such column: revenue_cents"); },
+      prepare: (sql) => {
+        const stmt = realPrepare(sql);
+        if (sql.includes("SUM(revenue_cents)") && sql.includes("-7 days")) {
+          stmt.first = async () => { throw new Error("no such column: revenue_cents"); };
+        }
+        return stmt;
+      },
+    };
+    const r = await callApi(["health"], "http://localhost/api/health", {}, revenueWeekDown);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.db, "up");
+    assert.equal(r.body.decisions_last_7d, 1);
+    assert.equal(r.body.revenue_last_7d, null);
+    assert.equal(r.body.revenue_total, 50000);
+    assert.equal(r.body.spent_total, 1200);
+    assert.deepEqual(r.body.health_probe_failures, ["revenue_week"]);
+    assert.deepEqual(r.body.health_probe_detail, { revenue_week: "revenue_cents" });
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
   });
 });
 

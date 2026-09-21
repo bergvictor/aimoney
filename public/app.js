@@ -564,8 +564,8 @@ const stalestOpenExp = (exps) => {
 
 // Fallback decisions/week from the already-loaded experiments list (no new
 // request): won/lost rows with ended_at inside 7d. Mirrors the API's
-// decisions_last_7d window so the header stays honest when the money probes
-// fail; health numbers win whenever present (see renderExperiments).
+// decisions_last_7d window so the header stays honest when the decisions probe
+// fails; health numbers win whenever present (see renderExperiments).
 const fallbackDecisions = (exps) => {
   const cutoff = Date.now() - 7 * 86400000;
   let n = 0;
@@ -662,7 +662,7 @@ function renderExperiments() {
   const vettedNoExp = state.health && typeof state.health.vetted_no_experiment === "number" ? state.health.vetted_no_experiment : null;
   const revenue = state.health && typeof state.health.revenue_last_7d === "number" ? state.health.revenue_last_7d : null;
   const revenueTotal = state.health && typeof state.health.revenue_total === "number" ? state.health.revenue_total : null;
-  // Fallback: when the money probes fail (null), count decisions from the
+  // Fallback: when the decisions probe fails (null), count decisions from the
   // already-loaded list so the week line and the stall nudge survive the
   // outage. Health wins whenever present; no new request is made.
   const decisions = healthDecisions !== null ? healthDecisions : fallbackDecisions(exps);

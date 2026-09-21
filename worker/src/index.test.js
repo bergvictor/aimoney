@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker, { agentMoneyEstimates, exactUrlTarget } from "./index.js";
+import worker, { agentMoneyEstimates, exactUrlTarget, flushVerdictWrites } from "./index.js";
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {
@@ -325,8 +325,11 @@ describe("batched verdict writes + single heartbeat (audit 2026-09-20-round3 Tas
   it("per-verdict signal/note writes go out as one env.DB.batch", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
     assert.ok(src.includes("const verdictWrites = [];"), "worker lost the verdict-writes accumulator");
-    assert.ok(src.includes("if (verdictWrites.length) await env.DB.batch(verdictWrites);"), "verdict writes must flush as one batch");
-    const loop = src.slice(src.indexOf("for (const v of verdicts)"), src.indexOf("if (verdictWrites.length)"));
+    assert.ok(src.includes("await flushVerdictWrites(env, verdictWrites)"), "verdict writes must flush via the batch+fallback helper");
+    assert.ok(src.includes("export async function flushVerdictWrites"), "worker lost the exported verdict-flush helper");
+    assert.ok(src.includes("await env.DB.batch(verdictWrites)"), "flush helper lost the single-batch fast path");
+    assert.ok(src.includes("await w.run()"), "flush helper lost the per-write retry");
+    const loop = src.slice(src.indexOf("for (const v of verdicts)"), src.indexOf("await flushVerdictWrites(env, verdictWrites)"));
     assert.ok(loop.includes("verdictWrites.push"), "verdict loop must accumulate into the batch");
     assert.equal(loop.split("await env.DB.prepare").length - 1, 2, "only the new-row INSERT and the slug-collision lookup stay inline");
     assert.ok(src.includes("SELECT id FROM opportunities WHERE slug = ?"), "slug-collision lookup must stay inline");
@@ -349,6 +352,50 @@ describe("batched verdict writes + single heartbeat (audit 2026-09-20-round3 Tas
     assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3");
     assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
     assert.ok(src.includes("INSERT INTO opportunities (slug, title, one_liner"), "new-row INSERT changed");
+  });
+});
+
+describe("verdict batch isolation fallback (audit 2026-09-20-round4 Task 3)", () => {
+  it("rejected batch re-runs writes individually, keeps successes, counts failures", async () => {
+    const landed = [];
+    const ok = (id) => ({ run: async () => { landed.push(id); } });
+    const bad = { run: async () => { throw new Error("bad write"); } };
+    const env = { DB: { batch: async () => { throw new Error("batch bad"); } } };
+    const failed = await flushVerdictWrites(env, [ok("a"), bad, ok("b")]);
+    assert.equal(failed, 1);
+    assert.deepEqual(landed, ["a", "b"]);
+  });
+
+  it("fast path batches once with no individual runs; empty flush batches nothing", async () => {
+    let batched = null;
+    let runs = 0;
+    const env = { DB: { batch: async (stmts) => { batched = stmts; } } };
+    const failed = await flushVerdictWrites(env, [{ run: async () => { runs++; } }]);
+    assert.equal(failed, 0);
+    assert.equal(batched.length, 1);
+    assert.equal(runs, 0);
+    let batchCalls = 0;
+    const emptyEnv = { DB: { batch: async () => { batchCalls++; } } };
+    assert.equal(await flushVerdictWrites(emptyEnv, []), 0);
+    assert.equal(batchCalls, 0);
+  });
+
+  it("run log carries a conditional verdict:N_failed marker beside src_fail/brief:failed", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    const finishLine = src.split("\n").find((l) => l.includes('await finish("ok"'));
+    assert.ok(finishLine.includes("src_fail:"), "finish lost the src_fail marker");
+    assert.ok(finishLine.includes("brief:failed"), "finish lost the brief:failed marker");
+    assert.ok(finishLine.includes("verdict:"), "finish lost the verdict marker");
+    assert.ok(src.includes("verdict:${verdictFailed}_failed"), "verdict marker must carry the failure count");
+    assert.ok(src.includes("verdictFailed ?"), "verdict suffix must be conditional (clean ticks carry none)");
+  });
+
+  it("same inflow cap, AI budget, and no-status-move rules", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("const MAX_NEW_PER_RUN = 2;"), "worker lost the inflow cap");
+    assert.ok(src.includes("newInserts >= MAX_NEW_PER_RUN"), "worker lost the overflow guard");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
   });
 });
 

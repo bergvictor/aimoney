@@ -193,6 +193,28 @@ export function agentMoneyEstimates(v) {
   };
 }
 
+// Verdict-writes flush with isolation fallback (audit 2026-09-20-round4 F4):
+// the per-verdict signal/note writes go out as one batch; when the batch
+// rejects, each statement re-runs individually so one bad write cannot drop
+// the tick's valid triage writes. Returns the count of writes that failed
+// individually (0 on the fast path). Exported pure-over-env.DB for tests.
+export async function flushVerdictWrites(env, verdictWrites) {
+  if (!verdictWrites.length) return 0;
+  try {
+    await env.DB.batch(verdictWrites);
+    return 0;
+  } catch {
+    let failed = 0;
+    for (const w of verdictWrites) {
+      try {
+        await w.run();
+      } catch {
+        failed++;
+      }
+    }
+    return failed;
+  }
+}
 async function runResearch(env, trigger) {
   const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0, stale: 0, src_fail: [] };
   // Reap runs a killed worker left behind: a "running" row older than the
@@ -341,9 +363,9 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
     // Verdict writes batch (F3): signal UPDATEs and notes appends accumulate
     // here and go out as ONE env.DB.batch after the loop — the collect phase
     // proved batching cuts ~9s to ~0.5s. New-row INSERTs and the slug-collision
-    // lookup stay inline since they branch. A failed batch loses this tick's
-    // verdict writes (signals stay unprocessed, retried next tick) — the same
-    // tradeoff round 2's health batching already accepted.
+    // lookup stay inline since they branch. A rejected batch falls back to
+    // per-write retry (failed signals stay unprocessed, retried next tick) —
+    // the same isolation the health batch uses; failures land as verdict:N_failed.
     const verdictWrites = [];
     for (const v of verdicts) {
       if (!v || typeof v !== "object") continue;
@@ -414,7 +436,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
         verdictWrites.push(env.DB.prepare("UPDATE signals SET processed=1 WHERE id=?").bind(sig.id));
       }
     }
-    if (verdictWrites.length) await env.DB.batch(verdictWrites);
+    const verdictFailed = await flushVerdictWrites(env, verdictWrites);
 
     // 3. One AI pass: brief one bare row — top-scored, or oldest-unreviewed-first past 48h —
     // unless the clock is nearly spent (it lands on a later run instead).
@@ -533,7 +555,7 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
     }
     // Single run-log write carrying the brief mode (a bare finish used to run
     // first and be overwritten here).
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);
