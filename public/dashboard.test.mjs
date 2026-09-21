@@ -2139,3 +2139,30 @@ describe("experiment-write schema hint (audit 2026-09-20-round3 Task 3)", () => 
     assert.ok(!admin.includes("missingMoneyColumnHint"), "opportunity admin saves must never hint the experiment-cents migration");
   });
 });
+
+describe("inflow-paused pill mirror (audit 2026-09-20-round4 Task 2)", () => {
+  it("live pill derives the paused bit from health without a new fetch", () => {
+    const live = js.slice(js.indexOf("} else if (last) {"), js.indexOf('$("#runs-body").innerHTML'));
+    assert.ok(live.includes("state.health.inflow_paused === true"), "live pill must derive the paused bit from the health snapshot");
+    assert.ok(!live.includes('api("/api/health")'), "pill mirror must reuse the fetched health, no new fetch");
+  });
+
+  it("live pill appends inflow paused to text + title after the backlog bit", () => {
+    const live = js.slice(js.indexOf("} else if (last) {"), js.indexOf('$("#runs-body").innerHTML'));
+    assert.ok(live.includes('if (inflowPaused) pill.title += " · inflow paused";'), "pill title lost the paused bit");
+    assert.ok(live.includes('if (inflowPaused) $("#agent-text").textContent += " " + String.fromCharCode(183) + " inflow paused";'), "pill text lost the paused bit");
+    assert.ok(live.indexOf('pill.title += " · " + backlogBit') < live.indexOf('pill.title += " · inflow paused"'), "paused bit must sit next to the backlog bit");
+  });
+
+  it("old backends without the key keep today's pill", () => {
+    assert.ok(js.includes("const inflowPaused = state.health && state.health.inflow_paused === true;"), "pill lost its strict-true paused guard");
+  });
+
+  it("cache persists the paused bit and paints it before the live refresh lands", () => {
+    const save = js.slice(js.indexOf("function saveLastGood"), js.indexOf("function paintLastGood"));
+    assert.ok(save.includes('inflow_paused: (typeof h.inflow_paused === "boolean"'), "snapshot lost the paused bit");
+    const paint = js.slice(js.indexOf("function paintLastGood"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(paint.includes("snap.health.inflow_paused === true"), "cache paint must derive the paused bit from the snapshot");
+    assert.ok(paint.includes('(cachedPaused ? " · inflow paused" : "")'), "cached pill lost the paused bit");
+  });
+});

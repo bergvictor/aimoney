@@ -259,14 +259,18 @@ function rememberBriefSkip(id) {
   briefSkippedIds.push(n);
   while (briefSkippedIds.length > BRIEF_SKIP_MEMORY) briefSkippedIds.shift();
 }
-async function selectBareRow(env, sql, binds) {
+async function selectBareRow(env, sql, binds, onFail) {
+  // onFail fires when either lookup throws (never on an honest empty pick),
+  // so a failing bare query reads as bare_select:failed on the run log
+  // instead of "no bare rows".
+  const fail = () => { if (onFail) onFail(); return null; };
   if (briefSkippedIds.length) {
     const clause = ` AND o.id NOT IN (${briefSkippedIds.map(() => "?").join(",")})`;
     const row = await env.DB.prepare(sql.replace(" ORDER BY ", clause + " ORDER BY "))
-      .bind(...binds, ...briefSkippedIds).first().catch(() => null);
+      .bind(...binds, ...briefSkippedIds).first().catch(fail);
     if (row) return row;
   }
-  return env.DB.prepare(sql).bind(...binds).first().catch(() => null);
+  return env.DB.prepare(sql).bind(...binds).first().catch(fail);
 }
 
 // Classify prompt (round3 Task 3): the triage pass and /debug-classify share
@@ -369,12 +373,15 @@ export async function runResearch(env, trigger) {
     // Staleness bound: unprocessed signals older than 30d become noise
     // (counted in state.stale) so the oldest-first take cannot wedge on
     // ancient pre-deploy backlog. Best-effort; the take still bounds work.
+    // A failed sweep is named on the run log (stale:failed) instead of
+    // resolving silently — triage still proceeds.
+    let staleFailed = false;
     try {
       const staleRun = await env.DB.prepare(
         "UPDATE signals SET processed = 1 WHERE processed = 0 AND created_at != '' AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')").run();
       const staleMeta = (staleRun && staleRun.meta) || {};
       state.stale = Number(staleMeta.changes || staleMeta.rows_written) || 0;
-    } catch { /* stale sweep failed; triage proceeds anyway */ }
+    } catch { staleFailed = true; /* stale sweep failed; triage proceeds anyway */ }
     await mark(state.stale ? `collected stale:${state.stale}` : "collected");
     const fresh = await env.DB.prepare(
       "SELECT * FROM signals WHERE processed = 0 ORDER BY id ASC LIMIT ?")
@@ -388,6 +395,7 @@ export async function runResearch(env, trigger) {
     // counted, never thrown — one flaky write must not abort the tick's triage
     // and brief passes. Skipped signals stay processed = 0 for a later tick.
     let prepassFailed = 0;
+    let prepassSelectFailed = false; // bounded pre-pass lookups failed: named on the run log, AI triage still runs
     if (fresh.length) {
       // Bounded pre-pass (F4): match only the ≤6 fresh URLs in SQL instead of
       // loading two full-table URL sets. Empty URLs never match (exactUrlTarget
@@ -399,10 +407,10 @@ export async function runResearch(env, trigger) {
         const placeholders = freshUrls.map(() => "?").join(",");
         oppUrls = await env.DB.prepare(
           `SELECT id, source_url FROM opportunities WHERE source_url IN (${placeholders})`)
-          .bind(...freshUrls).all().then((r) => r.results || []).catch(() => []);
+          .bind(...freshUrls).all().then((r) => r.results || []).catch(() => { prepassSelectFailed = true; return []; });
         linkedUrls = await env.DB.prepare(
           `SELECT url, opportunity_id FROM signals WHERE opportunity_id IS NOT NULL AND url IN (${placeholders})`)
-          .bind(...freshUrls).all().then((r) => r.results || []).catch(() => []);
+          .bind(...freshUrls).all().then((r) => r.results || []).catch(() => { prepassSelectFailed = true; return []; });
       }
       const rest = [];
       for (const sig of fresh) {
@@ -547,6 +555,8 @@ export async function runResearch(env, trigger) {
     let briefMode = "skipped";
     let briefFailed = false; // a brief parse/insert threw: named in the run log, retried next tick
     let briefSkipped = []; // insertBrief-false ids: named in the run log, rotated past next tick
+    let bareSelectFailed = false; // a bare-row lookup threw: named on the run log, distinct from brief:failed (AI/insert)
+    const markBareSelectFailed = () => { bareSelectFailed = true; };
     let bare = null;
     // Backlog age shared by the brief-mode flip and the extra-brief gate: one
     // oldest-unreviewed query per run (new proposals land newer, so the oldest
@@ -563,14 +573,14 @@ export async function runResearch(env, trigger) {
         }
       }
       if (briefMode === "oldest-first") {
-        bare = await selectBareRow(env, "SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL AND o.notes LIKE ? ORDER BY o.created_at ASC LIMIT 1", [String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)]);
+        bare = await selectBareRow(env, "SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL AND o.notes LIKE ? ORDER BY o.created_at ASC LIMIT 1", [String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)], markBareSelectFailed);
       } else {
         // Top-scored skips decided rows (audit 2026-09-20-round2 Task 3): a
         // killed/paused bare row must never consume the brief slot a live row
         // would have taken. The unreviewed-scoped picks stay byte-identical.
         bare = await selectBareRow(env,
       `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
-       WHERE b.id IS NULL AND o.status NOT IN ('killed','paused') ORDER BY o.score DESC LIMIT 1`, []); } }
+       WHERE b.id IS NULL AND o.status NOT IN ('killed','paused') ORDER BY o.score DESC LIMIT 1`, [], markBareSelectFailed); } }
     if (bare) {
       const sigs = await env.DB.prepare(
         "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")
@@ -611,11 +621,11 @@ export async function runResearch(env, trigger) {
           ? await selectBareRow(env,
             `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
              WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' AND o.id != ? ORDER BY o.created_at ASC LIMIT 1`,
-            [bare.id])
+            [bare.id], markBareSelectFailed)
           : await selectBareRow(env,
             `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
              WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%' ORDER BY o.created_at ASC LIMIT 1`,
-            []);
+            [], markBareSelectFailed);
         if (extraBare && state.ai_calls < MAX_AI_CALLS) {
           try {
             const sigs2 = await env.DB.prepare(
@@ -639,7 +649,7 @@ export async function runResearch(env, trigger) {
     }
     // Single run-log write carrying the brief mode (a bare finish used to run
     // first and be overwritten here).
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (state.src_partial.length ? ` src_partial:${state.src_partial.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : "") + (prepassFailed ? ` prepass:${prepassFailed}_failed` : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (state.src_partial.length ? ` src_partial:${state.src_partial.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : "") + (prepassFailed ? ` prepass:${prepassFailed}_failed` : "") + (staleFailed ? " stale:failed" : "") + (prepassSelectFailed ? " prepass_select:failed" : "") + (bareSelectFailed ? " bare_select:failed" : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);

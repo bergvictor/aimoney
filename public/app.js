@@ -995,15 +995,18 @@ function renderRuns() {
   } else if (last) {
     const noise = state.health && typeof state.health.noise_24h === "number" ? state.health.noise_24h : null;
     const backlogBit = reviewBacklogBit(state.health);
+    const inflowPaused = state.health && state.health.inflow_paused === true;
     pill.title = noise !== null ? "Latest research run: +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise" : "Latest research run";
     const probeFails = probeFailures();
     if (probeFails.length) pill.title += " · failing probes: " + probeFails.map((p) => probeLabel(p, probeDetailMap())).join(", ");
     if (backlogBit) pill.title += " · " + backlogBit;
+    if (inflowPaused) pill.title += " · inflow paused";
     const when = last.finished_at || last.started_at || "";
     $("#agent-text").textContent =
       `agent: ${last.status} · +${last.added}/${last.updated}/${last.briefs} · ${when.slice(0, 16).replace("T", " ")}`;
     if (noise !== null) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + noise + " noise";
     if (backlogBit) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + backlogBit;
+    if (inflowPaused) $("#agent-text").textContent += " " + String.fromCharCode(183) + " inflow paused";
     pill.classList.toggle("ok", last.status === "ok");
     pill.classList.toggle("bad", last.status === "error");
     const runsTab = document.querySelector("#tab-research");
@@ -1575,6 +1578,7 @@ function saveLastGood(fresh) {
       bare_without_brief: (typeof h.bare_without_brief === "number" ? h.bare_without_brief : null),
       unreviewed: (typeof h.unreviewed === "number" ? h.unreviewed : null),
       oldest_unreviewed_age_h: (typeof h.oldest_unreviewed_age_h === "number" ? h.oldest_unreviewed_age_h : null),
+      inflow_paused: (typeof h.inflow_paused === "boolean" ? h.inflow_paused : null),
       savedAt: now,
     };
   }
@@ -1607,14 +1611,17 @@ function paintLastGood() {
     const when = String(run.finished_at || run.started_at || "").slice(0, 16).replace("T", " ");
     const noise = snap.health && typeof snap.health.noise_24h === "number" ? snap.health.noise_24h : null;
     const cachedBacklog = reviewBacklogBit(snap.health || {});
+    const cachedPaused = snap.health && snap.health.inflow_paused === true;
     $("#agent-text").textContent =
       `agent: ${run.status} · +${run.added}/${run.updated}/${run.briefs} · ${when}` +
       (noise !== null ? ` · ${noise} noise` : "") +
       (cachedBacklog ? ` · ${cachedBacklog}` : "") +
+      (cachedPaused ? " · inflow paused" : "") +
       (isSnapshotStale(run.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "");
     const pill = $("#agent-pill");
     if (pill) pill.title = (noise !== null ? `Latest research run: +${run.added}/${run.updated} · ${noise} noise` : "Latest research run") +
       (cachedBacklog ? ` · ${cachedBacklog}` : "") +
+      (cachedPaused ? " · inflow paused" : "") +
       (isSnapshotStale(run.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "");
   }
   // Review chip: count + age + tooltip, stale-marked past one tick.

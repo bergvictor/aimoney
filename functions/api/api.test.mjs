@@ -991,6 +991,77 @@ describe("health (G4)", () => {
   });
 });
 
+describe("health inflow-paused bit (audit 2026-09-20-round4 Task 2)", () => {
+  const unrevRows = (n) => Array.from({ length: n }, (_, i) => ({
+    id: i + 1, slug: `u${i + 1}`, title: `U${i + 1}`, status: "researching",
+    value: 5, effort: 5, confidence: 5, fit: 5, score: 2083,
+    notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z",
+  }));
+
+  it("11 unreviewed reports inflow_paused true (paused triage never reads clean)", async () => {
+    const db = makeDB({ opportunities: unrevRows(11) });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.unreviewed, 11);
+    assert.equal(r.body.inflow_paused, true);
+  });
+
+  it("10 or fewer unreviewed reports inflow_paused false", async () => {
+    const atCap = await callApi(["health"], "http://localhost/api/health", {}, makeDB({ opportunities: unrevRows(10) }));
+    assert.equal(atCap.body.unreviewed, 10);
+    assert.equal(atCap.body.inflow_paused, false);
+    const below = await callApi(["health"], "http://localhost/api/health", {}, makeDB({ opportunities: oppSeed() }));
+    assert.equal(below.body.unreviewed, 2);
+    assert.equal(below.body.inflow_paused, false);
+  });
+
+  it("total outage reports inflow_paused null like its neighbors", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    const downDB = {
+      ...db,
+      batch: async () => { throw new Error("D1 down"); },
+      prepare: (sql) => {
+        const stmt = {
+          _sql: sql,
+          _args: [],
+          bind(...a) { stmt._args = a; return stmt; },
+          all: async () => { throw new Error("D1 down"); },
+          first: async () => { throw new Error("D1 down"); },
+          run: async () => { throw new Error("D1 down"); },
+        };
+        return stmt;
+      },
+    };
+    const r = await callApi(["health"], "http://localhost/api/health", {}, downDB);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, false);
+    assert.equal(r.body.unreviewed, null);
+    assert.equal(r.body.inflow_paused, null);
+  });
+
+  it("failed unreviewed probe reports inflow_paused null, never false", async () => {
+    const db = makeDB({ opportunities: unrevRows(11) });
+    const realPrepare = db.prepare.bind(db);
+    const oneBad = {
+      ...db,
+      batch: async () => { throw new Error("batch bad"); },
+      prepare: (sql) => {
+        const stmt = realPrepare(sql);
+        if (sql.includes("MIN(created_at)")) {
+          stmt.all = async () => { throw new Error("no such column: notes"); };
+          stmt.first = async () => { throw new Error("no such column: notes"); };
+        }
+        return stmt;
+      },
+    };
+    const r = await callApi(["health"], "http://localhost/api/health", {}, oneBad);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.unreviewed, null);
+    assert.equal(r.body.inflow_paused, null);
+  });
+});
+
 describe("closed-experiment money in ledger (audit 2026-09-20-round3 Task 1)", () => {
   const oppMoney = () => ([
     { id: 1, slug: "a", title: "A", status: "testing", value: 7, effort: 3, confidence: 5, fit: 8, score: 7000, notes: "seed notes", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
@@ -1234,7 +1305,7 @@ describe("health batch + rev cache (audit 2026-09-20-round2 Task 2)", () => {
     const db = makeDB({ opportunities: oppSeed() });
     const r = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(r.status, 200);
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time"]);
   });
 
   it("reports merged figures identical to the old per-query math", async () => {
@@ -1347,7 +1418,8 @@ describe("health outage honesty (audit 2026-09-20-round2 Task 1)", () => {
     assert.equal(r.body.last_vetted, null, "health last_vetted must be null during a DB outage");
     assert.equal(r.body.last_verdict, null, "health last_verdict must be null during a DB outage");
     assert.equal(r.body.experiments_by_status, null, "health experiments_by_status must be null during a DB outage, not {}");
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time"]);
+    assert.equal(r.body.inflow_paused, null, "health inflow_paused must be null during a DB outage, not false");
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time"]);
   });
 
   it("unchanged verify.sh ok:true grep fails the outage payload, passes the healthy one", async () => {
@@ -1482,7 +1554,7 @@ describe("health probe isolation (audit 2026-09-20-round1 Task 1)", () => {
   it("names the failing probe, keeps existing keys byte-identical for verify.sh", async () => {
     const r = await callApi(["health"], "http://localhost/api/health", {}, oneBadProbeDB());
     assert.deepEqual(r.body.health_probe_failures, ["revenue_lifetime"]);
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time", "health_probe_failures", "health_probe_detail"]);
     assert.deepEqual(r.body.health_probe_detail, { revenue_lifetime: "spent_cents" });
     assert.ok(JSON.stringify(r.body).includes('"ok":true'), "partial payload must keep the verify.sh marker");
   });
@@ -1524,7 +1596,7 @@ describe("health probe isolation (audit 2026-09-20-round1 Task 1)", () => {
     assert.equal(r.body.db, "up");
     assert.ok(!("health_probe_failures" in r.body), "a batch that rejects spuriously must not attach an empty failures key");
     assert.ok(!("health_probe_detail" in r.body), "a batch that rejects spuriously must not attach a detail key either");
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time"]);
     assert.equal(r.body.opportunities, 3);
     assert.equal(r.body.unreviewed, 2);
     assert.equal(r.body.decisions_last_7d, 1);
@@ -2012,7 +2084,7 @@ describe("decisions COUNT split from revenue SUM (audit 2026-09-20-round4 Task 1
     assert.equal(r.body.spent_total, 1200);
     assert.deepEqual(r.body.health_probe_failures, ["revenue_week"]);
     assert.deepEqual(r.body.health_probe_detail, { revenue_week: "revenue_cents" });
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time", "health_probe_failures", "health_probe_detail"]);
   });
 });
 
@@ -2406,9 +2478,10 @@ describe("experiments_by_status null on probe failure (audit 2026-09-20-round2 T
     }
     assert.deepEqual(partial.body.last_vetted, healthy.body.last_vetted);
     assert.deepEqual(partial.body.last_verdict, healthy.body.last_verdict);
+    assert.deepEqual(partial.body.inflow_paused, healthy.body.inflow_paused, "inflow_paused changed while only the status probe failed");
     assert.deepEqual(healthy.body.experiments_by_status, { won: 1, planned: 1 });
     assert.equal(partial.body.experiments_by_status, null);
-    assert.deepEqual(Object.keys(partial.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
+    assert.deepEqual(Object.keys(partial.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time", "health_probe_failures", "health_probe_detail"]);
   });
 });
 
@@ -2512,7 +2585,7 @@ describe("last-verdict probe row bound (audit 2026-09-20-round3 Task 3)", () => 
     const tailRows = await db.prepare(probeSql[0]).all();
     assert.equal((tailRows.results || []).length, 2000, "probe must transfer exactly the 2000-row window");
     // Every other health key byte-identical (values + order for verify.sh).
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time"]);
     assert.equal(r.body.ok, true);
     assert.equal(r.body.db, "up");
     assert.equal(r.body.opportunities, 2001);
