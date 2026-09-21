@@ -217,11 +217,8 @@ const reviewDecisionLine = (o) => {
 // vet-vs-kill call needs no drawer round-trip. Bare rows read "No brief yet"
 // (unproven, not empty); the excerpt is null-safe from the list API.
 const reviewBriefLine = (o) => {
-  // Scope the excerpt temp to the render block below.
-  {
-    const s = String(o.brief_summary || "").replace(/\s+/g, " ").trim().slice(0, 200);
-    return `<div class="review-brief muted">${esc(s || "No brief yet")}</div>`;
-};
+  const s = String(o.brief_summary || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  return `<div class="review-brief muted">${esc(s || "No brief yet")}</div>`;
 };
 
 function renderReview() {
