@@ -403,16 +403,23 @@ function cleanUnreviewed(notes) {
   return String(notes || "").replace(/UNREVIEWED,?\s*/g, "").replace(/UNREVIEWED/g, "").trim();
 }
 
-async function vetOpportunity(id) {
-  // Detail-before-write (F2): list rows no longer ship notes, so the full
-  // body is fetched first and stashed on the list row for the write below.
-  // Transient write-path cache — the post-write refresh replaces the row.
-  if (!state.token) return openAdminModal("Enter the admin token first.");
+// Detail-before-write (F2): list rows no longer ship notes, so Vet, Starter,
+// and Kill share one token-gated detail fetch that stashes full notes on the
+// list row for the write below. Returns the row, or null (after the modal or
+// a "<Action> failed" toast) when the caller must return early. Transient
+// write-path cache — the post-write refresh replaces the row.
+async function fetchDetailForWrite(id, actionLabel) {
+  if (!state.token) { openAdminModal("Enter the admin token first."); return null; }
   try {
     const d = await api(`/api/opportunities/${id}`);
     const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
     if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
-  } catch (e) { toast(`Vet failed: ${e.message}`); return; }
+    return o || null;
+  } catch (e) { toast(`${actionLabel} failed: ${e.message}`); return null; }
+}
+
+async function vetOpportunity(id) {
+  if (!await fetchDetailForWrite(id, "Vet")) return;
   return vetOpportunityInner(id);
 }
 
@@ -441,14 +448,7 @@ async function vetOpportunityInner(id) {
 // behind one tap. Token-gated like vetOpportunity; the toast carries a Start
 // shortcut for the created experiment. Human-pressed, one decision.
 async function vetAndLogStarter(id) {
-  // Detail-before-write (F2): see vetOpportunity — the starter's vetted tag
-  // appends to full detail notes, not the bit-only list row.
-  if (!state.token) return openAdminModal("Enter the admin token first.");
-  try {
-    const d = await api(`/api/opportunities/${id}`);
-    const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
-    if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
-  } catch (e) { toast(`Starter failed: ${e.message}`); return; }
+  if (!await fetchDetailForWrite(id, "Starter")) return;
   return vetAndLogStarterInner(id);
 }
 
@@ -485,14 +485,7 @@ async function vetAndLogStarterInner(id) {
 }
 
 async function killOpportunity(id, anchorEl) {
-  // Detail-before-write (F2): see vetOpportunity — the killed tag appends to
-  // full detail notes. Fetched before the post-mortem row opens.
-  if (!state.token) return openAdminModal("Enter the admin token first.");
-  try {
-    const d = await api(`/api/opportunities/${id}`);
-    const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
-    if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
-  } catch (e) { toast(`Kill failed: ${e.message}`); return; }
+  if (!await fetchDetailForWrite(id, "Kill")) return;
   return killOpportunityInner(id, anchorEl);
 }
 

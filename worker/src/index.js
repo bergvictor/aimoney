@@ -193,6 +193,27 @@ export function agentMoneyEstimates(v) {
   };
 }
 
+// Brief prompt + parse (F5): the main and extra brief passes share one prompt
+// builder and one reply parser so brief quality cannot diverge by path. The
+// built text matches the pre-share prompts exactly (LF joins); only the
+// call-site gates (retries/timeoutMs, AI budget, clock, 48h) stay inline.
+// Pure for tests.
+export function buildBriefPrompt(title, oneLiner, sigs) {
+  return [
+    { role: "system", content: "You write terse, practical research briefs. Reply with ONLY a JSON object, no prose." },
+    { role: "user", content:
+      `Write a research brief for this AI money-making opportunity as ONE JSON object with EXACTLY these keys: summary, what_works, numbers, risks, first_steps. Example shape:\n` +
+      `{"summary":"2-3 sentences","what_works":"tactics as bullet lines","numbers":[{"claim":"...","source":"..."}],"risks":"...","first_steps":"numbered lines for week 1"}.\n` +
+      `If you lack verified facts for a section, write that explicitly instead of inventing specifics.\n` +
+      `Opportunity: ${title} — ${oneLiner}\nSignals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") || "(none — use general knowledge, mark confidence accordingly)"}` },
+  ];
+}
+
+export function parseBriefJson(text) {
+  const m = String(text).match(/\{[\s\S]*\}/);
+  return JSON.parse(repairJson(m ? m[0] : "{}"));
+}
+
 // Verdict-writes flush with isolation fallback (audit 2026-09-20-round4 F4):
 // the per-verdict signal/note writes go out as one batch; when the batch
 // rejects, each statement re-runs individually so one bad write cannot drop
@@ -470,19 +491,10 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
       const text = await aiComplete(env, state, {
         model: AI_BRIEF, fallback: AI_CLASSIFY, maxTokens: BRIEF_TOKENS,
         timeoutMs: 90000, retries: 1,
-        messages: [
-        { role: "system", content: "You write terse, practical research briefs. Reply with ONLY a JSON object, no prose." },
-        { role: "user", content:
-          `Write a research brief for this AI money-making opportunity as ONE JSON object with EXACTLY these keys: summary, what_works, numbers, risks, first_steps. Example shape:
-{"summary":"2-3 sentences","what_works":"tactics as bullet lines","numbers":[{"claim":"...","source":"..."}],"risks":"...","first_steps":"numbered lines for week 1"}.
-If you lack verified facts for a section, write that explicitly instead of inventing specifics.
-Opportunity: ${bare.title} — ${bare.one_liner}
-Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") || "(none — use general knowledge, mark confidence accordingly)"}` },
-        ],
+        messages: buildBriefPrompt(bare.title, bare.one_liner, sigs),
       });
       try {
-        const m = String(text).match(/\{[\s\S]*\}/);
-        const b = JSON.parse(repairJson(m ? m[0] : "{}"));
+        const b = parseBriefJson(text);
         // Never store an empty brief (a parsed-but-keyless object once wrote
         // five blank fields). Retry naturally on the next tick instead.
         if (String(b.summary || "").trim() && String(b.first_steps || "").trim()) {
@@ -527,17 +539,9 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
             const text2 = await aiComplete(env, state, {
               model: AI_BRIEF, fallback: AI_CLASSIFY, maxTokens: BRIEF_TOKENS,
               timeoutMs: 90000, retries: 0,
-              messages: [
-                { role: "system", content: "You write terse, practical research briefs. Reply with ONLY a JSON object, no prose." },
-                { role: "user", content:
-                  `Write a research brief for this AI money-making opportunity as ONE JSON object with EXACTLY these keys: summary, what_works, numbers, risks, first_steps. Example shape:\n` +
-                  `{"summary":"2-3 sentences","what_works":"tactics as bullet lines","numbers":[{"claim":"...","source":"..."}],"risks":"...","first_steps":"numbered lines for week 1"}.\n` +
-                  `If you lack verified facts for a section, write that explicitly instead of inventing specifics.\n` +
-                  `Opportunity: ${extraBare.title} — ${extraBare.one_liner}\nSignals:\n${sigs2.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") || "(none — use general knowledge, mark confidence accordingly)"}` },
-              ],
+              messages: buildBriefPrompt(extraBare.title, extraBare.one_liner, sigs2),
             });
-            const m2 = String(text2).match(/\{[\s\S]*\}/);
-            const b2 = JSON.parse(repairJson(m2 ? m2[0] : "{}"));
+            const b2 = parseBriefJson(text2);
             if (String(b2.summary || "").trim() && String(b2.first_steps || "").trim()) {
               await env.DB.prepare(
               `INSERT INTO briefs (opportunity_id, version, summary, what_works,
@@ -559,13 +563,24 @@ Signals:\n${sigs.map((s) => `- ${s.title} (${s.url}) ${s.snippet}`).join("\n") |
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);
+    // Tail-visible marker (audit F3): waitUntil discards the return value and
+    // the finish above is best-effort, so a D1-dead cron tick logs one line
+    // instead of resolving into ok-shaped silence. The rare console.* in this
+    // file is deliberate: worker tail is the only surface that survives D1 death.
+    if (trigger === "cron") console.error("cron-failed", String(e && e.message || e).slice(0, 200));
     return { status: "error", error: String(e && e.message || e), ...state };
   }
 }
 
 export default {
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(runResearch(env, "cron").catch(() => null));
+    // A pre-run D1 death (the run-open threw before the try block, so no run
+    // row exists) rejects: log the same tail-visible marker instead of
+    // swallowing it, so an overnight outage never reads as a quiet night.
+    // The cron response contract is unchanged (there is none — waitUntil).
+    ctx.waitUntil(runResearch(env, "cron").catch((e) => {
+      console.error("cron-failed", e && e.message || e);
+    }));
   },
   async fetch(request, env, ctx) {
     const url = new URL(request.url);

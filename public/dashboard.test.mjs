@@ -436,7 +436,7 @@ describe("token modal + inline post-mortem (audit 2026-09-20-round3 Task 2)", ()
   it("Vet/Kill/Start/Lose/Win/Starter open the admin modal when the token is missing", () => {
     assert.ok(js.includes("function openAdminModal"), "app.js lost openAdminModal");
     assert.ok(js.includes('openAdminModal("Enter the admin token first.")'), "gated taps must open the admin modal with the toast text as subnote");
-    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 9, "Vet/Kill/Starter wrappers + Vet/Kill/Start/Lose/Win/Starter handlers must all open the modal");
+    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 7, "shared fetchDetailForWrite gate + Vet/Kill/Start/Lose/Win/Starter handlers must all open the modal");
     assert.ok(js.includes("[data-admin-subnote]"), "modal must pin the subnote");
     assert.ok(js.includes('$("#btn-admin").click()'), "openAdminModal must reuse the Admin showModal block");
   });
@@ -748,16 +748,22 @@ describe("needs_review bit + detail-before-write (audit 2026-09-20-round3 Task 2
     assert.ok(!strip.includes("api(`/api/opportunities/${top.id}`)"), "strip must not fetch the detail endpoint");
   });
 
-  it("Vet, Vet-&-starter, and Kill fetch detail first, then append byte-identical tags", () => {
-    for (const [name, start, end] of [
-      ["vet", "async function vetOpportunity", "async function vetOpportunityInner"],
-      ["starter", "async function vetAndLogStarter", "async function vetAndLogStarterInner"],
-      ["kill", "async function killOpportunity", "async function killOpportunityInner"],
+  it("Vet, Vet-&-starter, and Kill share one detail-before-write helper, then append byte-identical tags", () => {
+    const helper = js.slice(js.indexOf("async function fetchDetailForWrite"), js.indexOf("async function vetOpportunity"));
+    assert.ok(helper.includes('openAdminModal("Enter the admin token first.")'), "helper must open the admin modal without a token");
+    assert.ok(helper.includes("api(`/api/opportunities/${id}`)"), "helper must GET the detail endpoint");
+    assert.ok(helper.includes("o.notes = d.opportunity.notes"), "helper must stash full detail notes for the write");
+    assert.ok(helper.includes("toast(`${actionLabel} failed:"), "helper must toast the action label on failure");
+    assert.ok(helper.includes("return null"), "helper must return null when the caller must return early");
+    for (const [name, start, end, label] of [
+      ["vet", "async function vetOpportunity", "async function vetOpportunityInner", "Vet"],
+      ["starter", "async function vetAndLogStarter", "async function vetAndLogStarterInner", "Starter"],
+      ["kill", "async function killOpportunity", "async function killOpportunityInner", "Kill"],
     ]) {
       const fn = js.slice(js.indexOf(start), js.indexOf(end));
-      assert.ok(fn.includes("api(`/api/opportunities/${id}`)"), `${name} must GET the detail endpoint first`);
-      assert.ok(fn.includes("o.notes = d.opportunity.notes"), `${name} must stash full detail notes for the write`);
-      assert.ok(fn.indexOf("api(`/api/opportunities/${id}`)") < fn.indexOf("Inner(id"), `${name} must fetch before delegating to the write`);
+      assert.ok(fn.includes(`fetchDetailForWrite(id, "${label}")`), `${name} must reuse the shared detail-before-write helper with its label`);
+      assert.ok(!fn.includes("api(`/api/opportunities/${id}`)"), `${name} must not keep an inline detail fetch beside the helper`);
+      assert.ok(fn.indexOf("fetchDetailForWrite") < fn.indexOf("Inner(id"), `${name} must fetch before delegating to the write`);
     }
     assert.ok(js.includes("[${day} vetted] Human vetted; cap lifted."), "vetted tag changed");
     assert.ok(js.includes("[${day} killed] ${pm.trim()}"), "killed tag changed");
@@ -826,7 +832,7 @@ describe("five-second read (audit 2026-09-20-round1 Task 3)", () => {
 describe("dead toast gates (audit 2026-09-20-round1 Task 4)", () => {
   it("unreachable toast gates behind modal returns are gone; live gates stay", () => {
     assert.ok(!js.includes("supersedes the toast gate"), "app.js still ships dead toast gates");
-    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 9, "modal gates must stay at 9");
+    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 7, "modal gates must stay at 7 (one shared write-path gate + six handlers)");
     assert.equal(js.split('return toast("Enter the admin token first.")').length - 1, 3, "only the 3 live toast gates must remain");
   });
 });

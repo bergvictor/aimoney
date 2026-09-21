@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker, { agentMoneyEstimates, exactUrlTarget, flushVerdictWrites } from "./index.js";
+import worker, { agentMoneyEstimates, buildBriefPrompt, exactUrlTarget, flushVerdictWrites, parseBriefJson } from "./index.js";
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {
@@ -605,5 +605,117 @@ describe("extra brief ungated from first pass (audit 2026-09-20-round3 Task 3)",
     assert.equal(src.split("SELECT created_at FROM opportunities WHERE notes LIKE").length - 1, 1, "oldest-unreviewed must be queried once per run");
     assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
     assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+  });
+});
+
+describe("D1-dead cron tick surfaces in worker logs (audit 2026-09-20-round1 F3)", () => {
+  const SRC = join(dirname(fileURLToPath(import.meta.url)), "index.js");
+  const rejectingDB = () => ({
+    prepare: () => ({
+      bind: () => ({
+        first: async () => { throw new Error("D1 down"); },
+        all: async () => { throw new Error("D1 down"); },
+        run: async () => { throw new Error("D1 down"); },
+      }),
+    }),
+    batch: async () => { throw new Error("D1 down"); },
+  });
+  const captureError = async (fn) => {
+    const logged = [];
+    const orig = console.error;
+    console.error = (...a) => { logged.push(a.map(String).join(" ")); };
+    try {
+      await fn();
+    } finally {
+      console.error = orig;
+    }
+    return logged;
+  };
+  const runTick = async (env) => {
+    let waited = null;
+    await worker.scheduled({}, env, { waitUntil(p) { waited = p; } });
+    await waited;
+  };
+
+  it("scheduled no longer swallows cron failures; the tail marker exists", () => {
+    const src = readFileSync(SRC, "utf8");
+    assert.ok(!src.includes('runResearch(env, "cron").catch(() => null)'), "scheduled still swallows cron failures into silence");
+    assert.ok(src.includes("cron-failed"), "worker lost the tail-visible cron-failed marker");
+  });
+
+  it("pre-run D1 death (run-open throws) logs cron-failed instead of silence", async () => {
+    const logged = await captureError(() => runTick({ DB: rejectingDB(), AI: null }));
+    assert.ok(logged.some((l) => l.includes("cron-failed")), `tick stayed silent; logged: ${JSON.stringify(logged)}`);
+  });
+
+  it("mid-run D1 death (fresh take throws) logs cron-failed after the best-effort finish", async () => {
+    // Run-open answers so the pass starts; everything after it rejects.
+    // Collect is stubbed offline so no source fetch leaves the test.
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error("offline"); };
+    const db = {
+      prepare: (sql) => ({
+        bind: () => ({
+          first: async () => (String(sql).includes("INSERT INTO agent_runs") ? { id: 7 } : null),
+          all: async () => { throw new Error("D1 down"); },
+          run: async () => { throw new Error("D1 down"); },
+        }),
+      }),
+      batch: async () => { throw new Error("D1 down"); },
+    };
+    let logged;
+    try {
+      logged = await captureError(() => runTick({ DB: db, AI: null }));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    assert.ok(logged.some((l) => l.includes("cron-failed")), `mid-run death stayed silent; logged: ${JSON.stringify(logged)}`);
+  });
+});
+
+describe("shared brief prompt+parse helpers (audit 2026-09-20-round1 F5)", () => {
+  it("both brief passes build prompts and parse replies through the shared helpers", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("export function buildBriefPrompt(title, oneLiner, sigs)"), "worker lost the shared brief-prompt builder");
+    assert.ok(src.includes("export function parseBriefJson(text)"), "worker lost the shared brief parser");
+    assert.equal(src.split("buildBriefPrompt(").length - 1, 3, "definition + main + extra call sites must share buildBriefPrompt");
+    assert.equal(src.split("parseBriefJson(").length - 1, 3, "definition + main + extra call sites must share parseBriefJson");
+    assert.ok(src.includes("buildBriefPrompt(bare.title, bare.one_liner, sigs)"), "main brief must build its prompt through the helper");
+    assert.ok(src.includes("buildBriefPrompt(extraBare.title, extraBare.one_liner, sigs2)"), "extra brief must build its prompt through the helper");
+    assert.ok(src.includes("parseBriefJson(text)"), "main brief must parse through the helper");
+    assert.ok(src.includes("parseBriefJson(text2)"), "extra brief must parse through the helper");
+    assert.equal(src.split("You write terse, practical research briefs").length - 1, 1, "prompt text must live in exactly one place");
+  });
+
+  it("gates and budget stay inline at the call sites, untouched", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("timeoutMs: 90000, retries: 1"), "main brief lost its retries/timeout gate");
+    assert.ok(src.includes("retries: 0"), "extra brief must use retries:0 to stay in budget");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3 (classify + brief + extra brief)");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(src.includes("oldest-first") && src.includes("top-scored"), "brief mode gates changed");
+    assert.ok(src.includes("const extraBare = bare"), "extra query lost its null-bare branch");
+    assert.equal(src.split("briefFailed = true").length - 1, 2, "both brief catches must record the failure");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+  });
+
+  it("buildBriefPrompt renders the byte-identical prompt for both passes", () => {
+    const [sys, user] = buildBriefPrompt("My title", "one liner", [{ title: "T", url: "U", snippet: "S" }]);
+    assert.equal(sys.role, "system");
+    assert.equal(sys.content, "You write terse, practical research briefs. Reply with ONLY a JSON object, no prose.");
+    assert.equal(user.role, "user");
+    assert.equal(user.content,
+      "Write a research brief for this AI money-making opportunity as ONE JSON object with EXACTLY these keys: summary, what_works, numbers, risks, first_steps. Example shape:\n" +
+      '{"summary":"2-3 sentences","what_works":"tactics as bullet lines","numbers":[{"claim":"...","source":"..."}],"risks":"...","first_steps":"numbered lines for week 1"}.\n' +
+      "If you lack verified facts for a section, write that explicitly instead of inventing specifics.\n" +
+      "Opportunity: My title — one liner\nSignals:\n- T (U) S");
+    assert.ok(buildBriefPrompt("T", "O", [])[1].content.endsWith("Signals:\n(none — use general knowledge, mark confidence accordingly)"), "empty signals must render the no-evidence fallback");
+  });
+
+  it("parseBriefJson extracts the object span and repairs escaped underscores", () => {
+    assert.deepEqual(parseBriefJson('lead {"summary":"s","first_steps":"f"} trail'), { summary: "s", first_steps: "f" });
+    assert.deepEqual(parseBriefJson('{"opportunity\\_id":3}'), { opportunity_id: 3 });
+    assert.deepEqual(parseBriefJson("no json here"), {});
+    assert.throws(() => parseBriefJson("{not json}"), "a matched-but-invalid span must throw so the caller records brief:failed");
   });
 });
