@@ -1876,3 +1876,382 @@ describe("silent worker failures carry markers (audit 2026-09-20-round4 Task 3)"
     }
   });
 });
+
+describe("inflow-gate count failures are named (audit 2026-09-20-round5 Task 2)", () => {
+  // Drives the real runResearch on the cron trigger against a stubbed D1:
+  // two unprocessed signals, a classify reply carrying two "new" verdicts,
+  // one bare row for the brief pass, a fresh backlog (top-scored mode, no
+  // extra pass). failGate throws exactly one of the two inflow-gate COUNTs.
+  // Each must finish ok with its marker on the run log and the fallback cap
+  // byte-identical to today (marker-only, no behavior change).
+  const verdictLine = (n, title) => JSON.stringify({
+    n, action: "new", opportunity_id: null, title,
+    one_liner: "repeatable buyer-paid test service", category: "services",
+    value: 6, effort: 3, confidence: 4, fit: 5,
+    est_monthly_low: 100, est_monthly_high: 500,
+    capital_needed: "$0", time_to_first_dollar: "1-2 weeks",
+  });
+  const CLASSIFY_REPLY = verdictLine(0, "Testable Widget Service") + "\n" + verdictLine(1, "Auditable Prompt Pack") + "\n";
+  const BRIEF_JSON = JSON.stringify({
+    summary: "Terse summary of the opportunity.", what_works: "Do X.",
+    numbers: [], risks: "Low.", first_steps: "1. Ship the smallest test.",
+  });
+
+  function stubEnv({ bare, unreviewed, failGate }) {
+    const now = new Date().toISOString();
+    const signals = [
+      { id: 101, source: "hn", title: "Signal A", url: "https://example.com/a", snippet: "s", processed: 0, opportunity_id: null },
+      { id: 102, source: "hn", title: "Signal B", url: "https://example.com/b", snippet: "s", processed: 0, opportunity_id: null },
+    ];
+    const bareRow = { id: 7, title: "Bare row", one_liner: "needs evidence", score: 9000, notes: "UNREVIEWED", created_at: now };
+    const inserted = [];
+    const briefedIds = [];
+    const calls = { classify: 0, brief: 0 };
+    let nextId = 1000;
+    let runError = "";
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("SELECT o.* FROM opportunities o LEFT JOIN briefs")) return bareRow;
+            if (sql.includes("SELECT created_at FROM opportunities")) return { created_at: now };
+            if (sql.includes("SELECT COUNT(*)") && sql.includes("LEFT JOIN briefs")) {
+              if (failGate === "bare") throw new Error("D1 bare gate count down");
+              return { n: bare };
+            }
+            if (sql.includes("FROM opportunities WHERE notes LIKE")) {
+              if (failGate === "unreviewed") throw new Error("D1 unreviewed gate count down");
+              return { n: unreviewed };
+            }
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) {
+              const limit = Number(stmt.params[0]) || signals.length;
+              return { results: signals.filter((s) => s.processed === 0).slice(0, limit) };
+            }
+            if (sql.includes("source_url IN") || sql.includes("opportunity_id IS NOT NULL AND url IN")) {
+              return { results: [] };
+            }
+            if (sql.includes("SELECT title, url, snippet FROM signals")) {
+              briefedIds.push(stmt.params[0]);
+              return { results: [] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("INSERT INTO opportunities")) {
+              inserted.push({ sql, params: stmt.params });
+              return { meta: { last_row_id: nextId++ } };
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1, opportunity_id")) {
+              const [oppId, sigId] = stmt.params;
+              const s = signals.find((x) => x.id === sigId);
+              if (s) { s.processed = 1; s.opportunity_id = oppId; }
+              return {};
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1 WHERE id")) {
+              const s = signals.find((x) => x.id === stmt.params[0]);
+              if (s) s.processed = 1;
+              return {};
+            }
+            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) {
+              return { meta: { changes: 0 } };
+            }
+            if (sql.includes("UPDATE agent_runs SET finished_at")) {
+              runError = String(stmt.params[6] || "");
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = {
+      run: async (_model, opts) => {
+        const text = JSON.stringify((opts && opts.messages) || []);
+        if (text.includes("FRESH SIGNALS")) { calls.classify++; return { response: CLASSIFY_REPLY }; }
+        calls.brief++;
+        return { response: BRIEF_JSON };
+      },
+    };
+    return { env: { DB, AI }, signals, inserted, briefedIds, calls, runError: () => runError };
+  }
+
+  async function runTick(opts) {
+    _resetBriefSkippedForTests();
+    const t = stubEnv(opts);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    try {
+      const result = await runResearch(t.env, "cron");
+      return { result, signals: t.signals, inserted: t.inserted, briefedIds: t.briefedIds, calls: t.calls, runError: t.runError() };
+    } finally {
+      globalThis.fetch = realFetch;
+      _resetBriefSkippedForTests();
+    }
+  }
+
+  it("a failed bare count finishes ok with bare_count:failed and the default cap kept", async () => {
+    const t = await runTick({ bare: 11, unreviewed: 0, failGate: "bare" });
+    assert.equal(t.result.status, "ok", `bare throw must not fail the tick: ${t.result.error || "(no error)"}`);
+    assert.ok(t.runError.includes("bare_count:failed"), `run log must name the failed bare count: ${t.runError}`);
+    assert.ok(!t.runError.includes("unreviewed_count:failed"), `run log must not name the healthy gate: ${t.runError}`);
+    assert.equal(t.calls.classify, 1, "bare-failed tick must still classify");
+    assert.equal(t.inserted.length, 2, "bare count failure must keep the default cap of 2, not the bare-gated 1");
+    assert.deepEqual(t.signals.map((s) => s.processed), [1, 1]);
+    assert.deepEqual(t.briefedIds, [7], "brief pass must still run when the bare count throws");
+  });
+
+  it("a failed unreviewed count at live 11 finishes ok with unreviewed_count:failed and no pause", async () => {
+    const t = await runTick({ bare: 0, unreviewed: 11, failGate: "unreviewed" });
+    assert.equal(t.result.status, "ok", `unreviewed throw must not fail the tick: ${t.result.error || "(no error)"}`);
+    assert.ok(t.runError.includes("unreviewed_count:failed"), `run log must name the failed unreviewed count: ${t.runError}`);
+    assert.ok(!t.runError.includes("bare_count:failed"), `run log must not name the healthy gate: ${t.runError}`);
+    assert.ok(!t.runError.includes("inflow:paused"), `an unknown queue must not read as paused: ${t.runError}`);
+    assert.equal(t.calls.classify, 1, "unreviewed-failed tick must still classify (the pause never engages)");
+    assert.equal(t.inserted.length, 2, "unreviewed count failure must keep the bare-gated cap of 2, not the paused 0");
+    assert.deepEqual(t.signals.map((s) => s.processed), [1, 1]);
+    assert.deepEqual(t.briefedIds, [7], "brief pass must still run when the unreviewed count throws");
+  });
+
+  it("a healthy tick carries neither gate marker (quiet shape byte-identical)", async () => {
+    const t = await runTick({ bare: 0, unreviewed: 0, failGate: null });
+    assert.equal(t.result.status, "ok", `healthy tick failed: ${t.result.error || "(no error)"}`);
+    for (const m of ["bare_count:failed", "unreviewed_count:failed"]) {
+      assert.ok(!t.runError.includes(m), `healthy tick must carry no ${m}: ${t.runError}`);
+    }
+    assert.ok(t.runError.includes("brief:top-scored"), `healthy tick must keep its brief mode: ${t.runError}`);
+  });
+
+  it("finish line appends the two conditional gate markers after the existing ones", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    const finishLine = src.split("\n").find((l) => l.includes('await finish("ok"'));
+    for (const m of ["bare_count:failed", "unreviewed_count:failed"]) {
+      assert.ok(finishLine.includes(m), `finish lost the ${m} marker`);
+    }
+    for (const g of ["bareCountFailed ?", "unreviewedCountFailed ?"]) {
+      assert.ok(finishLine.includes(g), `finish lost the conditional guard ${g} (clean ticks must carry none)`);
+    }
+    const idx = (s) => finishLine.indexOf(s);
+    const order = ["bare_select:failed", "bare_count:failed", "unreviewed_count:failed"];
+    for (let i = 1; i < order.length; i++) {
+      assert.ok(idx(order[i - 1]) !== -1 && idx(order[i - 1]) < idx(order[i]),
+        `finish markers out of order: ${order[i - 1]} must precede ${order[i]}`);
+    }
+  });
+
+  it("README names the bare-count and unreviewed-count markers", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    for (const m of ["bare_count:failed", "unreviewed_count:failed"]) {
+      assert.ok(readme.includes(m), `README lost the ${m} marker`);
+    }
+  });
+});
+
+describe("silent worker failures are named (audit 2026-09-20-round5 Task 3)", () => {
+  // Drives the real runResearch on the cron trigger against a stubbed D1:
+  // two unprocessed signals, a classify reply carrying two "new" verdicts,
+  // one bare row for the brief pass, a fresh backlog (top-scored mode, no
+  // extra pass). failOn throws exactly one of the three previously-silent
+  // shapes: the pre-pass notes append, the slug-collision select, or the
+  // brief-age select. Each must finish ok with its marker on the run log.
+  const verdictLine = (n, title) => JSON.stringify({
+    n, action: "new", opportunity_id: null, title,
+    one_liner: "repeatable buyer-paid test service", category: "services",
+    value: 6, effort: 3, confidence: 4, fit: 5,
+    est_monthly_low: 100, est_monthly_high: 500,
+    capital_needed: "$0", time_to_first_dollar: "1-2 weeks",
+  });
+  const CLASSIFY_REPLY = verdictLine(0, "Testable Widget Service") + "\n" + verdictLine(1, "Auditable Prompt Pack") + "\n";
+  const BRIEF_JSON = JSON.stringify({
+    summary: "Terse summary of the opportunity.", what_works: "Do X.",
+    numbers: [], risks: "Low.", first_steps: "1. Ship the smallest test.",
+  });
+  const MATCH_URL = "https://example.com/match";
+
+  function stubEnv({ failOn, prepassMatch }) {
+    const now = new Date().toISOString();
+    const signals = [
+      { id: 101, source: "hn", title: "Signal A", url: prepassMatch ? MATCH_URL : "https://example.com/a", snippet: "s", processed: 0, opportunity_id: null },
+      { id: 102, source: "hn", title: "Signal B", url: "https://example.com/b", snippet: "s", processed: 0, opportunity_id: null },
+    ];
+    const bareRow = { id: 7, title: "Bare row", one_liner: "needs evidence", score: 9000, notes: "UNREVIEWED", created_at: now };
+    const inserted = [];
+    const briefedIds = [];
+    let nextId = 1000;
+    let runError = "";
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("SELECT id FROM opportunities WHERE slug")) {
+              if (failOn === "slug") throw new Error("D1 slug lookup down");
+              return null;
+            }
+            if (sql.includes("SELECT o.* FROM opportunities o LEFT JOIN briefs")) return bareRow;
+            if (sql.includes("SELECT created_at FROM opportunities")) {
+              if (failOn === "briefAge") throw new Error("D1 brief-age lookup down");
+              return { created_at: now };
+            }
+            if (sql.includes("LEFT JOIN briefs")) return { n: 0 };
+            if (sql.includes("FROM opportunities WHERE notes LIKE")) return { n: 0 };
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) {
+              const limit = Number(stmt.params[0]) || signals.length;
+              return { results: signals.filter((s) => s.processed === 0).slice(0, limit) };
+            }
+            if (sql.includes("source_url IN")) {
+              return { results: prepassMatch ? [{ id: 5, source_url: MATCH_URL }] : [] };
+            }
+            if (sql.includes("opportunity_id IS NOT NULL AND url IN")) {
+              return { results: [] };
+            }
+            if (sql.includes("SELECT title, url, snippet FROM signals")) {
+              briefedIds.push(stmt.params[0]);
+              return { results: [] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("INSERT INTO opportunities")) {
+              if (failOn === "slug") throw new Error("duplicate slug");
+              inserted.push({ sql, params: stmt.params });
+              return { meta: { last_row_id: nextId++ } };
+            }
+            if (sql.includes("UPDATE opportunities SET notes")) {
+              if (failOn === "prepassNotes") throw new Error("D1 notes append down");
+              return {};
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1, opportunity_id")) {
+              const [oppId, sigId] = stmt.params;
+              const s = signals.find((x) => x.id === sigId);
+              if (s) { s.processed = 1; s.opportunity_id = oppId; }
+              return {};
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1 WHERE id")) {
+              const s = signals.find((x) => x.id === stmt.params[0]);
+              if (s) s.processed = 1;
+              return {};
+            }
+            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) {
+              return { meta: { changes: 0 } };
+            }
+            if (sql.includes("UPDATE agent_runs SET finished_at")) {
+              runError = String(stmt.params[6] || "");
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = {
+      run: async (_model, opts) => {
+        const text = JSON.stringify((opts && opts.messages) || []);
+        return { response: text.includes("FRESH SIGNALS") ? CLASSIFY_REPLY : BRIEF_JSON };
+      },
+    };
+    return { env: { DB, AI }, signals, inserted, briefedIds, runError: () => runError };
+  }
+
+  async function runTick(opts) {
+    _resetBriefSkippedForTests();
+    const t = stubEnv(opts);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    try {
+      const result = await runResearch(t.env, "cron");
+      return { result, signals: t.signals, inserted: t.inserted, briefedIds: t.briefedIds, runError: t.runError() };
+    } finally {
+      globalThis.fetch = realFetch;
+      _resetBriefSkippedForTests();
+    }
+  }
+
+  it("a failed pre-pass notes append finishes ok with prepass_notes:1_failed, the link itself kept", async () => {
+    const t = await runTick({ failOn: "prepassNotes", prepassMatch: true });
+    assert.equal(t.result.status, "ok", `notes throw must not fail the tick: ${t.result.error || "(no error)"}`);
+    assert.ok(t.runError.includes("prepass_notes:1_failed"), `run log must count the failed notes append: ${t.runError}`);
+    assert.ok(!t.runError.includes("prepass_select:failed"), `a notes failure must not read as a lookup failure: ${t.runError}`);
+    assert.equal(t.signals[0].processed, 1, "the linked signal must stay linked (only its notes append failed)");
+    assert.equal(t.signals[0].opportunity_id, 5, "the link must still point at the exact-URL match");
+    assert.equal(t.inserted.length, 1, "the unmatched signal must still triage to a new row");
+    assert.deepEqual(t.briefedIds, [7], "brief pass must still run when a notes append throws");
+  });
+
+  it("a failed slug-collision select finishes ok with slug_select:failed and the signal unprocessed", async () => {
+    const t = await runTick({ failOn: "slug", prepassMatch: false });
+    assert.equal(t.result.status, "ok", `slug throw must not fail the tick: ${t.result.error || "(no error)"}`);
+    assert.ok(t.runError.includes("slug_select:failed"), `run log must name the failed slug lookup: ${t.runError}`);
+    assert.equal(t.inserted.length, 0, "no row may insert when every INSERT collides");
+    assert.deepEqual(t.signals.map((s) => s.processed), [0, 0], "slug-lookup failures must leave signals unprocessed for retry, never noise them");
+    assert.deepEqual(t.briefedIds, [7], "brief pass must still run when the slug lookup throws");
+  });
+
+  it("a failed brief-age select finishes ok with brief_age:failed and the top-scored fallback", async () => {
+    const t = await runTick({ failOn: "briefAge", prepassMatch: false });
+    assert.equal(t.result.status, "ok", `brief-age throw must not fail the tick: ${t.result.error || "(no error)"}`);
+    assert.ok(t.runError.includes("brief_age:failed"), `run log must name the failed backlog-age lookup: ${t.runError}`);
+    assert.ok(t.runError.includes("brief:top-scored"), `an unknown backlog age must fall back to top-scored: ${t.runError}`);
+    assert.ok(!t.runError.includes("brief:failed"), `a lookup failure must not read as an AI/insert failure: ${t.runError}`);
+    assert.equal(t.inserted.length, 2, "triage verdicts must still flush when the brief-age lookup throws");
+    assert.deepEqual(t.signals.map((s) => s.processed), [1, 1]);
+    assert.deepEqual(t.briefedIds, [7], "main brief must still run on the top-scored fallback");
+  });
+
+  it("a healthy tick carries none of the three markers (quiet shape byte-identical)", async () => {
+    const t = await runTick({ failOn: null, prepassMatch: false });
+    assert.equal(t.result.status, "ok", `healthy tick failed: ${t.result.error || "(no error)"}`);
+    for (const m of ["prepass_notes:", "slug_select:failed", "brief_age:failed"]) {
+      assert.ok(!t.runError.includes(m), `healthy tick must carry no ${m}: ${t.runError}`);
+    }
+    assert.ok(t.runError.includes("brief:top-scored"), `healthy tick must keep its brief mode: ${t.runError}`);
+    assert.deepEqual(t.briefedIds, [7]);
+  });
+
+  it("finish line appends the three conditional markers after the existing ones", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    const finishLine = src.split("\n").find((l) => l.includes('await finish("ok"'));
+    for (const m of ["prepass_notes:", "slug_select:failed", "brief_age:failed"]) {
+      assert.ok(finishLine.includes(m), `finish lost the ${m} marker`);
+    }
+    assert.ok(finishLine.includes("prepass_notes:${prepassNotesFailed}_failed"), "notes marker must carry the failure count");
+    for (const g of ["prepassNotesFailed ?", "slugSelectFailed ?", "briefAgeFailed ?"]) {
+      assert.ok(finishLine.includes(g), `finish lost the conditional guard ${g} (clean ticks must carry none)`);
+    }
+    const idx = (s) => finishLine.indexOf(s);
+    const order = ["unreviewed_count:failed", "prepass_notes:${prepassNotesFailed}_failed", "slug_select:failed", "brief_age:failed"];
+    for (let i = 1; i < order.length; i++) {
+      assert.ok(idx(order[i - 1]) !== -1 && idx(order[i - 1]) < idx(order[i]),
+        `finish markers out of order: ${order[i - 1]} must precede ${order[i]}`);
+    }
+  });
+
+  it("README names the pre-pass-notes, slug-select, and brief-age markers", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    for (const m of ["prepass_notes:", "slug_select:failed", "brief_age:failed"]) {
+      assert.ok(readme.includes(m), `README lost the ${m} marker`);
+    }
+  });
+});

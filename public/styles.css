@@ -215,4 +215,8 @@ footer {
   .masthead h1 { font-size: 22px; }
   .lede { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .formula { display: none; }
+  /* Narrow phones hide the four 1–10 meter columns (value/effort/conf/fit);
+     rank/title/status/score/$/mo/first-$ stay visible and the drawer keeps
+     every meter. Desktop renders unchanged. */
+  .ledger .meter-col { display: none; }
 }

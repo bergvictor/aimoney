@@ -395,6 +395,7 @@ export async function runResearch(env, trigger) {
     // counted, never thrown — one flaky write must not abort the tick's triage
     // and brief passes. Skipped signals stay processed = 0 for a later tick.
     let prepassFailed = 0;
+    let prepassNotesFailed = 0; // pre-pass notes appends failed: named on the run log, the link itself still counts
     let prepassSelectFailed = false; // bounded pre-pass lookups failed: named on the run log, AI triage still runs
     if (fresh.length) {
       // Bounded pre-pass (F4): match only the ≤6 fresh URLs in SQL instead of
@@ -419,7 +420,7 @@ export async function runResearch(env, trigger) {
         const linked = await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(target, sig.id).run().then(() => true, () => false);
         if (!linked) { prepassFailed++; continue; }
         state.updated++;
-        await env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, target).run().catch(() => null);
+        await env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, target).run().catch(() => { prepassNotesFailed++; });
       }
       fresh.length = 0;
       fresh.push(...rest);
@@ -436,14 +437,16 @@ export async function runResearch(env, trigger) {
     // it. Overflow stays processed = 0 for a later tick — reversible, no
     // status move. Best-effort: a failed count keeps the looser cap.
     let maxNewThisRun = MAX_NEW_PER_RUN;
+    let bareCountFailed = false; // bare gate count threw: named on the run log, looser cap kept
+    let unreviewedCountFailed = false; // unreviewed gate count threw: named on the run log, bare-gated cap kept
     try {
       const bareRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL").first();
       if (bareRow && Number(bareRow.n) > BARE_BACKLOG_CAP) maxNewThisRun = 1;
-    } catch { /* bare count failed; keep the default cap */ }
+    } catch { bareCountFailed = true; /* bare count failed; keep the default cap */ }
     try {
       const unRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%UNREVIEWED%'").first();
       if (unRow && Number(unRow.n) > UNREVIEWED_BACKLOG_CAP) maxNewThisRun = 0;
-    } catch { /* unreviewed count failed; keep the bare-gated cap */ }
+    } catch { unreviewedCountFailed = true; /* unreviewed count failed; keep the bare-gated cap */ }
 
     // 2. One AI pass: classify signals against the live priority list.
     // Quiet ticks skip the top-60 fetch and the prompt build entirely (F5):
@@ -479,6 +482,7 @@ export async function runResearch(env, trigger) {
     // per-write retry (failed signals stay unprocessed, retried next tick) —
     // the same isolation the health batch uses; failures land as verdict:N_failed.
     const verdictWrites = [];
+    let slugSelectFailed = false; // slug-collision lookup threw: named on the run log, the signal stays unprocessed for retry
     for (const v of verdicts) {
       if (!v || typeof v !== "object") continue;
       const n = Number(v.n);
@@ -525,9 +529,19 @@ export async function runResearch(env, trigger) {
         } catch {
           // Slug collision: link as supports, not drop — reversible, notes
           // newest-kept, no status move. The duplicate proposal is free
-          // corroborating evidence for the existing row.
-          const existing = await env.DB.prepare("SELECT id FROM opportunities WHERE slug = ?").bind(slug).first().catch(() => null);
-          if (existing && existing.id) {
+          // corroborating evidence for the existing row. A failed lookup is
+          // neither collision nor noise: the signal stays unprocessed for a
+          // later tick (still ages honestly toward the 30d sweep).
+          let existing = null;
+          let slugLookupFailed = false;
+          try {
+            existing = await env.DB.prepare("SELECT id FROM opportunities WHERE slug = ?").bind(slug).first();
+          } catch {
+            slugLookupFailed = true;
+          }
+          if (slugLookupFailed) {
+            slugSelectFailed = true;
+          } else if (existing && existing.id) {
             state.updated++;
             verdictWrites.push(env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(existing.id, sig.id));
             verdictWrites.push(env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, existing.id));
@@ -556,6 +570,7 @@ export async function runResearch(env, trigger) {
     let briefFailed = false; // a brief parse/insert threw: named in the run log, retried next tick
     let briefSkipped = []; // insertBrief-false ids: named in the run log, rotated past next tick
     let bareSelectFailed = false; // a bare-row lookup threw: named on the run log, distinct from brief:failed (AI/insert)
+    let briefAgeFailed = false; // the backlog-age lookup threw: named on the run log, brief mode falls back to top-scored
     const markBareSelectFailed = () => { bareSelectFailed = true; };
     let bare = null;
     // Backlog age shared by the brief-mode flip and the extra-brief gate: one
@@ -565,7 +580,12 @@ export async function runResearch(env, trigger) {
     if (Date.now() - t0 < briefDeadline) {
       briefMode = "top-scored";
       if (trigger === "cron") {
-        const oldestForBrief = await env.DB.prepare("SELECT created_at FROM opportunities WHERE notes LIKE ? ORDER BY created_at ASC LIMIT 1").bind(String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)).first().catch(() => null);
+        let oldestForBrief = null;
+        try {
+          oldestForBrief = await env.DB.prepare("SELECT created_at FROM opportunities WHERE notes LIKE ? ORDER BY created_at ASC LIMIT 1").bind(String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)).first();
+        } catch {
+          briefAgeFailed = true;
+        }
         const ageMsForBrief = oldestForBrief && oldestForBrief.created_at ? Date.now() - Date.parse(oldestForBrief.created_at) : NaN;
         oldestUnreviewedAgeMs = ageMsForBrief;
         if (Number.isFinite(ageMsForBrief) && ageMsForBrief > 48 * 3600000) {
@@ -649,7 +669,7 @@ export async function runResearch(env, trigger) {
     }
     // Single run-log write carrying the brief mode (a bare finish used to run
     // first and be overwritten here).
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (state.src_partial.length ? ` src_partial:${state.src_partial.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : "") + (prepassFailed ? ` prepass:${prepassFailed}_failed` : "") + (staleFailed ? " stale:failed" : "") + (prepassSelectFailed ? " prepass_select:failed" : "") + (bareSelectFailed ? " bare_select:failed" : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (state.src_partial.length ? ` src_partial:${state.src_partial.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : "") + (prepassFailed ? ` prepass:${prepassFailed}_failed` : "") + (staleFailed ? " stale:failed" : "") + (prepassSelectFailed ? " prepass_select:failed" : "") + (bareSelectFailed ? " bare_select:failed" : "") + (bareCountFailed ? " bare_count:failed" : "") + (unreviewedCountFailed ? " unreviewed_count:failed" : "") + (prepassNotesFailed ? ` prepass_notes:${prepassNotesFailed}_failed` : "") + (slugSelectFailed ? " slug_select:failed" : "") + (briefAgeFailed ? " brief_age:failed" : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);

@@ -195,8 +195,8 @@ function renderLedger() {
       <td>${statusPill(o.status)}</td>
       <td class="score-cell"><span class="score-num">${esc(o.score)}</span>${noBriefBadge(o)}
         <div class="score-bar"><i style="width:${Math.round(100 * (o.score || 0) / max)}%"></i></div></td>
-      <td>${meter(o.value)}</td><td>${meter(o.effort)}</td>
-      <td>${meter(o.confidence)}</td><td>${meter(o.fit)}</td>
+      <td class="meter-col">${meter(o.value)}</td><td class="meter-col">${meter(o.effort)}</td>
+      <td class="meter-col">${meter(o.confidence)}</td><td class="meter-col">${meter(o.fit)}</td>
       <td class="num money">${money(o.est_monthly_low, o.est_monthly_high)}</td>
       <td class="muted">${esc(o.time_to_first_dollar || "—")}</td>
     </tr>`).join("")
@@ -249,8 +249,8 @@ function renderReview() {
       <td>${statusPill(o.status)}</td>
       <td class="score-cell"><span class="score-num">${esc(o.score)}</span>${noBriefBadge(o)}
         <div class="score-bar"><i style="width:${Math.round(100 * (o.score || 0) / max)}%"></i></div></td>
-      <td>${meter(o.value)}</td><td>${meter(o.effort)}</td>
-      <td>${meter(o.confidence)}</td><td>${meter(o.fit)}</td>
+      <td class="meter-col">${meter(o.value)}</td><td class="meter-col">${meter(o.effort)}</td>
+      <td class="meter-col">${meter(o.confidence)}</td><td class="meter-col">${meter(o.fit)}</td>
       <td class="num money">${money(o.est_monthly_low, o.est_monthly_high)}</td>
       <td class="muted">${esc(o.time_to_first_dollar || "—")}</td>
     </tr>`).join("")
@@ -487,11 +487,13 @@ function vettedNotes(notes) {
   return `${cleanUnreviewed(notes)}\n[${day} vetted] Human vetted; cap lifted.`.trim().slice(-8000);
 }
 
-// Review detail prefetch (audit 2026-09-20-round3 Task 1): each V/K verdict
-// costs a detail GET plus the PATCH. The detail GET for row N+1 is
-// predictable — the review queue is oldest-first and verdicts advance in
-// order — so focusing or verdicting row N prefetches row N+1 in the
-// background, and the next verdict costs only its PATCH. The cache holds
+// Review detail prefetch (audit 2026-09-20-round3 Task 1; round5 Task 1
+// re-arms the focused row itself): each V/K verdict costs a detail GET plus
+// the PATCH. The detail GET for row N+1 is predictable — the review queue is
+// oldest-first and verdicts advance in order — so verdicting row N prefetches
+// row N+1 in the background, and focusing row N re-arms N itself plus N+1
+// (the post-refresh focus lands after the wholesale wipe, so the next verdict
+// costs only its PATCH). The cache holds
 // notes only (never rendered), goes stale after 5 min, and is dropped
 // wholesale on every opportunities refresh; a failed PATCH keeps the row
 // visible with the existing "<Action> failed" toast, exactly as today.
@@ -735,6 +737,7 @@ function focusReviewRow(id) {
   }
   const tr = document.querySelector(`#ledger-body tr.row[data-id="${id}"]`);
   if (tr) tr.focus();
+  prefetchReviewDetail(id); // focusing N re-arms N itself post-refresh; never awaited
   prefetchReviewDetail(nextReviewId(id)); // focusing N warms N+1; never awaited
 }
 

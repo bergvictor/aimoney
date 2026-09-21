@@ -2166,3 +2166,132 @@ describe("inflow-paused pill mirror (audit 2026-09-20-round4 Task 2)", () => {
     assert.ok(paint.includes('(cachedPaused ? " · inflow paused" : "")'), "cached pill lost the paused bit");
   });
 });
+
+describe("focus re-arms the focused row (audit 2026-09-20-round5 Task 1)", () => {
+  // Cache + prefetch + fetchDetailForWrite + focusReviewRow extracted from the
+  // shipped source (not copied) with a counted stub api, so these cases fail
+  // if the post-refresh focus stops re-arming the row the next verdict needs.
+  function shippedFocusHarness() {
+    const cacheStart = js.indexOf("const DETAIL_CACHE_TTL_MS");
+    assert.ok(cacheStart !== -1, "app.js lost DETAIL_CACHE_TTL_MS");
+    const cacheEnd = js.indexOf("// Detail-before-write (F2)", cacheStart);
+    assert.ok(cacheEnd !== -1 && cacheEnd > cacheStart, "app.js lost the detail-cache block boundary");
+    const fetchStart = js.indexOf("async function fetchDetailForWrite");
+    assert.ok(fetchStart !== -1, "app.js lost fetchDetailForWrite");
+    const fetchEnd = js.indexOf("async function vetOpportunity(", fetchStart);
+    assert.ok(fetchEnd !== -1 && fetchEnd > fetchStart, "app.js lost the fetchDetailForWrite block boundary");
+    const focusStart = js.indexOf("function focusReviewRow");
+    assert.ok(focusStart !== -1, "app.js lost focusReviewRow");
+    const focusEnd = js.indexOf("function advanceReviewFocus", focusStart);
+    assert.ok(focusEnd !== -1 && focusEnd > focusStart, "app.js lost the focusReviewRow block boundary");
+    return new Function("state", "api", "toast", "openAdminModal", "document", "Date", "Map",
+      `${js.slice(cacheStart, cacheEnd)}\n${js.slice(fetchStart, fetchEnd)}\n${js.slice(focusStart, focusEnd)}\nreturn { detailCache, getCachedDetailNotes, invalidateDetailCache, nextReviewId, fetchDetailForWrite, focusReviewRow };`);
+  }
+
+  function mount() {
+    const calls = [];
+    const toasts = [];
+    const state = {
+      token: "t",
+      reviewList: [{ id: 11 }, { id: 12 }, { id: 13 }],
+      opportunities: [{ id: 11 }, { id: 12 }, { id: 13 }],
+    };
+    const api = async (path) => {
+      calls.push(path);
+      return { opportunity: { notes: `notes-for-${path}` } };
+    };
+    const document = { querySelector: () => ({ focus() {}, tabIndex: 0 }) };
+    const factory = shippedFocusHarness();
+    const h = factory(state, api, (m) => toasts.push(m), () => {}, document, Date, Map);
+    const flush = () => new Promise((r) => setTimeout(r, 0));
+    return { state, calls, toasts, ...h, flush };
+  }
+
+  it("focus warms the focused id itself alongside N+1, never awaited", () => {
+    const focusSlice = js.slice(js.indexOf("function focusReviewRow"), js.indexOf("function advanceReviewFocus"));
+    assert.ok(focusSlice.includes("prefetchReviewDetail(id)"), "focusing N must re-arm N itself");
+    assert.ok(focusSlice.includes("prefetchReviewDetail(nextReviewId(id))"), "focusing N must keep warming N+1");
+    assert.ok(!focusSlice.includes("await prefetchReviewDetail"), "focus prefetches must stay fire-and-forget");
+  });
+
+  it("focus→verdict→focus→verdict costs zero detail GETs on the second verdict", async () => {
+    const h = mount();
+    h.focusReviewRow(11);
+    await h.flush();
+    h.calls.length = 0;
+    const first = await h.fetchDetailForWrite(11, "Vet");
+    assert.ok(first, "first verdict must resolve its row");
+    assert.equal(h.calls.length, 0, `first verdict after focus must cost zero detail GETs, got: ${h.calls.join(",")}`);
+    // Post-verdict refresh: the list rows are replaced, the reviewed row
+    // leaves the queue, and the wholesale wipe drops the whole cache.
+    h.state.reviewList = [{ id: 12 }, { id: 13 }];
+    h.invalidateDetailCache();
+    h.focusReviewRow(12);
+    await h.flush();
+    h.calls.length = 0;
+    const second = await h.fetchDetailForWrite(12, "Vet");
+    assert.ok(second, "second verdict must resolve its row");
+    assert.equal(second.notes, "notes-for-/api/opportunities/12", "second verdict must write from the re-armed cache");
+    assert.equal(h.calls.length, 0, `second verdict after post-refresh focus must cost zero detail GETs, got: ${h.calls.join(",")}`);
+    assert.equal(h.toasts.length, 0, "cache-hit verdicts must not toast");
+  });
+
+  it("wholesale invalidation on refresh is unchanged", () => {
+    const targets = js.slice(js.indexOf("async function refreshTargets"), js.indexOf("paintLastGood();"));
+    assert.ok(targets.includes("if (opps) { state.opportunities = opps.opportunities || []; invalidateDetailCache(); }"), "opportunities refresh must keep its wholesale cache drop");
+  });
+});
+
+describe("narrow phones hide the meter columns (audit 2026-09-20-round5 Task 4)", () => {
+  it("the four thead meter columns carry meter-col; rank/title/status/score/$/mo/first-$ do not", () => {
+    for (const [title, label] of [
+      ["Realistic monthly revenue at modest scale", "Value"],
+      ["Weeks of focused work to first dollar", "Effort"],
+      ["Strength of evidence", "Conf."],
+      ["Leverage of your existing stack", "Fit"],
+    ]) {
+      assert.ok(html.includes(`<th class="meter-col" title="${title}">${label}</th>`), `thead lost the meter-col ${label} column`);
+    }
+    assert.equal(html.split('class="meter-col"').length - 1, 4, "exactly the four meter headers may carry meter-col");
+    for (const h of ['<th class="num">#</th>', "<th>Opportunity</th>", "<th>Status</th>",
+      '<th class="num">Score</th>', '<th class="num">$/mo</th>', "<th>First $</th>"]) {
+      assert.ok(html.includes(h), `thead lost a kept column: ${h}`);
+    }
+  });
+
+  it("both row renders tag their four meter cells; nothing else does", () => {
+    for (const field of ["value", "effort", "confidence", "fit"]) {
+      assert.equal(js.split(`<td class="meter-col">\${meter(o.${field})}</td>`).length - 1, 2,
+        `${field} must render in a meter-col cell in both the ledger and the review queue`);
+    }
+    assert.equal(js.split('<td class="meter-col">').length - 1, 8, "exactly the eight meter cells may carry meter-col");
+  });
+
+  it("the hiding rule lives under the 760px breakpoint only; desktop CSS is untouched", () => {
+    const narrowAt = css.indexOf("@media (max-width: 760px)");
+    assert.ok(narrowAt !== -1, "styles.css lost the 760px breakpoint");
+    const rule = ".ledger .meter-col { display: none; }";
+    assert.ok(css.includes(rule), "styles.css lost the meter-column hiding rule");
+    assert.ok(css.indexOf(".meter-col") > narrowAt, "the hiding rule must live inside the 760px block, never on desktop");
+    assert.equal(css.split(".meter-col").length - 1, 1, "exactly one meter-col rule may exist");
+    assert.ok(!css.slice(0, narrowAt).includes("meter-col"), "desktop CSS must not mention meter-col");
+  });
+
+  it("the drawer keeps every meter with no meter-col hook", () => {
+    const drawerStart = js.indexOf("async function openDrawer");
+    assert.ok(drawerStart !== -1, "app.js lost openDrawer");
+    const drawerEnd = js.indexOf("/* ---- modals ---- */", drawerStart);
+    assert.ok(drawerEnd !== -1 && drawerEnd > drawerStart, "app.js lost the drawer block boundary");
+    const drawer = js.slice(drawerStart, drawerEnd);
+    assert.ok(drawer.includes("<dt>Value/effort/conf/fit</dt>"), "drawer lost its Value/effort/conf/fit line");
+    assert.ok(!drawer.includes("meter-col"), "drawer must keep every meter visible (no meter-col hook)");
+  });
+
+  it("the new rule ships no dark-mode payload", () => {
+    const narrow = css.slice(css.indexOf("@media (max-width: 760px)"));
+    for (const hook of ["prefers-color-scheme", "data-theme", "toggleTheme", "setTheme", "useTheme"]) {
+      assert.ok(!narrow.includes(hook), `760px block ships a dark-mode hook (${hook})`);
+    }
+    assert.ok(/color-scheme\s*:\s*light/.test(css), "styles.css must keep declaring color-scheme: light");
+  });
+});
