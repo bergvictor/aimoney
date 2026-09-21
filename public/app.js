@@ -386,7 +386,9 @@ function inlinePostMortem(container, { label, placeholder, confirmText, onSubmit
 // human-entered revenue input, so a win costs the same single click as a loss.
 // Empty lines cancel with the row untouched; bad/negative $ clamps to 0
 // exactly like the modal; the source truncates to 120 chars like the modal and
-// empty renders exactly as today (no via bit). Returns false when a row is already open.
+// empty renders exactly as today (no via bit). The optional spend mirrors the
+// revenue input; empty leaves the row's existing spend untouched (no key sent,
+// never clobbered with 0). Returns false when a row is already open.
 function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, cancelToast }) {
   if (!container) return false;
   if (container.querySelector("[data-pm-input]")) return false;
@@ -398,6 +400,12 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
   amount.placeholder = "Revenue $ (human-entered, e.g. 500)";
   amount.setAttribute("aria-label", "Revenue in dollars");
   amount.inputMode = "decimal";
+  const spend = document.createElement("input");
+  spend.type = "text";
+  spend.dataset.winSpend = "1";
+  spend.placeholder = "Spend $ (optional)";
+  spend.setAttribute("aria-label", "Spend in dollars");
+  spend.inputMode = "decimal";
   const source = document.createElement("input");
   source.type = "text";
   source.dataset.winSource = "1";
@@ -425,8 +433,10 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
     if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }
     const revenueCents = Math.max(0, Math.round(Number(amount.value.trim()) * 100) || 0);
     const revenueSource = source.value.trim().slice(0, 120);
+    const spendRaw = spend.value.trim();
+    const spentCents = spendRaw === "" ? null : Math.max(0, Math.round(Number(spendRaw) * 100) || 0);
     cleanup();
-    onSubmit(pm, revenueCents, revenueSource);
+    onSubmit(pm, revenueCents, revenueSource, spentCents);
   };
   ok.addEventListener("click", (ev) => { ev.stopPropagation(); submit(); });
   input.addEventListener("keydown", (ev) => {
@@ -437,11 +447,16 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
     if (ev.key === "Enter") { ev.preventDefault(); submit(); }
     if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
   });
+  spend.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
+  });
   source.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); submit(); }
     if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
   });
   row.appendChild(amount);
+  row.appendChild(spend);
   row.appendChild(source);
   row.appendChild(input);
   row.appendChild(ok);
@@ -745,28 +760,31 @@ async function loseExperiment(id, anchorEl) {
   inlinePostMortem(loseContainer, { label: "One-line post-mortem (required to close as lost):", placeholder: "One-line post-mortem (required to close as lost):", confirmText: "Lose", onSubmit: (pm) => doLose(pm), cancelToast: "Close cancelled — post-mortem required." });
 }
 
-// One-click Win for planned/running experiments: one inline $ amount, one optional
-// source line, one inline line, then a single PATCH to won sending that line as both result
-// and post_mortem, the human-entered amount as revenue_cents, and the source
-// as revenue_source, so the API closure gate holds unchanged (ended_at stamped by the API). Token-gated
-// like loseExperiment; orphaned cards never render the button; an empty
-// inline line cancels with the row untouched; bad/negative $ clamps to 0
-// exactly like the modal. Human-pressed, one decision.
+// One-click Win for planned/running experiments: one inline $ amount, one
+// optional spend, one optional source line, one inline line, then a single
+// PATCH to won sending that line as both result and post_mortem, the
+// human-entered amount as revenue_cents, and the source as revenue_source,
+// so the API closure gate holds unchanged (ended_at stamped by the API).
+// Token-gated like loseExperiment; orphaned cards never render the button;
+// an empty inline line cancels with the row untouched; bad/negative $ clamps
+// to 0 exactly like the modal. An empty spend sends no spent_cents key so the
+// API keeps the row's existing value — a modal-entered spend is never
+// clobbered with 0. Human-pressed, one decision.
 async function winExperiment(id, anchorEl) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
   const winContainer = (anchorEl ? (anchorEl.closest(".card") || anchorEl.closest(".review-actions") || anchorEl.parentElement) : null) || document.querySelector("#board") || document.body;
-  const doWin = async (pm, revenueCents, revenueSource) => {
+  const doWin = async (pm, revenueCents, revenueSource, spentCents) => {
   // (cancel handled by inline row: empty still cancels, row untouched)
   try {
     await api(`/api/experiments/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status: "won", result: pm.trim(), post_mortem: pm.trim(), revenue_cents: revenueCents, revenue_source: revenueSource }),
+      body: JSON.stringify({ status: "won", result: pm.trim(), post_mortem: pm.trim(), revenue_cents: revenueCents, revenue_source: revenueSource, ...(spentCents === null || spentCents === undefined ? {} : { spent_cents: spentCents }) }),
     });
     toast("Experiment closed as won");
     await refreshTargets({ runs: false });
   } catch (e) { toast(`Close failed: ${e.message}`); }
   };
-  inlineWinClose(winContainer, { label: "One-line post-mortem (required to close as won):", placeholder: "One-line post-mortem (required to close as won):", confirmText: "Win", onSubmit: (pm, revenueCents, revenueSource) => doWin(pm, revenueCents, revenueSource), cancelToast: "Win cancelled — post-mortem required." });
+  inlineWinClose(winContainer, { label: "One-line post-mortem (required to close as won):", placeholder: "One-line post-mortem (required to close as won):", confirmText: "Win", onSubmit: (pm, revenueCents, revenueSource, spentCents) => doWin(pm, revenueCents, revenueSource, spentCents), cancelToast: "Win cancelled — post-mortem required." });
 }
 
 function renderExperiments() {

@@ -10,7 +10,8 @@ export const slugify = (s) =>
   String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "").slice(0, 80);
 
-// Priority score. MUST match functions/api/[[path]].js scoreOf and the README:
+// Priority score. MUST match the README formula via effectiveScore below
+// (the API imports effectiveScore from here; its scoreOf copy is deduped):
 //   score = 100 * (value * confidence * fit) / (effort + 1)
 export const scoreOf = (o) =>
   Math.round(100 * ((o.value * o.confidence * o.fit) / (o.effort + 1)) * 10) / 10;
@@ -46,6 +47,7 @@ export function tokensMatch(got, want) {
 
 // Evidence append (F4): keep the NEWEST max chars, not the oldest.
 // Mirrors the SQL fix `substr(notes || ?, -8000)` in worker/src/index.js.
+// Pinned JS spec of that SQL idiom (no shipped importer; the lib suite pins the rule).
 export function appendKeepNewest(notes, addition, max = 8000) {
   const combined = String(notes || "") + String(addition || "");
   return combined.length <= max ? combined : combined.slice(-max);

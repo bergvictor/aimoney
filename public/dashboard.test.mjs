@@ -564,7 +564,38 @@ describe("win revenue source (audit 2026-09-20-round3 Task 2)", () => {
   it("empty post-mortem line still cancels with the row untouched", () => {
     const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
     assert.ok(winRow.includes("if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }"), "Win empty line must cancel with the row untouched");
-    assert.ok(winRow.includes("onSubmit(pm, revenueCents, revenueSource)"), "Win submit must pass the source through");
+    assert.ok(winRow.includes("onSubmit(pm, revenueCents, revenueSource"), "Win submit must pass the source through");
+  });
+});
+
+describe("win optional spend (audit 2026-09-20-round1 Task 3)", () => {
+  it("Win inline row owns an optional spend input beside revenue + source + post-mortem", () => {
+    const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
+    assert.ok(winRow.includes("dataset.winSpend"), "Win row lacks its spend input");
+    assert.ok(winRow.includes("Spend $ (optional)"), "Win spend input lost its optional copy");
+    assert.ok(winRow.includes("Spend in dollars"), "Win spend input lost its accessible label");
+    assert.ok(winRow.includes("row.appendChild(spend)"), "Win row must render the spend input");
+  });
+
+  it("empty spend sends no spent_cents so a modal-entered value is never clobbered with 0", () => {
+    const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
+    assert.ok(winRow.includes('spendRaw === "" ? null'), "Win must map an empty spend to null, not 0");
+    assert.ok(winRow.includes("onSubmit(pm, revenueCents, revenueSource, spentCents)"), "Win submit must pass the spend through");
+    const doWin = js.slice(js.indexOf("const doWin = async"), js.indexOf("inlineWinClose(winContainer"));
+    assert.ok(doWin.includes("spent_cents"), "Win close must thread the spend into the PATCH");
+    assert.ok(doWin.includes("spentCents === null"), "Win must omit spent_cents when the spend input is empty");
+    assert.ok(doWin.includes('status: "won"'), "Win must still PATCH status=won");
+    assert.ok(doWin.includes("result: pm.trim(), post_mortem: pm.trim()"), "Win must still send the line as result + post-mortem");
+  });
+
+  it("bad/negative spend clamps to 0 exactly like revenue and the modal", () => {
+    assert.ok(js.includes('Math.max(0, Math.round(Number($("#m-spend").value.trim()) * 100) || 0)'), "modal lost its spend clamp");
+    assert.ok(js.includes("Math.max(0, Math.round(Number(spendRaw) * 100) || 0)"), "Win must clamp the inline spend exactly like revenue");
+  });
+
+  it("closed rows still show both money legs on the board and in the drawer", () => {
+    assert.ok(js.includes("moneyCents(e.spent_cents)} spent"), "board card lost the spent leg");
+    assert.ok(js.includes("moneyCents(e.spent_cents || 0)} spent"), "drawer lost the spent leg");
   });
 });
 
