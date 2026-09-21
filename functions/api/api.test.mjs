@@ -1740,6 +1740,87 @@ describe("self-migration switch (audit 2026-09-20-round3 Task 1)", () => {
     assert.equal(second.body.schema_migration, first.body.schema_migration);
   });
 
+  // Round6 Task 1: a PRAGMA stub that throws once, then answers healthy.
+  const flakyPragmaOnce = (db, failWith) => {
+    const realPrepare = db.prepare.bind(db);
+    let attempts = 0;
+    db.prepare = (sql) => {
+      if (sql.startsWith("PRAGMA table_info") && attempts++ === 0) {
+        return {
+          _sql: sql, _args: [],
+          bind(...a) { return this; },
+          all: async () => { throw failWith; },
+          first: async () => { throw failWith; },
+          run: async () => { throw failWith; },
+        };
+      }
+      return realPrepare(sql);
+    };
+    return db;
+  };
+
+  it("a transient PRAGMA throw is not cached: var set migrates and reports numbers on the next call", async () => {
+    _resetSchemaMigrationForTests();
+    const db = flakyPragmaOnce(
+      oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() }),
+      new Error("D1 busy, retry later"));
+    const env = { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } };
+    const first = await callApi(["health"], "http://localhost/api/health", env, db);
+    assert.equal(first.status, 200);
+    assert.equal(first.body.revenue_total, null, "the first call cannot migrate on a thrown PRAGMA");
+    assert.deepEqual(first.body.health_probe_failures, ["revenue_week", "revenue_lifetime"]);
+    assert.ok(!("schema_missing_columns" in first.body), "an inconclusive first call names no columns");
+    const second = await callApi(["health"], "http://localhost/api/health", env, db);
+    assert.equal(second.body.revenue_last_7d, 50000);
+    assert.equal(second.body.revenue_total, 50000);
+    assert.equal(second.body.spent_total, 1200);
+    assert.ok(!("health_probe_failures" in second.body), "the retried PRAGMA migrates and the probes answer");
+    assert.ok(db._oldSchema.columns.has("revenue_cents") && db._oldSchema.columns.has("spent_cents"),
+      "the retried call must add both money columns");
+  });
+
+  it("a transient PRAGMA throw is not cached: var unset names the columns plus the disabled line on the next call", async () => {
+    _resetSchemaMigrationForTests();
+    const db = flakyPragmaOnce(
+      oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() }),
+      new Error("D1 busy, retry later"));
+    const first = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(first.status, 200);
+    assert.ok(!("schema_missing_columns" in first.body), "an inconclusive first call carries no switch line");
+    const second = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.deepEqual(second.body.schema_missing_columns, ["revenue_cents", "spent_cents"]);
+    assert.ok(second.body.schema_migration.includes("disabled"), "retried call must carry the disabled line");
+    assert.ok(second.body.schema_migration.includes("ALLOW_SCHEMA_MIGRATION=1"), "disabled line must name the exact variable");
+    const pragmas = db._oldSchema.pragmaCalls();
+    await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(db._oldSchema.pragmaCalls(), pragmas, "once decided, unset reuses the report without re-PRAGMA");
+  });
+
+  it("an empty table_info answer is not cached: the next call re-checks and migrates", async () => {
+    _resetSchemaMigrationForTests();
+    const db = oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() });
+    const realPrepare = db.prepare.bind(db);
+    let attempts = 0;
+    db.prepare = (sql) => {
+      if (sql.startsWith("PRAGMA table_info") && attempts++ === 0) {
+        return {
+          _sql: sql, _args: [],
+          bind(...a) { return this; },
+          all: async () => ({ results: [] }),
+          first: async () => null,
+          run: async () => ({ success: true }),
+        };
+      }
+      return realPrepare(sql);
+    };
+    const env = { extraEnv: { ALLOW_SCHEMA_MIGRATION: "1" } };
+    const first = await callApi(["health"], "http://localhost/api/health", env, db);
+    assert.equal(first.body.revenue_total, null, "an empty table_info cannot migrate");
+    const second = await callApi(["health"], "http://localhost/api/health", env, db);
+    assert.equal(second.body.revenue_total, 50000);
+    assert.ok(!("health_probe_failures" in second.body), "the re-checked PRAGMA migrates and the probes answer");
+  });
+
   it("tolerates a duplicate-column race (a sibling isolate already added it)", async () => {
     _resetSchemaMigrationForTests();
     const db = oldSchemaDB({ opportunities: oppSeed(), experiments: wonSeed() },

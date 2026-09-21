@@ -149,13 +149,23 @@ function renderStartHere() {
     if ((state.apiFailures || []).includes("/api/opportunities")) return;
     el.classList.add("hidden"); el.innerHTML = ""; return;
   }
+  paintStartHere(el, top, "");
+}
+
+// Single strip painter (round6 Task 2): the live render above and the
+// last-good-cache boot paint share this one builder, so copy, buttons, and
+// the Vet/Kill gate cannot drift between the two. `top` is the live #1 pick
+// or the cached snapshot row (same normalized fields); the cached site
+// passes its stale mark, live passes "". The gate is computed once here via
+// isNeedsReview — the snapshot bit was saved from the same predicate.
+function paintStartHere(el, top, staleMark) {
   const excerpt = firstStepsFirstLine({ first_steps: top.brief_first_steps });
   const nextAction = excerpt || "No brief yet — open the drawer for facts.";
   const needsReview = isNeedsReview(top);
   el.classList.remove("hidden");
   el.innerHTML =
     `<div style="background:var(--green-wash);border:1px solid var(--green);border-radius:8px;padding:10px 12px;margin-bottom:12px">` +
-    `<p style="margin:0 0 4px"><b>Start here today:</b> ${esc(top.title)}</p>` +
+    `<p style="margin:0 0 4px"><b>Start here today:</b> ${esc(top.title)}${staleMark}</p>` +
     `<p class="muted" style="margin:0 0 8px;font-size:13px"><span class="mono">${money(top.est_monthly_low, top.est_monthly_high)}/mo</span>` +
     ` · <span>Capital: ${esc(top.capital_needed || "—")}</span>` +
     ` · <span>Next: ${esc(nextAction)}</span></p>` +
@@ -1600,25 +1610,7 @@ function paintLastGood() {
   const el = $("#start-here");
   if (cachedTop && cachedTop.id !== null && cachedTop.id !== undefined && el) {
     const staleMark = isSnapshotStale(cachedTop.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "";
-    const excerpt = firstStepsFirstLine({ first_steps: cachedTop.brief_first_steps });
-    const nextAction = excerpt || "No brief yet — open the drawer for facts.";
-    const needsReview = Number(cachedTop.needs_review) === 1;
-    el.classList.remove("hidden");
-    el.innerHTML =
-      `<div style="background:var(--green-wash);border:1px solid var(--green);border-radius:8px;padding:10px 12px;margin-bottom:12px">` +
-      `<p style="margin:0 0 4px"><b>Start here today:</b> ${esc(cachedTop.title)}${staleMark}</p>` +
-      `<p class="muted" style="margin:0 0 8px;font-size:13px"><span class="mono">${money(cachedTop.est_monthly_low, cachedTop.est_monthly_high)}/mo</span>` +
-      ` · <span>Capital: ${esc(cachedTop.capital_needed || "—")}</span>` +
-      ` · <span>Next: ${esc(nextAction)}</span></p>` +
-      `<p style="margin:0"><button id="start-here-open" class="btn small" type="button">Open in drawer</button>` +
-      (needsReview ? ` <button id="start-here-vet" class="btn small" type="button">Vet</button> <button id="start-here-kill" class="btn small ghost danger" type="button">Kill</button>` : "") +
-      `</p>` +
-      `</div>`;
-    $("#start-here-open").addEventListener("click", () => openDrawer(cachedTop.id));
-    if (needsReview) {
-      $("#start-here-vet").addEventListener("click", () => vetOpportunity(cachedTop.id));
-      $("#start-here-kill").addEventListener("click", (ev) => killOpportunity(cachedTop.id, ev.currentTarget));
-    }
+    paintStartHere(el, cachedTop, staleMark);
   }
 }
 

@@ -1039,8 +1039,8 @@ describe("last-good first paint (audit 2026-09-20-round3 Task 2)", () => {
     assert.ok(paint.includes('$("#agent-text")'), "cache paint must fill the agent pill");
     assert.ok(paint.includes('$("#start-here")'), "cache paint must fill the Start-here strip");
     assert.ok(paint.includes('$("#review-count")'), "cache paint must fill the review chip");
-    assert.ok(paint.includes("Start here today"), "cached strip must keep the strip copy");
-    assert.ok(paint.includes("openDrawer(cachedTop.id)"), "cached strip must deep-link via openDrawer");
+    assert.ok(paint.includes("paintStartHere(el, cachedTop,"), "cached strip must delegate to the shared strip painter");
+    assert.ok(!paint.includes("start-here-vet"), "cached strip must not duplicate the strip buttons beside the shared painter");
     assert.ok(!paint.includes('api("/api/'), "cache paint must not issue a fetch");
   });
 
@@ -1067,6 +1067,26 @@ describe("last-good first paint (audit 2026-09-20-round3 Task 2)", () => {
     assert.ok(strip.includes("el.innerHTML ="), "live strip must still repaint on success");
     const rr = js.slice(js.indexOf("async function refreshReview"), js.indexOf("const fmtAgeH"));
     assert.ok(rr.includes("el.textContent = state.reviewList.length"), "review count must still fill from live data");
+  });
+});
+
+describe("one Start-here painter (audit 2026-09-20-round6 Task 2)", () => {
+  it("live and cached strips delegate to one shared paintStartHere", () => {
+    assert.ok(js.includes("function paintStartHere"), "app.js lost the shared strip painter");
+    assert.equal(js.split("Start here today:</b>").length - 1, 1, "the strip markup must live in exactly one builder");
+    const live = js.slice(js.indexOf("function renderStartHere"), js.indexOf("function paintStartHere"));
+    assert.ok(live.includes("paintStartHere(el, top,"), "live strip must delegate to the shared painter");
+    const paint = js.slice(js.indexOf("function paintLastGood"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(paint.includes("paintStartHere(el, cachedTop,"), "cached strip must delegate to the shared painter");
+    assert.ok(paint.includes("LAST_GOOD_STALE_MARK"), "cached strip must keep passing its stale mark");
+  });
+
+  it("the Vet/Kill gate is computed once from the same predicate", () => {
+    const painter = js.slice(js.indexOf("function paintStartHere"), js.indexOf("/* ---- priority list ---- */"));
+    assert.ok(painter.includes("const needsReview = isNeedsReview(top)"), "shared painter must gate once on isNeedsReview");
+    assert.ok(painter.includes("openDrawer(top.id)"), "shared painter lost the drawer deep-link");
+    const paint = js.slice(js.indexOf("function paintLastGood"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(!paint.includes("needs_review"), "cached strip must not compute its own gate beside the shared one");
   });
 });
 

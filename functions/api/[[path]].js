@@ -7,7 +7,7 @@ const json = (data, status = 200) =>
     headers: { "content-type": "application/json; charset=utf-8" },
   });
 
-import { effectiveScore, tokensMatch } from "../../worker/src/lib.js";
+import { clamp10, effectiveScore, tokensMatch } from "../../worker/src/lib.js";
 
 // release.json is deploy-static: its revision is fetched once per isolate and
 // reused by every later /api/health call (a failed fetch retries next call).
@@ -21,8 +21,10 @@ let cachedHealthRev = null;
 // applies exactly the ADD COLUMN statements from
 // d1/migrate-2026-09-20-experiment-cents.sql, one at a time (ADD-only, no
 // endpoint). Default-off: unset changes nothing; the health payload then
-// names the missing columns plus the disabled line. At most once per
-// isolate (cached below); tests reset via _resetSchemaMigrationForTests.
+// names the missing columns plus the disabled line. Decided outcomes are
+// cached below (at most one PRAGMA per isolate once decided); inconclusive
+// answers (PRAGMA throw, empty table_info) are never cached, so the next
+// call retries. Tests reset via _resetSchemaMigrationForTests.
 const MONEY_PROBE_COLUMNS = ["revenue_cents", "spent_cents"];
 const MONEY_COLUMN_DDL = {
   revenue_cents: "ALTER TABLE experiments ADD COLUMN revenue_cents INTEGER NOT NULL DEFAULT 0",
@@ -41,13 +43,16 @@ async function ensureMoneyColumns(env) {
     have = new Set((info.results || []).map((c) => c.name));
   } catch {
     // PRAGMA unsupported or the database unreachable: leave the probes to
-    // report (unset behaviour stays byte-identical to today).
-    schemaMigrationState = none;
+    // report (unset behaviour stays byte-identical to today). NOT cached:
+    // a transient D1 blip is "cannot tell", and caching it would turn this
+    // isolate into never-migrate, never-hint for its lifetime — the next
+    // call retries the PRAGMA (round6 Task 1).
     return none;
   }
   // An empty table_info (an unknown stub shape) means "cannot tell": report
-  // nothing rather than guessing the table is old.
-  if (!have.size) { schemaMigrationState = none; return none; }
+  // nothing rather than guessing the table is old. NOT cached either: an
+  // empty answer may be transient too, so the next call re-checks.
+  if (!have.size) { return none; }
   const missing = MONEY_PROBE_COLUMNS.filter((c) => !have.has(c));
   if (!missing.length) { schemaMigrationState = none; return none; }
   if (String(env.ALLOW_SCHEMA_MIGRATION || "") !== "1") {
@@ -71,11 +76,9 @@ async function ensureMoneyColumns(env) {
   return done;
 }
 
-const clamp10 = (v, dflt) => {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return dflt;
-  return Math.min(10, Math.max(1, Math.round(n)));
-};
+// clamp10 shared via worker/src/lib.js (round6 Task 3; local duplicate
+// removed — every call site passes its default explicitly, so the shared
+// (v, d = 5) signature changes nothing).
 
 // Review-queue verdict tag (audit 2026-09-20-round4 F4): the dated marker a
 // notes PATCH must append when it clears UNREVIEWED. Same shape the health
