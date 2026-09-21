@@ -407,9 +407,11 @@ export async function onRequest(context) {
       // by whether the database answered at all. A total outage keeps the
       // exact outage payload (ok:false, db down, all null, no new key).
       let healthProbeFailures = null;
+      let healthProbeDetail = null;
       if (!healthRes && healthStmts.length) {
         const perProbe = [];
         const failed = [];
+        const failedDetail = {};
         for (let i = 0; i < healthStmts.length; i++) {
           try {
             if (i === 3) perProbe.push(await healthStmts[i].all());
@@ -417,9 +419,14 @@ export async function onRequest(context) {
               const row = await healthStmts[i].first();
               perProbe.push({ results: row ? [row] : [] });
             }
-          } catch {
+          } catch (err) {
             perProbe.push(null);
             failed.push(healthProbeNames[i] || String(i));
+            // Schema-drift hint: name ONLY the missing column (narrow regex on
+            // the driver message) - never the SQL or the raw error text.
+            const driftMsg = err instanceof Error ? err.message : String(err ?? "");
+            const driftMatch = /no such column:\s*([A-Za-z_][A-Za-z0-9_]*)/i.exec(driftMsg);
+            if (driftMatch) failedDetail[healthProbeNames[i] || String(i)] = driftMatch[1];
           }
         }
         if (perProbe.some((r) => r !== null)) {
@@ -428,6 +435,7 @@ export async function onRequest(context) {
           // key: presence of health_probe_failures means at least one probe
           // actually failed (an empty array is truthy, so [] would leak).
           healthProbeFailures = failed.length ? failed : null;
+          healthProbeDetail = Object.keys(failedDetail).length ? failedDetail : null;
         }
       }
       // A batch with zero answering probes reads as an outage, not as zeros:
@@ -479,7 +487,7 @@ export async function onRequest(context) {
           if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
         }
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(5)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(6)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(6)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(7)) ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: (healthDown || probeFailed(8)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(9)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}) });
+      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(5)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(6)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(6)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(7)) ? null : (vettedRow ? vettedRow.n : 0), vetted_no_experiment: (healthDown || probeFailed(8)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(9)) ? null : (noiseRow ? noiseRow.n : 0), time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}) });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({

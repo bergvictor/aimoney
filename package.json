@@ -4,7 +4,7 @@
   "private": true,
   "description": "AIMoney Lab — ranked AI money-making opportunities, research briefs, experiments, and a cron research agent (Cloudflare Pages + Worker + D1).",
   "scripts": {
-    "test": "node --test worker/src/lib.test.js worker/src/index.test.js functions/api/api.test.mjs public/tab-icon.test.mjs public/dashboard.test.mjs",
+    "test": "node --test worker/src/lib.test.js worker/src/index.test.js functions/api/api.test.mjs d1/migrations.test.mjs public/tab-icon.test.mjs public/dashboard.test.mjs",
     "deploy": "./deploy/deploy.sh",
     "verify": "./deploy/verify.sh",
     "worker:dev": "wrangler dev --config worker/wrangler.toml",
