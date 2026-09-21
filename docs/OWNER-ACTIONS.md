@@ -4,7 +4,7 @@ Everything below needs the human owner — no code, cron tick, or agent run can
 do it. Three actions, in order. Dashboard: `https://aimoney.pages.dev`;
 numbers below all come from `https://aimoney.pages.dev/api/health`.
 
-## 1. Clear the Needs-review queue (11 rows, oldest 7.5 days)
+## 1. Clear the Needs-review queue (live count + oldest age in /api/health)
 
 Action: open the Priority tab, click the `Needs review (N · oldest Nd)` chip
 (or the agent pill, which jumps to the same filter), and press one verdict per

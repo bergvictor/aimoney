@@ -105,6 +105,36 @@ else
   done
 fi
 
+# Worker-revision gate: the research worker must serve the deployed commit
+# from GET / (rev stamped at deploy time by deploy/stamp-worker-rev.sh), the
+# same way release.json gates Pages. A mismatch means a stale worker, a
+# queued deploy, or a skipped stamp step.
+if [ "$EXPECTED_REV" = "unknown" ]; then
+  echo "FAIL worker-revision: cannot determine the expected revision (pass it as \$1 or set EXPECTED_REV)"; FAIL=1
+else
+  WBODY="$(curl -fsSL --max-time 25 "$WORKER/?$CB" 2>/dev/null || true)"
+  if [ -z "$WBODY" ]; then
+    echo "FAIL worker-revision: unreachable ($WORKER/)"; FAIL=1
+  else
+    WREV="$(printf '%s' "$WBODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('rev',''))" 2>/dev/null || true)"
+    if [ -z "$WREV" ]; then
+      echo "FAIL worker-revision: unparsable body (not JSON with a rev key)"; FAIL=1
+    elif [ "$WREV" = "unknown" ]; then
+      echo "FAIL worker-revision: placeholder rev unknown (stamp step skipped?)"; FAIL=1
+    else
+      case "$WREV" in
+        "$EXPECTED_REV") echo "ok   worker-revision (${WREV})" ;;
+        "$EXPECTED_REV"*) echo "ok   worker-revision (${WREV} matches ${EXPECTED_REV})" ;;
+        *)
+          case "$EXPECTED_REV" in
+            "$WREV"*) echo "ok   worker-revision (${WREV} matches ${EXPECTED_REV})" ;;
+            *) echo "FAIL worker-revision: stale revision ${WREV}, expected ${EXPECTED_REV}"; FAIL=1 ;;
+          esac ;;
+      esac
+    fi
+  fi
+fi
+
 # Non-empty priority list: the seed (or the agent) must have populated D1.
 N="$(curl -fsSL --max-time 25 "$PAGES/api/opportunities?limit=1&$CB" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('opportunities',[])))" 2>/dev/null || echo 0)"
 if [ "${N:-0}" -ge 1 ]; then

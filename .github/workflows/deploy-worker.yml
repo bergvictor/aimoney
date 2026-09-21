@@ -35,6 +35,10 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      # Worker rev runs via the shared deploy/stamp-worker-rev.sh (same file
+      # deploy/deploy.sh calls) so CI and manual deploys converge.
+      - name: Stamp worker revision
+        run: ./deploy/stamp-worker-rev.sh ${{ github.sha }}
       - run: wrangler deploy --config worker/wrangler.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}

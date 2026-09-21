@@ -65,7 +65,12 @@ echo "==> stamped public/release.json rev=${REV} release=${REL}"
 echo "==> Pages: deploy"
 $WRANGLER pages deploy public --project-name aimoney --commit-dirty=true
 
-# 4. Research worker (cron + AI + D1).
+# 4. Research worker (cron + AI + D1). The rev stamp runs via
+# deploy/stamp-worker-rev.sh (shared with .github/workflows/deploy-worker.yml
+# "Stamp worker revision"): same helper, same file — one home so CI and manual
+# deploys converge.
+echo "==> Worker: stamp revision"
+./deploy/stamp-worker-rev.sh "$FULL"
 echo "==> Worker: deploy"
 $WRANGLER deploy --config worker/wrangler.toml
 

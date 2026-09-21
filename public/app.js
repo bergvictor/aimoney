@@ -1398,7 +1398,7 @@ function openExperimentModal(exp, defaultOpp = null) {
       <label>Metric<input id="m-metric" value="${esc(exp?.metric || "")}"></label>
       <label>Target<input id="m-target" value="${esc(exp?.target || "")}"></label>
       <label>Spent<input id="m-spent" value="${esc(exp?.spent || "")}"></label>
-      <label>Revenue ($)<input id="m-revenue" inputmode="decimal" value="${esc(exp?.revenue_cents ? (exp.revenue_cents / 100) : "")}"></label>
+      <label>Revenue received ($)<input id="m-revenue" inputmode="decimal" value="${esc(exp?.revenue_cents ? (exp.revenue_cents / 100) : "")}"><span class="muted">Only money actually received — counts toward lifetime revenue on save.</span></label>
       <label>Precise spend ($)<input id="m-spend" inputmode="decimal" value="${esc(exp?.spent_cents ? (exp.spent_cents / 100) : "")}"></label>
       <label>Revenue source<input id="m-source" maxlength="120" value="${esc(exp?.revenue_source || "")}"></label>
       <label>Result<input id="m-result" value="${esc(exp?.result || "")}"></label>

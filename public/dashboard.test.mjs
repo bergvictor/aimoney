@@ -1132,6 +1132,7 @@ describe("shipped-JS parse gate (audit 2026-09-20-round2 Task 1)", () => {
       "functions/api/[[path]].js",
       "worker/src/index.js",
       "worker/src/lib.js",
+      "worker/src/rev.js",
     ];
     for (const rel of shipped) {
       const abs = join(REPO, rel);
@@ -2336,5 +2337,27 @@ describe("narrow phones hide the meter columns (audit 2026-09-20-round5 Task 4)"
       assert.ok(!narrow.includes(hook), `760px block ships a dark-mode hook (${hook})`);
     }
     assert.ok(/color-scheme\s*:\s*light/.test(css), "styles.css must keep declaring color-scheme: light");
+  });
+});
+
+describe("experiment modal revenue received-only (audit 2026-09-20-round7 Task 1)", () => {
+  it("modal field reads as received-only with a lifetime-revenue hint", () => {
+    const modal = js.slice(js.indexOf("function openExperimentModal"), js.indexOf('$("#btn-add-exp")'));
+    assert.ok(modal.includes("function openExperimentModal"), "app.js lost the openExperimentModal block boundary");
+    assert.ok(modal.includes('>Revenue received ($)<input id="m-revenue"'), "revenue field must read as received-only");
+    assert.ok(!modal.includes('>Revenue ($)<input id="m-revenue"'), "bare Revenue ($) label must be gone from the modal");
+    assert.ok(modal.includes("Only money actually received"), "revenue field lost its received-only hint");
+    assert.ok(modal.includes("counts toward lifetime revenue on save"), "revenue hint must name the lifetime-revenue effect");
+  });
+
+  it("request shapes and payload keys stay byte-identical", () => {
+    const modal = js.slice(js.indexOf("function openExperimentModal"), js.indexOf('$("#btn-add-exp")'));
+    assert.ok(modal.includes('revenue_cents: Math.max(0, Math.round(Number($("#m-revenue").value.trim()) * 100) || 0)'), "modal lost its revenue payload key or clamp");
+  });
+
+  it("README states the received-only rule beside the money-column docs", () => {
+    const readme = readFileSync(join(ROOT, "..", "README.md"), "utf8");
+    assert.ok(readme.includes("Revenue received ($)"), "README lost the received-only modal label");
+    assert.ok(readme.includes("only money actually received"), "README lost the received-only rule");
   });
 });

@@ -158,6 +158,7 @@ async function aiComplete(env, state, { model, fallback, maxTokens, messages, ti
 }
 
 import { clamp10, slugify, effectiveScore, parseJsonLines, repairJson, tokensMatch } from "./lib.js";
+import { WORKER_REV } from "./rev.js";
 
 // Agent money estimates (F1): the triage verdict may carry est_monthly_low,
 // est_monthly_high, capital_needed, and time_to_first_dollar for "new" rows.
@@ -698,15 +699,18 @@ export default {
       // A dead database must read as unhealthy: ok:false (503) when the
       // last-run read fails or DB is unbound, so the surface and the
       // verify.sh worker-status gate fail closed instead of passing green.
-      if (!env.DB) return json({ ok: false, agent: "research-v1", last_run: null }, 503);
+      // rev answers which code is serving: the deploy-stamped SHA ("unknown"
+      // under wrangler dev), overridable via WORKER_REV for tests and previews.
+      const workerRev = (env.WORKER_REV || "").trim() || WORKER_REV;
+      if (!env.DB) return json({ ok: false, agent: "research-v1", rev: workerRev, last_run: null }, 503);
       let last;
       try {
         last = await env.DB.prepare(
           "SELECT * FROM agent_runs ORDER BY id DESC LIMIT 1").first();
       } catch {
-        return json({ ok: false, agent: "research-v1", last_run: null }, 503);
+        return json({ ok: false, agent: "research-v1", rev: workerRev, last_run: null }, 503);
       }
-      return json({ ok: true, agent: "research-v1", last_run: last });
+      return json({ ok: true, agent: "research-v1", rev: workerRev, last_run: last });
     }
     if (request.method === "GET" && url.pathname === "/ping-ai") {
       const want = (env.ADMIN_TOKEN || "").trim();

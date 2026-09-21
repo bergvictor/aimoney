@@ -7,7 +7,7 @@
     "type": "cloudflare-pages-git-connected",
     "pages_build_output_dir": "public",
     "pages_build_command": "scripts/stamp-release.sh (stamps public/release.json from CF_PAGES_COMMIT_SHA; no framework build)",
-    "worker_build": "wrangler deploy --config worker/wrangler.toml (also .github/workflows on push)",
+    "worker_build": "deploy/stamp-worker-rev.sh + wrangler deploy --config worker/wrangler.toml (also .github/workflows on push)",
     "script": "deploy/deploy.sh",
     "verify_script": "deploy/verify.sh"
   },

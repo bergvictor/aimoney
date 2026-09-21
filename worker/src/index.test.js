@@ -565,21 +565,42 @@ describe("worker root health honesty (audit 2026-09-20-round3 Task 3)", () => {
     }
   });
 
-  it("keeps the healthy shape unchanged, including an empty run log", async () => {
+  it("keeps the healthy shape plus rev, including an empty run log", async () => {
     const row = { id: 1, status: "ok" };
     const okDB = { prepare: () => ({ first: async () => row }) };
     const res = await getRoot({ DB: okDB });
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.deepEqual(Object.keys(body), ["ok", "agent", "last_run"]);
+    assert.deepEqual(Object.keys(body), ["ok", "agent", "rev", "last_run"]);
     assert.equal(body.ok, true);
     assert.equal(body.agent, "research-v1");
+    assert.equal(typeof body.rev, "string");
+    assert.ok(body.rev.length > 0, "healthy root must answer a non-empty rev");
     assert.deepEqual(body.last_run, row);
     // An empty table (null row, answering database) is healthy, not down.
     const emptyDB = { prepare: () => ({ first: async () => null }) };
     const res2 = await getRoot({ DB: emptyDB });
     assert.equal(res2.status, 200);
     assert.equal((await res2.json()).ok, true);
+  });
+
+  it("serves the deploy-stamped rev, overridable via WORKER_REV (audit 2026-09-20-round7 Task 3)", async () => {
+    const okDB = { prepare: () => ({ first: async () => ({ id: 1, status: "ok" }) }) };
+    const stamped = await (await getRoot({ DB: okDB, WORKER_REV: "deadbee" })).json();
+    assert.equal(stamped.rev, "deadbee");
+    const dev = await (await getRoot({ DB: okDB })).json();
+    assert.equal(typeof dev.rev, "string");
+    assert.ok(dev.rev.length > 0, "dev root must still answer a non-empty rev");
+  });
+
+  it("reports its rev even when D1 is dead (audit 2026-09-20-round7 Task 3)", async () => {
+    const failingDB = { prepare: () => ({ first: async () => { throw new Error("D1 down"); } }) };
+    const body = await (await getRoot({ DB: failingDB, WORKER_REV: "deadbee" })).json();
+    assert.equal(body.ok, false);
+    assert.equal(body.rev, "deadbee");
+    const unbound = await (await getRoot({ DB: null })).json();
+    assert.equal(typeof unbound.rev, "string");
+    assert.ok(unbound.rev.length > 0, "an unbound worker must still report its rev");
   });
 });
 
@@ -2253,5 +2274,14 @@ describe("silent worker failures are named (audit 2026-09-20-round5 Task 3)", ()
     for (const m of ["prepass_notes:", "slug_select:failed", "brief_age:failed"]) {
       assert.ok(readme.includes(m), `README lost the ${m} marker`);
     }
+  });
+});
+
+describe("worker never vets (audit 2026-09-20-round7 Task 2)", () => {
+  it("worker source records no vetted verdict and clears no UNREVIEWED marker", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("runResearch"), "positive control: worker source must still own runResearch");
+    assert.ok(!/vetted/i.test(src), "worker must never record a vetted verdict (verdicts are human-only)");
+    assert.ok(!/\.replace(All)?\([^)]*UNREVIEWED/.test(src), "worker must never clear the UNREVIEWED marker with a replace");
   });
 });

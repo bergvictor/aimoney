@@ -262,3 +262,48 @@ describe("gitignore covers local secrets (audit 2026-09-20-round7 Task 3)", () =
     assert.ok(ignored.includes(".dev.vars"), ".gitignore lost the pre-existing .dev.vars line");
   });
 });
+
+describe("worker rev stamp + gate (audit 2026-09-20-round7 Task 3)", () => {
+  it("both callers stamp via the shared helper before deploying the worker", () => {
+    const deploy = read("deploy/deploy.sh");
+    const yml = read(".github/workflows/deploy-worker.yml");
+    assert.ok(deploy.includes("./deploy/stamp-worker-rev.sh"), "deploy.sh must invoke the shared worker-rev stamp");
+    assert.ok(yml.includes("./deploy/stamp-worker-rev.sh"), "workflow must invoke the shared worker-rev stamp");
+    assert.ok(yml.includes("Stamp worker revision"), "workflow must keep the stamp step name");
+    const deployStampAt = deploy.indexOf("./deploy/stamp-worker-rev.sh");
+    const deployAt = deploy.indexOf("deploy --config worker/wrangler.toml");
+    assert.ok(deployAt !== -1 && deployStampAt < deployAt, "deploy.sh must stamp before deploying the worker");
+    const ymlStampAt = yml.indexOf("./deploy/stamp-worker-rev.sh");
+    const ymlDeployAt = yml.indexOf("deploy --config worker/wrangler.toml");
+    assert.ok(ymlDeployAt !== -1 && ymlStampAt < ymlDeployAt, "workflow must stamp before deploying the worker");
+  });
+
+  it("shared helper stamps the full SHA into worker/src/rev.js", () => {
+    const stamp = read("deploy/stamp-worker-rev.sh");
+    assert.ok(stamp.includes("worker/src/rev.js"), "stamp must own worker/src/rev.js");
+    assert.ok(stamp.includes("WORKER_REV"), "stamp must write the WORKER_REV binding");
+    assert.ok(stamp.includes("git rev-parse HEAD"), "stamp fallback must read the full HEAD, not a short form");
+    assert.ok(!stamp.includes("git rev-parse --short"), "stamp must not cut the revision to short");
+    assert.ok(stamp.includes('export const WORKER_REV = "%s"'), "stamp must write a rev.js module");
+  });
+
+  it("worker root serves the stamped rev with an unknown dev default", () => {
+    const worker = read("worker/src/index.js");
+    const rev = read("worker/src/rev.js");
+    assert.ok(worker.includes('from "./rev.js"'), "worker root must read the stamped rev module");
+    assert.ok(worker.includes("rev: workerRev"), "worker root must serve the rev key");
+    assert.ok(rev.includes('WORKER_REV = "unknown"'), "committed rev.js must default to unknown for wrangler dev");
+  });
+
+  it("verify.sh fails a mismatched worker rev the way it fails a stale Pages rev", () => {
+    const verify = read("deploy/verify.sh");
+    assert.ok(verify.includes("json.load(sys.stdin).get('rev'"), "verify.sh must parse the worker rev out of JSON");
+    assert.ok(verify.includes("FAIL worker-revision: unreachable"), "an unreachable worker must fail named");
+    assert.ok(verify.includes("FAIL worker-revision: unparsable body"), "an unparsable worker body must fail named");
+    assert.ok(verify.includes("FAIL worker-revision: placeholder rev unknown"), "an unstamped worker rev must fail named");
+    assert.ok(verify.includes("FAIL worker-revision: stale revision"), "a stale worker rev must fail named");
+    assert.ok(verify.includes("ok   worker-revision"), "a matching worker rev must pass named");
+    assert.ok(verify.includes('case "$WREV" in'), "verify must prefix-match worker full against expected short");
+    assert.ok(verify.includes('case "$EXPECTED_REV" in'), "verify must prefix-match expected full against worker short");
+  });
+});
