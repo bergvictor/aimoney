@@ -256,6 +256,22 @@ function makeDB(seed = {}) {
       }
       return { success: true };
     }
+    if (sql.includes("UPDATE opportunities SET title=")) {
+      // Full PATCH update (audit 2026-09-20-round2 Task 1): persist the row so
+      // Vet→PATCH→health drives end to end on one stubbed D1. Bind order
+      // mirrors updateOpportunity exactly (17 fields + id).
+      const [title, one_liner, category, status, value, effort, confidence, fit, score, est_monthly_low, est_monthly_high, time_to_first_dollar, capital_needed, skills_needed, source, source_url, notes, id] = args;
+      const row = data.opportunities.find((o) => String(o.id) === String(id));
+      if (row) {
+        Object.assign(row, { title, one_liner, category, status, value, effort, confidence, fit, score, est_monthly_low, est_monthly_high, time_to_first_dollar, capital_needed, skills_needed, source, source_url, notes, updated_at: new Date().toISOString() });
+      }
+      return { success: true };
+    }
+    if (sql.includes("UPDATE opportunities SET updated_at")) {
+      const row = data.opportunities.find((o) => String(o.id) === String(args[0]));
+      if (row) row.updated_at = new Date().toISOString();
+      return { success: true };
+    }
     if (sql.includes("UPDATE opportunities SET")) {
       return { success: true };
     }
@@ -1323,7 +1339,7 @@ describe("health outage honesty (audit 2026-09-20-round2 Task 1)", () => {
       assert.equal(r.body[k], null, `health ${k} must be null during a DB outage, not 0`);
     }
     assert.equal(r.body.last_vetted, null, "health last_vetted must be null during a DB outage");
-    assert.deepEqual(r.body.experiments_by_status, {});
+    assert.equal(r.body.experiments_by_status, null, "health experiments_by_status must be null during a DB outage, not {}");
     assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "vetted_no_experiment", "noise_24h", "time"]);
   });
 
@@ -1956,5 +1972,146 @@ describe("experiment update bounds (audit 2026-09-20-round3 Task 2)", () => {
     assert.equal(args[8].length, 30);
     assert.equal(args[9].length, 30);
     assert.equal(args[10].length, 8000);
+  });
+});
+
+describe("vetting path Vet-PATCH-health (audit 2026-09-20-round2 Task 1)", () => {
+  // Real path, not helper units: the dashboard's vettedNotes (extracted from
+  // shipped public/app.js, never copied) builds the PATCH body, which goes
+  // through the real PATCH handler on a stubbed D1, then the real /api/health
+  // on the same rows. Certifies the ONLY unreviewed→vetted route
+  // (public/app.js vetOpportunityInner via vettedNotes → PATCH
+  // /api/opportunities/:id; the worker never vets by design).
+  function shippedVettedNotes() {
+    const appJs = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "public", "app.js"), "utf8");
+    const cleanStart = appJs.indexOf("function cleanUnreviewed");
+    assert.ok(cleanStart !== -1, "app.js lost cleanUnreviewed");
+    const cleanEnd = appJs.indexOf("\n}\n", cleanStart) + 3;
+    const vettedStart = appJs.indexOf("function vettedNotes");
+    assert.ok(vettedStart !== -1, "app.js lost vettedNotes");
+    const vettedEnd = appJs.indexOf("\n}\n", vettedStart) + 3;
+    return new Function(`${appJs.slice(cleanStart, cleanEnd)} ${appJs.slice(vettedStart, vettedEnd)} return vettedNotes;`)();
+  }
+
+  it("Vet PATCH clears UNREVIEWED and health counts +1 vetted with last_vetted today", async () => {
+    const vettedNotes = shippedVettedNotes();
+    const today = new Date().toISOString().slice(0, 10);
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED, scores capped until a human vets it", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" },
+        { id: 2, slug: "b", title: "B", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED, scores capped", created_at: "2026-09-11T00:00:00Z", updated_at: "2026-09-11T00:00:00Z" },
+      ],
+    });
+    const before = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(before.body.unreviewed, 2);
+    assert.equal(before.body.vetted_last_7d, 0);
+    assert.equal(before.body.last_vetted, null);
+
+    const notes = vettedNotes(db.data.opportunities[0].notes);
+    assert.ok(!notes.includes("UNREVIEWED"), "vetted notes must clear UNREVIEWED");
+    assert.ok(notes.includes(`[${today} vetted]`), `vetted notes must carry today's tag, got: ${notes.slice(-80)}`);
+
+    const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      { method: "PATCH", token: "secret", body: { notes } }, db);
+    assert.equal(patch.status, 200);
+
+    const detail = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1", {}, db);
+    assert.ok(!String(detail.body.opportunity.notes).includes("UNREVIEWED"));
+    assert.ok(String(detail.body.opportunity.notes).includes(`[${today} vetted]`));
+
+    const after = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(after.body.unreviewed, 1);
+    assert.equal(after.body.vetted_last_7d, 1);
+    assert.equal(after.body.last_vetted, today);
+  });
+
+  it("a touch without the tag date does not fake velocity (tag contract, not updated_at)", async () => {
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" },
+      ],
+    });
+    const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      { method: "PATCH", token: "secret", body: { notes: "manually cleared, no tag" } }, db);
+    assert.equal(patch.status, 200);
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.body.unreviewed, 0);
+    assert.equal(health.body.vetted_last_7d, 0, "clearing UNREVIEWED without a dated tag must not count as vetted");
+    assert.equal(health.body.last_vetted, null);
+  });
+
+  it("Vet without the admin token 401s and leaves health unchanged", async () => {
+    const vettedNotes = shippedVettedNotes();
+    const db = makeDB({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 2083, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" },
+      ],
+    });
+    const notes = vettedNotes("Agent proposal — UNREVIEWED");
+    const patch = await callApi(["opportunities", "1"], "http://localhost/api/opportunities/1",
+      { method: "PATCH", body: { notes } }, db);
+    assert.equal(patch.status, 401);
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.body.unreviewed, 1);
+    assert.equal(health.body.vetted_last_7d, 0);
+  });
+});
+
+describe("experiments_by_status null on probe failure (audit 2026-09-20-round2 Task 4)", () => {
+  // One bad probe (the GROUP BY status SELECT): the batch rejects and that
+  // statement fails individually too, while the other eleven answer. Mirrors
+  // the lifetime-probe isolation test.
+  const statusProbeDownDB = () => {
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: new Date().toISOString(), revenue_cents: 50000, spent_cents: 1200 },
+        { id: 2, opportunity_id: 1, status: "planned", ended_at: "", revenue_cents: 0, spent_cents: 0 },
+      ],
+    });
+    const realPrepare = db.prepare.bind(db);
+    return {
+      ...db,
+      batch: async () => { throw new Error("no such column: status"); },
+      prepare: (sql) => {
+        const stmt = realPrepare(sql);
+        if (sql.includes("GROUP BY status")) {
+          stmt.all = async () => { throw new Error("no such column: status"); };
+          stmt.first = async () => { throw new Error("no such column: status"); };
+        }
+        return stmt;
+      },
+    };
+  };
+
+  const twoExpSeed = () => ({
+    opportunities: oppSeed(),
+    experiments: [
+      { id: 1, opportunity_id: 1, status: "won", ended_at: new Date().toISOString(), revenue_cents: 50000, spent_cents: 1200 },
+      { id: 2, opportunity_id: 1, status: "planned", ended_at: "", revenue_cents: 0, spent_cents: 0 },
+    ],
+  });
+
+  it("failed status probe reads null (unknown), health_probe_failures names it", async () => {
+    const r = await callApi(["health"], "http://localhost/api/health", {}, statusProbeDownDB());
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.db, "up");
+    assert.equal(r.body.experiments_by_status, null, "failed status probe must read null, not {}");
+    assert.deepEqual(r.body.health_probe_failures, ["experiments_by_status"]);
+    assert.deepEqual(r.body.health_probe_detail, { experiments_by_status: "status" });
+    assert.ok(JSON.stringify(r.body).includes('"ok":true'), "partial payload must keep the verify.sh marker");
+  });
+
+  it("all other keys stay byte-identical when only the status probe fails", async () => {
+    const healthy = await callApi(["health"], "http://localhost/api/health", {}, makeDB(twoExpSeed()));
+    const partial = await callApi(["health"], "http://localhost/api/health", {}, statusProbeDownDB());
+    for (const k of ["opportunities", "unreviewed", "bare_without_brief", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h"]) {
+      assert.deepEqual(partial.body[k], healthy.body[k], `key ${k} changed while only the status probe failed`);
+    }
+    assert.deepEqual(partial.body.last_vetted, healthy.body.last_vetted);
+    assert.deepEqual(healthy.body.experiments_by_status, { won: 1, planned: 1 });
+    assert.equal(partial.body.experiments_by_status, null);
+    assert.deepEqual(Object.keys(partial.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "vetted_no_experiment", "noise_24h", "time", "health_probe_failures", "health_probe_detail"]);
   });
 });

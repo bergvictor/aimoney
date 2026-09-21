@@ -555,9 +555,12 @@ export async function runResearch(env, trigger) {
       if (briefMode === "oldest-first") {
         bare = await selectBareRow(env, "SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL AND o.notes LIKE ? ORDER BY o.created_at ASC LIMIT 1", [String.fromCharCode(37) + "UNREVIEWED" + String.fromCharCode(37)]);
       } else {
+        // Top-scored skips decided rows (audit 2026-09-20-round2 Task 3): a
+        // killed/paused bare row must never consume the brief slot a live row
+        // would have taken. The unreviewed-scoped picks stay byte-identical.
         bare = await selectBareRow(env,
       `SELECT o.* FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id
-       WHERE b.id IS NULL ORDER BY o.score DESC LIMIT 1`, []); } }
+       WHERE b.id IS NULL AND o.status NOT IN ('killed','paused') ORDER BY o.score DESC LIMIT 1`, []); } }
     if (bare) {
       const sigs = await env.DB.prepare(
         "SELECT title, url, snippet FROM signals WHERE opportunity_id = ? ORDER BY id DESC LIMIT 6")

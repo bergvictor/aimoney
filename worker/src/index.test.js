@@ -1247,3 +1247,101 @@ describe("skip classify AI when inflow paused (audit 2026-09-20-round4 Task 3)",
     assert.ok(readme.includes("inflow:paused"), "README lost the inflow:paused marker");
   });
 });
+
+describe("top-scored brief skips killed/paused (audit 2026-09-20-round2 Task 3)", () => {
+  const BRIEF_JSON = JSON.stringify({
+    summary: "Terse summary of the opportunity.", what_works: "Do X.",
+    numbers: [], risks: "Low.", first_steps: "1. Ship the smallest test.",
+  });
+
+  // Two bare rows: a high-score killed row (the old unfiltered top-scored
+  // pick would take it) and a lower-score live row (the fixed pick must take
+  // it). The stub emulates the SQL status filter so the test fails on the old
+  // query (briefs id 8) and passes on the fixed one (briefs id 7).
+  function stubEnv() {
+    const now = new Date().toISOString();
+    const killedBare = { id: 8, title: "Killed bare", one_liner: "decided", score: 99999, status: "killed", notes: "decided", created_at: now };
+    const liveBare = { id: 7, title: "Live bare", one_liner: "needs evidence", score: 9000, status: "researching", notes: "UNREVIEWED", created_at: now };
+    const briefedIds = [];
+    const queries = [];
+    let runError = "";
+    const DB = {
+      prepare(sql) {
+        queries.push(sql);
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("SELECT o.* FROM opportunities o LEFT JOIN briefs")) {
+              if (sql.includes("ORDER BY o.score DESC")) {
+                if (sql.includes("NOT IN ('killed','paused')")) return liveBare;
+                return killedBare;
+              }
+              return liveBare;
+            }
+            if (sql.includes("SELECT created_at FROM opportunities")) return { created_at: now };
+            if (sql.includes("LEFT JOIN briefs")) return { n: 0 };
+            if (sql.includes("FROM opportunities WHERE notes LIKE")) return { n: 1 };
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) return { results: [] };
+            if (sql.includes("SELECT title, url, snippet FROM signals")) {
+              briefedIds.push(stmt.params[0]);
+              return { results: [] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) return { meta: { changes: 0 } };
+            if (sql.includes("UPDATE agent_runs SET finished_at")) runError = String(stmt.params[6] || "");
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = { run: async () => ({ response: BRIEF_JSON }) };
+    return { env: { DB, AI }, briefedIds, queries, runError: () => runError };
+  }
+
+  it("briefs the top live bare row instead of a higher-score killed bare row", async () => {
+    _resetBriefSkippedForTests();
+    const t = stubEnv();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    try {
+      const result = await runResearch(t.env, "cron");
+      assert.equal(result.status, "ok", `run failed: ${result.error || "(no error)"}`);
+      assert.ok(result.briefs >= 1, "tick must write at least one brief");
+      assert.deepEqual(t.briefedIds, [7], "top-scored brief must skip the killed row for the live row");
+      assert.ok(t.runError().includes("brief:top-scored"), `run log must name top-scored mode: ${t.runError()}`);
+      assert.ok(t.queries.some((q) => q.includes("NOT IN ('killed','paused')")), "top-scored query must carry the killed/paused exclusion");
+    } finally {
+      globalThis.fetch = realFetch;
+      _resetBriefSkippedForTests();
+    }
+  });
+
+  it("leaves the unreviewed-scoped picks and gates byte-identical", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("NOT IN ('killed','paused')").length - 1, 1, "exactly the top-scored pick must exclude killed/paused");
+    assert.ok(!src.includes("WHERE b.id IS NULL ORDER BY o.score DESC"), "top-scored pick must no longer be unfiltered");
+    assert.ok(src.includes("WHERE b.id IS NULL AND o.notes LIKE ? ORDER BY o.created_at ASC LIMIT 1"), "oldest-first pick changed");
+    assert.ok(src.includes("WHERE b.id IS NULL AND o.notes LIKE '%UNREVIEWED%'"), "extra-brief pick changed");
+    assert.ok(src.includes("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL"), "bare count changed");
+    assert.ok(src.includes("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%UNREVIEWED%'"), "unreviewed gate changed");
+  });
+
+  it("README documents the decided-row exclusion beside the brief mode", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("top-scored excluding killed/paused"), "README lost the decided-row exclusion");
+  });
+});

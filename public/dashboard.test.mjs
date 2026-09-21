@@ -1199,3 +1199,42 @@ describe("agent pill backlog mirror + review jump (audit 2026-09-20-round4 Task 
     assert.ok(!jump.includes("api(") && !jump.includes("PATCH"), "pill jump must stay read-only");
   });
 });
+
+describe("vetting path contract (audit 2026-09-20-round2 Task 1)", () => {
+  // vettedNotes + cleanUnreviewed extracted from the shipped source (not
+  // copied) so these cases fail if the tag contract drifts.
+  function shippedVetted() {
+    const cleanStart = js.indexOf("function cleanUnreviewed");
+    assert.ok(cleanStart !== -1, "app.js lost cleanUnreviewed");
+    const cleanEnd = js.indexOf("\n}\n", cleanStart) + 3;
+    const vettedStart = js.indexOf("function vettedNotes");
+    assert.ok(vettedStart !== -1, "app.js lost vettedNotes");
+    const vettedEnd = js.indexOf("\n}\n", vettedStart) + 3;
+    return new Function(`${js.slice(cleanStart, cleanEnd)} ${js.slice(vettedStart, vettedEnd)} return { vettedNotes, cleanUnreviewed };`)();
+  }
+
+  it("vettedNotes clears UNREVIEWED and appends today's [YYYY-MM-DD vetted] tag", () => {
+    const { vettedNotes } = shippedVetted();
+    const today = new Date().toISOString().slice(0, 10);
+    const out = vettedNotes("Agent proposal — UNREVIEWED, scores capped until a human vets it");
+    assert.ok(!out.includes("UNREVIEWED"), "vetted notes must clear UNREVIEWED");
+    assert.ok(out.includes(`[${today} vetted]`), `must carry today's tag, got: ${out.slice(-80)}`);
+    assert.ok(out.includes("Human vetted; cap lifted."), "must keep the human-vetted copy");
+    assert.ok(out.length <= 8000, "must respect the 8000-char cap");
+    assert.ok(/\[\d{4}-\d{2}-\d{2} vetted\]/.test(out), "tag must stay greppable as [YYYY-MM-DD vetted]");
+  });
+
+  it("vet path is the only unreviewed-to-vetted route: vettedNotes then PATCH notes", () => {
+    const vetInner = js.slice(js.indexOf("async function vetOpportunityInner"), js.indexOf("async function vetAndLogStarter"));
+    assert.ok(vetInner.includes("vettedNotes(o.notes)"), "vet must build notes via the shared vettedNotes helper");
+    assert.ok(vetInner.includes('method: "PATCH"'), "vet must PATCH");
+    assert.ok(vetInner.includes("body: JSON.stringify({ notes })"), "vet must PATCH exactly the vetted notes");
+    assert.ok(!vetInner.includes("status:"), "plain Vet must keep status (only Starter flips to testing)");
+    const workerJs = readFileSync(join(ROOT, "..", "worker", "src", "index.js"), "utf8");
+    assert.ok(workerJs.includes("The agent PROPOSES"), "worker lost the never-vets docblock");
+    assert.ok(workerJs.includes("never moves status"), "worker lost the never-moves-status guard");
+    for (const bulk of ["vetAll", "autoVet", "bulkVet", "vetQueue", "vetEvery"]) {
+      assert.ok(!js.includes(bulk), `dashboard must not grow a bulk vet path (${bulk})`);
+    }
+  });
+});
