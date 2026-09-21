@@ -1087,3 +1087,163 @@ describe("poison-row brief rotation (audit 2026-09-20-round3 Task 3)", () => {
     _resetBriefSkippedForTests();
   });
 });
+
+describe("skip classify AI when inflow paused (audit 2026-09-20-round4 Task 3)", () => {
+  // Drives the real runResearch on the cron trigger against a stubbed D1:
+  // two unprocessed signals, a classify reply carrying two "new" verdicts,
+  // one bare row for the brief pass, a fresh backlog (top-scored mode, no
+  // extra pass), and an AI router that counts classify vs brief calls by
+  // their prompt bytes (FRESH SIGNALS only appears in the classify prompt).
+  const verdictLine = (n, title) => JSON.stringify({
+    n, action: "new", opportunity_id: null, title,
+    one_liner: "repeatable buyer-paid test service", category: "services",
+    value: 6, effort: 3, confidence: 4, fit: 5,
+    est_monthly_low: 100, est_monthly_high: 500,
+    capital_needed: "$0", time_to_first_dollar: "1-2 weeks",
+  });
+  const CLASSIFY_REPLY = verdictLine(0, "Testable Widget Service") + "\n" + verdictLine(1, "Auditable Prompt Pack") + "\n";
+  const BRIEF_JSON = JSON.stringify({
+    summary: "Terse summary of the opportunity.", what_works: "Do X.",
+    numbers: [], risks: "Low.", first_steps: "1. Ship the smallest test.",
+  });
+
+  function stubEnv({ bare, unreviewed }) {
+    const now = new Date().toISOString();
+    const signals = [
+      { id: 101, source: "hn", title: "Signal A", url: "https://example.com/a", snippet: "s", processed: 0, opportunity_id: null },
+      { id: 102, source: "hn", title: "Signal B", url: "https://example.com/b", snippet: "s", processed: 0, opportunity_id: null },
+    ];
+    const bareRow = { id: 7, title: "Bare row", one_liner: "needs evidence", score: 9000, notes: "UNREVIEWED", created_at: now };
+    const inserted = [];
+    const briefedIds = [];
+    const calls = { classify: 0, brief: 0 };
+    let nextId = 1000;
+    let runError = "";
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("SELECT o.* FROM opportunities o LEFT JOIN briefs")) return bareRow;
+            if (sql.includes("SELECT created_at FROM opportunities")) return { created_at: now };
+            if (sql.includes("LEFT JOIN briefs")) return { n: bare };
+            if (sql.includes("FROM opportunities WHERE notes LIKE")) return { n: unreviewed };
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) {
+              const limit = Number(stmt.params[0]) || signals.length;
+              return { results: signals.filter((s) => s.processed === 0).slice(0, limit) };
+            }
+            if (sql.includes("SELECT title, url, snippet FROM signals")) {
+              briefedIds.push(stmt.params[0]);
+              return { results: [] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("INSERT INTO opportunities")) {
+              inserted.push({ sql, params: stmt.params });
+              return { meta: { last_row_id: nextId++ } };
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1, opportunity_id")) {
+              const [oppId, sigId] = stmt.params;
+              const s = signals.find((x) => x.id === sigId);
+              if (s) { s.processed = 1; s.opportunity_id = oppId; }
+              return {};
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1 WHERE id")) {
+              const s = signals.find((x) => x.id === stmt.params[0]);
+              if (s) s.processed = 1;
+              return {};
+            }
+            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) {
+              return { meta: { changes: 0 } };
+            }
+            if (sql.includes("UPDATE agent_runs SET finished_at")) {
+              runError = String(stmt.params[6] || "");
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = {
+      run: async (_model, opts) => {
+        const text = JSON.stringify((opts && opts.messages) || []);
+        if (text.includes("FRESH SIGNALS")) { calls.classify++; return { response: CLASSIFY_REPLY }; }
+        calls.brief++;
+        return { response: BRIEF_JSON };
+      },
+    };
+    return { env: { DB, AI }, signals, inserted, briefedIds, calls, runError: () => runError };
+  }
+
+  async function runTick(opts) {
+    _resetBriefSkippedForTests();
+    const t = stubEnv(opts);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    try {
+      const result = await runResearch(t.env, "cron");
+      return { result, signals: t.signals, inserted: t.inserted, briefedIds: t.briefedIds, calls: t.calls, runError: t.runError() };
+    } finally {
+      globalThis.fetch = realFetch;
+      _resetBriefSkippedForTests();
+    }
+  }
+
+  it("skips the classify AI call at unreviewed 11, logs inflow:paused, still briefs", async () => {
+    const t = await runTick({ bare: 0, unreviewed: 11 });
+    assert.equal(t.result.status, "ok", `run failed: ${t.result.error || "(no error)"}`);
+    assert.equal(t.calls.classify, 0, "paused tick must make 0 classify AI calls");
+    assert.ok(t.calls.brief >= 1, "paused tick must still run the brief pass");
+    assert.ok(t.result.briefs >= 1, "paused tick must write at least one brief");
+    assert.deepEqual(t.briefedIds, [7], "paused tick must brief the bare row");
+    assert.ok(t.runError.includes("inflow:paused"), `run log must name the pause: ${t.runError}`);
+    assert.equal(t.inserted.length, 0);
+    assert.deepEqual(t.signals.map((s) => s.processed), [0, 0], "paused-tick signals must stay processed = 0 for a later tick");
+  });
+
+  it("classify runs as today at unreviewed <= 10 (cap 2, no pause bit)", async () => {
+    const t = await runTick({ bare: 0, unreviewed: 10 });
+    assert.equal(t.result.status, "ok", `run failed: ${t.result.error || "(no error)"}`);
+    assert.equal(t.calls.classify, 1, "unpaused tick must classify exactly once");
+    assert.equal(t.inserted.length, 2);
+    assert.deepEqual(t.signals.map((s) => s.processed), [1, 1]);
+    assert.ok(!t.runError.includes("inflow:paused"), `unpaused run log must not name a pause: ${t.runError}`);
+  });
+
+  it("bare-backlog drop to 1 survives the moved gate", async () => {
+    const t = await runTick({ bare: 11, unreviewed: 3 });
+    assert.equal(t.result.status, "ok", `run failed: ${t.result.error || "(no error)"}`);
+    assert.equal(t.calls.classify, 1, "bare-gated tick must still classify");
+    assert.equal(t.inserted.length, 1);
+    assert.deepEqual(t.signals.map((s) => s.processed), [1, 0], "the second new-verdict signal must wait for a later tick");
+    assert.ok(!t.runError.includes("inflow:paused"), `bare-gated run log must not name a pause: ${t.runError}`);
+  });
+
+  it("gates sit before the classify pass; the pause bit rides the finish line", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    const gateAt = src.indexOf("let maxNewThisRun = MAX_NEW_PER_RUN;");
+    const verdictsAt = src.indexOf("let verdicts = [];");
+    assert.ok(gateAt !== -1 && verdictsAt !== -1 && gateAt < verdictsAt, "inflow gates must be read before the classify pass");
+    assert.ok(src.includes("if (maxNewThisRun > 0)"), "classify AI call lost its inflow-pause guard");
+    assert.ok(src.includes('maxNewThisRun === 0 ? " inflow:paused" : ""'), "run log lost the inflow:paused disclosure");
+  });
+
+  it("README documents the classify skip beside the pause gate", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("skips the classify AI call entirely"), "README lost the classify skip");
+    assert.ok(readme.includes("inflow:paused"), "README lost the inflow:paused marker");
+  });
+});

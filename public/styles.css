@@ -54,6 +54,8 @@ body {
 .agent-pill .dot { width: 9px; height: 9px; border-radius: 50%; background: #999; }
 .agent-pill.ok .dot { background: var(--green); }
 .agent-pill.bad .dot { background: var(--red); }
+.agent-pill[role="button"] { cursor: pointer; }
+.agent-pill[role="button"]:focus { outline: 2px solid var(--green); outline-offset: 2px; }
 .masthead-actions { display: flex; gap: 8px; }
 .tabs {
   max-width: 1180px; margin: 0 auto; padding: 0 20px;
@@ -113,6 +115,7 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 14px; }
 .ledger tbody tr:last-child td { border-bottom: none; }
 .ledger tbody tr.row { cursor: pointer; }
 .ledger tbody tr.row:hover { background: #fafaf7; }
+.ledger tbody tr.row:focus { outline: 2px solid var(--green); outline-offset: -2px; background: var(--green-wash); }
 .rank { font-family: var(--mono); color: var(--muted); }
 .opp-title { font-weight: 650; }
 .opp-title .cat { font-weight: 400; }

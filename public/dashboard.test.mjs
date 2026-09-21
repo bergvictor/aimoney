@@ -1061,3 +1061,141 @@ describe("shipped-JS parse gate (audit 2026-09-20-round2 Task 1)", () => {
     }
   });
 });
+
+describe("review triage mode V/K + auto-advance (audit 2026-09-20-round4 Task 1)", () => {
+  const triageStart = js.indexOf("/* ---- review triage mode");
+  assert.ok(triageStart !== -1, "app.js lost the review triage mode block");
+  const triage = js.slice(triageStart, js.indexOf('document.querySelectorAll(".filters .chip")', triageStart));
+  const handler = js.slice(js.indexOf("function handleReviewKey"), js.indexOf('document.addEventListener("keydown", handleReviewKey)'));
+
+  it("review rows are keyboard-focusable with a V/K hint; keys bind once", () => {
+    const review = js.slice(js.indexOf("function renderReview"), js.indexOf("const isNeedsReview"));
+    assert.ok(review.includes('tabindex="0"'), "review rows lost their roving tabindex");
+    assert.ok(review.includes("data-review-row="), "review rows lost their data-review-row id");
+    assert.ok(review.includes("V vets this row"), "review rows lost the V/K hint");
+    assert.ok(js.includes("function handleReviewKey"), "app.js lost handleReviewKey");
+    assert.ok(js.includes('document.addEventListener("keydown", handleReviewKey)'), "V/K handler never binds");
+    assert.equal(js.split('document.addEventListener("keydown", handleReviewKey)').length - 1, 1, "V/K handler must bind exactly once");
+    assert.ok(css.includes("tr.row:focus"), "styles lack the focused-row outline");
+  });
+
+  it("V vets and K kills the focused row only, ignoring typing contexts", () => {
+    assert.ok(handler.includes("if (!state.reviewOnly) return;"), "keys must fire only in the review filter");
+    assert.ok(handler.includes('key !== "v"') && handler.includes('key !== "k"'), "handler must route exactly V and K");
+    assert.ok(handler.includes("focusedReviewId()"), "handler must act on the focused row");
+    assert.ok(handler.includes("vetOpportunity(id)"), "V must reuse vetOpportunity");
+    assert.ok(handler.includes("killOpportunity(id,"), "K must reuse killOpportunity");
+    assert.ok(handler.includes('t.tagName === "INPUT"'), "keys must ignore form typing");
+    assert.ok(handler.includes(".pm-inline"), "keys must ignore the open post-mortem row");
+    assert.ok(handler.includes('"dialog"'), "keys must ignore the open modal");
+    assert.ok(handler.includes('"#drawer"'), "keys must ignore the open drawer");
+    assert.ok(handler.includes(".review-actions"), "K must anchor the inline row to the focused row");
+  });
+
+  it("keys stay token-gated through the wrappers; buttons and drawer untouched", () => {
+    assert.ok(!handler.includes("vetOpportunityInner("), "V must route through the token-gated vetOpportunity, not its inner");
+    assert.ok(!handler.includes("killOpportunityInner("), "K must route through the token-gated killOpportunity, not its inner");
+    assert.ok(handler.includes("ev.preventDefault()"), "handled keys must not also trigger focused buttons");
+    assert.ok(js.includes("data-vet="), "review Vet button lost");
+    assert.ok(js.includes("data-kill="), "review Kill button lost");
+    assert.ok(js.includes('id="drawer-vet"'), "drawer Vet path lost");
+    assert.ok(js.includes('id="drawer-kill"'), "drawer Kill path lost");
+  });
+
+  it("each verdict PATCHes exactly its row, then advances focus to the next unreviewed", () => {
+    const vetInner = js.slice(js.indexOf("async function vetOpportunityInner"), js.indexOf("async function vetAndLogStarter"));
+    const doKill = js.slice(js.indexOf("const doKill = async"), js.indexOf("inlinePostMortem(killContainer"));
+    for (const [name, fn] of [["vet", vetInner], ["kill", doKill]]) {
+      assert.equal(fn.split("api(`/api/opportunities/${id}`").length - 1, 1, `${name} must PATCH exactly its row`);
+      assert.ok(fn.includes("const orderBefore = state.reviewList.map((x) => x.id);"), `${name} must snapshot the pre-verdict order`);
+      assert.ok(fn.includes("advanceReviewFocus(id, orderBefore);"), `${name} must advance focus after the verdict`);
+    }
+    const focus = js.slice(js.indexOf("function focusReviewRow"), js.indexOf("function advanceReviewFocus"));
+    assert.ok(focus.includes("#ledger-body td"), "empty queue must focus the empty-queue line");
+    assert.ok(focus.includes("cell.focus()"), "empty-queue line must take focus");
+    assert.ok(focus.includes("tr.focus()"), "next row must take focus");
+    const advance = js.slice(js.indexOf("function advanceReviewFocus"), js.indexOf("function handleReviewKey"));
+    assert.ok(advance.includes("if (!state.reviewOnly) return;"), "advance must not steal focus outside the review filter");
+  });
+
+  it("nextReviewIdAfter prefers the row after the verdict, else first remaining, else null", () => {
+    const start = js.indexOf("function nextReviewIdAfter");
+    assert.ok(start !== -1, "app.js lost nextReviewIdAfter");
+    const next = new Function("state", "orderBefore", "verdictId",
+      `${js.slice(start, js.indexOf("\n}\n", start) + 3)} return nextReviewIdAfter(orderBefore, verdictId);`);
+    const list = (...ids) => ({ reviewList: ids.map((id) => ({ id })) });
+    assert.equal(next(list(2, 3), [1, 2, 3], 1), 2, "must advance to the row after the verdict");
+    assert.equal(next(list(3), [1, 2, 3], 1), 3, "must skip rows that already left the queue");
+    assert.equal(next(list(1), [1, 2, 3], 3), 1, "last-row verdict must wrap to the first remaining row");
+    assert.equal(next(list(), [1], 1), null, "empty queue must report null for the empty-queue line");
+    assert.equal(next(list(2), [1, 2], 9), 2, "unknown verdict id must fall back to the first remaining row");
+  });
+
+  it("no auto path: one keypress vets at most one row, never on a timer or loop", () => {
+    assert.equal(triage.split("vetOpportunity(").length - 1, 1, "triage block must call vetOpportunity exactly once (the V keypress)");
+    assert.equal(triage.split("killOpportunity(").length - 1, 1, "triage block must call killOpportunity exactly once (the K keypress)");
+    assert.ok(!triage.includes("setInterval") && !triage.includes("setTimeout"), "triage must never vet on a timer");
+    for (const bulk of ["vetAll", "autoVet", "bulkVet", "vetQueue", "vetEvery", "forEach"]) {
+      assert.ok(!triage.includes(bulk), `triage block must not grow a bulk path (${bulk})`);
+    }
+  });
+});
+
+describe("agent pill backlog mirror + review jump (audit 2026-09-20-round4 Task 4)", () => {
+  it("reviewBacklogBit renders N to review plus the oldest age (pure, live-shaped payload)", () => {
+    const start = js.indexOf("const reviewBacklogBit");
+    assert.ok(start !== -1, "app.js lost the reviewBacklogBit helper");
+    const bit = new Function(
+      `${js.slice(start, js.indexOf("\n};", start) + 3)} return reviewBacklogBit;`)();
+    assert.equal(bit({ unreviewed: 11, oldest_unreviewed_age_h: 175.5 }), "11 to review · oldest 7d");
+    assert.equal(bit({ unreviewed: 3, oldest_unreviewed_age_h: 5.9 }), "3 to review · oldest 5h");
+    assert.equal(bit({ unreviewed: 2, oldest_unreviewed_age_h: 0.4 }), "2 to review · oldest <1h");
+    assert.equal(bit({ unreviewed: 0, oldest_unreviewed_age_h: null }), "0 to review");
+    assert.equal(bit({ unreviewed: 4 }), "4 to review");
+    assert.equal(bit({}), "", "old backends without the count must keep today's pill");
+    assert.equal(bit(null), "");
+  });
+
+  it("live pill appends the bit to text + title; dot colors and probe tooltip untouched", () => {
+    const live = js.slice(js.indexOf("} else if (last) {"), js.indexOf('$("#runs-body").innerHTML'));
+    assert.ok(live.includes("const backlogBit = reviewBacklogBit(state.health);"), "live pill must derive the bit from the health snapshot");
+    assert.ok(live.includes('if (backlogBit) pill.title += " · " + backlogBit;'), "pill title lost the backlog bit");
+    assert.ok(live.includes('if (backlogBit) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + backlogBit;'), "pill text lost the backlog bit");
+    assert.ok(live.includes('pill.classList.toggle("ok", last.status === "ok")'), "pill ok-toggle must still key off run status");
+    assert.ok(live.includes('pill.classList.toggle("bad", last.status === "error")'), "pill bad-toggle must still key off run status");
+    assert.ok(live.includes("failing probes: "), "pill lost the failing-probes disclosure");
+    assert.ok(live.indexOf("failing probes: ") < live.indexOf('pill.title += " · " + backlogBit'), "probe disclosure must stay ahead of the backlog bit");
+    assert.ok(js.includes('$("#agent-text").textContent = "agent: db down";'), "db-down pill path changed");
+  });
+
+  it("cache persists the backlog keys and paints them before the live refresh lands", () => {
+    const save = js.slice(js.indexOf("function saveLastGood"), js.indexOf("function paintLastGood"));
+    assert.ok(save.includes("unreviewed: (typeof h.unreviewed"), "snapshot lost the unreviewed count");
+    assert.ok(save.includes("oldest_unreviewed_age_h: (typeof h.oldest_unreviewed_age_h"), "snapshot lost the backlog age");
+    const paint = js.slice(js.indexOf("function paintLastGood"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(paint.includes("reviewBacklogBit(snap.health"), "cache paint must derive the bit from the snapshot");
+    assert.ok(paint.includes("(cachedBacklog ? ` · ${cachedBacklog}` : \"\")"), "cached pill text lost the backlog bit");
+    const paintAt = js.indexOf("paintLastGood();");
+    const refreshAt = js.indexOf("refresh().catch");
+    assert.ok(paintAt !== -1 && refreshAt !== -1 && paintAt < refreshAt, "cache paint must run before the live refresh");
+    const live = js.slice(js.indexOf("} else if (last) {"), js.indexOf('$("#runs-body").innerHTML'));
+    assert.ok(live.includes("reviewBacklogBit(state.health)"), "live refresh must repaint the bit from live health, winning over cache");
+  });
+
+  it("served pill is a labelled jump anchor; click/Enter opens the review filter read-only", () => {
+    const pill = html.match(/<div[^>]*id="agent-pill"[^>]*>/);
+    assert.ok(pill, "index.html lost #agent-pill");
+    assert.ok(pill[0].includes('role="button"'), "pill lost its button role");
+    assert.ok(pill[0].includes('tabindex="0"'), "pill lost its keyboard focus");
+    assert.ok(pill[0].includes('data-review-jump="1"'), "pill lost its review-jump anchor");
+    assert.ok(css.includes('.agent-pill[role="button"]'), "styles lack the clickable-pill cursor");
+    assert.ok(js.includes("function jumpToReviewQueue"), "app.js lost jumpToReviewQueue");
+    const jump = js.slice(js.indexOf("function jumpToReviewQueue"), js.indexOf("/* ---- detail drawer ---- */"));
+    assert.ok(jump.includes('activateTab("priority", true)'), "jump must land on the Priority tab");
+    assert.ok(jump.includes('.chip[data-review="1"]'), "jump must target the review chip");
+    assert.ok(jump.includes("chip.click()"), "jump must reuse the review chip handler");
+    assert.ok(jump.includes('addEventListener("click", jumpToReviewQueue)'), "pill click never jumps");
+    assert.ok(jump.includes('"Enter"') && jump.includes('" "'), "pill jump must work from the keyboard");
+    assert.ok(!jump.includes("api(") && !jump.includes("PATCH"), "pill jump must stay read-only");
+  });
+});

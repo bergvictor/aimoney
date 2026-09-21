@@ -190,7 +190,7 @@ function renderReview() {
   const rows = state.reviewList.filter((o) => !state.zeroOnly || isZeroSpend(o));
   const max = Math.max(1, ...rows.map((o) => o.score || 0));
   $("#ledger-body").innerHTML = rows.length ? rows.map((o, i) => `
-    <tr class="row" data-id="${o.id}">
+    <tr class="row" data-id="${o.id}" tabindex="0" data-review-row="${o.id}" title="V vets this row · K opens the post-mortem">
       <td class="num rank">${i + 1}</td>
       <td><div class="opp-title">${esc(o.title)} <span class="cat muted">· ${esc(o.category)}</span></div>
         <div class="opp-sub">${esc(o.one_liner || "")}</div>
@@ -286,6 +286,20 @@ function updateReviewChipTitle() {
     ? `${state.reviewList.length} need review · ${n} without briefs`
     : `${state.reviewList.length} need review`;
 }
+
+// Backlog pill bit (pure, self-contained for tests): "N to review · oldest
+// Xd" from a health-shaped object. "" when the backend never reported a
+// count (old backends keep today's pill); the age hides at 0 or when the
+// backend never reported it. Same age buckets as fmtAgeH.
+const reviewBacklogBit = (health) => {
+  const n = health && health.unreviewed;
+  if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return "";
+  const h = health && health.oldest_unreviewed_age_h;
+  const age = (n > 0 && typeof h === "number" && Number.isFinite(h))
+    ? (h < 1 ? " · oldest <1h" : h < 24 ? ` · oldest ${Math.floor(h)}h` : ` · oldest ${Math.floor(h / 24)}d`)
+    : "";
+  return `${n} to review${age}`;
+};
 
 // Inline one-line post-mortem row: replaces blocking prompt() with an in-page
 // input + Confirm/Cancel so a phone keeps context. Empty confirms cancel with
@@ -436,6 +450,7 @@ async function vetOpportunityInner(id) {
   const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
   if (!o) return;
   const notes = vettedNotes(o.notes);
+  const orderBefore = state.reviewList.map((x) => x.id);
   try {
     await api(`/api/opportunities/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
@@ -445,6 +460,7 @@ async function vetOpportunityInner(id) {
     await refreshTargets({ experiments: false, runs: false });
     await refreshReview();
     if (state.reviewOnly) renderLedger();
+    advanceReviewFocus(id, orderBefore);
   } catch (e) { toast(`Vet failed: ${e.message}`); }
 }
 
@@ -504,6 +520,7 @@ async function killOpportunityInner(id, anchorEl) {
   if (!o) return;
   const day = new Date().toISOString().slice(0, 10);
   const notes = `${cleanUnreviewed(o.notes)}\n[${day} killed] ${pm.trim()}`.trim().slice(-8000);
+  const orderBefore = state.reviewList.map((x) => x.id);
   try {
     await api(`/api/opportunities/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
@@ -513,11 +530,74 @@ async function killOpportunityInner(id, anchorEl) {
     await refreshTargets({ experiments: false, runs: false });
     await refreshReview();
     if (state.reviewOnly) renderLedger();
+    advanceReviewFocus(id, orderBefore);
     if (state.detail) openDrawer(state.detail.opportunity.id);
   } catch (e) { toast(`Kill failed: ${e.message}`); }
   };
   inlinePostMortem(killContainer, { label: "One-line post-mortem (required to kill):", placeholder: "One-line post-mortem (required to kill):", confirmText: "Kill", onSubmit: (pm) => doKill(pm), cancelToast: "Kill cancelled — post-mortem required." });
 }
+
+/* ---- review triage mode: V/K + auto-advance (one human verdict per keypress) ---- */
+// The queue drains one verdict at a time: V vets the focused review row and
+// focuses the next unreviewed row; K opens the inline post-mortem on the
+// focused row, and Confirm kills + advances while Cancel/Esc keeps the row
+// (the inline row owns cancel). Both keys reuse vetOpportunity /
+// killOpportunity, so the token gate, toasts, and refreshes are unchanged and
+// the buttons and drawer paths are untouched. Nothing here vets without a
+// keypress: no timer, no loop over the queue, no bulk call.
+function focusedReviewId() {
+  const el = document.activeElement;
+  const tr = el && el.closest ? el.closest('#ledger-body tr.row[data-id]') : null;
+  return tr ? Number(tr.dataset.id) : null;
+}
+
+// Next focus target after a verdict (pure over the refreshed review list):
+// the first remaining row after the verdict id in the pre-verdict order,
+// else the first remaining row, else null for the empty-queue line.
+function nextReviewIdAfter(orderBefore, verdictId) {
+  const ids = orderBefore || [];
+  const remaining = new Set((state.reviewList || []).map((o) => o.id));
+  const start = ids.indexOf(verdictId);
+  for (let i = start + 1; i < ids.length; i++) {
+    if (remaining.has(ids[i])) return ids[i];
+  }
+  for (const id of ids) {
+    if (remaining.has(id)) return id;
+  }
+  return null;
+}
+
+function focusReviewRow(id) {
+  if (id === null || id === undefined) {
+    const cell = document.querySelector("#ledger-body td");
+    if (cell) { cell.tabIndex = -1; cell.focus(); }
+    return;
+  }
+  const tr = document.querySelector(`#ledger-body tr.row[data-id="${id}"]`);
+  if (tr) tr.focus();
+}
+
+function advanceReviewFocus(verdictId, orderBefore) {
+  if (!state.reviewOnly) return;
+  focusReviewRow(nextReviewIdAfter(orderBefore, verdictId));
+}
+
+function handleReviewKey(ev) {
+  if (!state.reviewOnly) return;
+  if (!ev || ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  const t = ev.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+  if (t && t.closest && (t.closest(".pm-inline") || t.closest("dialog") || t.closest("#drawer"))) return;
+  const key = String(ev.key || "").toLowerCase();
+  if (key !== "v" && key !== "k") return;
+  const id = focusedReviewId();
+  if (id === null || id === undefined || Number.isNaN(id)) return;
+  ev.preventDefault();
+  if (key === "v") { vetOpportunity(id); return; }
+  const tr = document.querySelector(`#ledger-body tr.row[data-id="${id}"]`);
+  killOpportunity(id, (tr && tr.querySelector(".review-actions")) || tr);
+}
+document.addEventListener("keydown", handleReviewKey);
 
 document.querySelectorAll(".filters .chip").forEach((chip) => {
   chip.addEventListener("click", () => {
@@ -728,13 +808,16 @@ function renderRuns() {
     pill.title = "Database unreachable (health.db != up)";
   } else if (last) {
     const noise = state.health && typeof state.health.noise_24h === "number" ? state.health.noise_24h : null;
+    const backlogBit = reviewBacklogBit(state.health);
     pill.title = noise !== null ? "Latest research run: +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise" : "Latest research run";
     const probeFails = probeFailures();
     if (probeFails.length) pill.title += " · failing probes: " + probeFails.map((p) => probeLabel(p, probeDetailMap())).join(", ");
+    if (backlogBit) pill.title += " · " + backlogBit;
     const when = last.finished_at || last.started_at || "";
     $("#agent-text").textContent =
       `agent: ${last.status} · +${last.added}/${last.updated}/${last.briefs} · ${when.slice(0, 16).replace("T", " ")}`;
     if (noise !== null) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + noise + " noise";
+    if (backlogBit) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + backlogBit;
     pill.classList.toggle("ok", last.status === "ok");
     pill.classList.toggle("bad", last.status === "error");
     const runsTab = document.querySelector("#tab-research");
@@ -763,6 +846,23 @@ function renderRuns() {
     : (state.apiFailures.includes("/api/runs")
       ? `<tr><td colspan="10" class="muted">Could not load the research log — see the banner above and retry.</td></tr>`
       : `<tr><td colspan="10" class="muted">No agent runs yet — the first cron pass lands within 6h of deploy.</td></tr>`);
+}
+
+// Review jump: the pill mirrors the backlog count, so clicking it (or
+// Enter/Space on the focused pill) opens the Needs-review filter on the
+// Priority tab. Read-only: reuses the review chip's own click handler.
+function jumpToReviewQueue() {
+  activateTab("priority", true);
+  const chip = document.querySelector('.filters .chip[data-review="1"]');
+  if (chip) chip.click();
+  else { state.reviewOnly = true; refreshReview().then(renderLedger); }
+}
+const agentPillJump = $("#agent-pill");
+if (agentPillJump) {
+  agentPillJump.addEventListener("click", jumpToReviewQueue);
+  agentPillJump.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); jumpToReviewQueue(); }
+  });
 }
 
 /* ---- detail drawer ---- */
@@ -1259,6 +1359,8 @@ function saveLastGood(fresh) {
     snap.health = {
       noise_24h: (typeof h.noise_24h === "number" ? h.noise_24h : null),
       bare_without_brief: (typeof h.bare_without_brief === "number" ? h.bare_without_brief : null),
+      unreviewed: (typeof h.unreviewed === "number" ? h.unreviewed : null),
+      oldest_unreviewed_age_h: (typeof h.oldest_unreviewed_age_h === "number" ? h.oldest_unreviewed_age_h : null),
       savedAt: now,
     };
   }
@@ -1290,12 +1392,15 @@ function paintLastGood() {
   if (run && run.status && $("#agent-text")) {
     const when = String(run.finished_at || run.started_at || "").slice(0, 16).replace("T", " ");
     const noise = snap.health && typeof snap.health.noise_24h === "number" ? snap.health.noise_24h : null;
+    const cachedBacklog = reviewBacklogBit(snap.health || {});
     $("#agent-text").textContent =
       `agent: ${run.status} · +${run.added}/${run.updated}/${run.briefs} · ${when}` +
       (noise !== null ? ` · ${noise} noise` : "") +
+      (cachedBacklog ? ` · ${cachedBacklog}` : "") +
       (isSnapshotStale(run.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "");
     const pill = $("#agent-pill");
     if (pill) pill.title = (noise !== null ? `Latest research run: +${run.added}/${run.updated} · ${noise} noise` : "Latest research run") +
+      (cachedBacklog ? ` · ${cachedBacklog}` : "") +
       (isSnapshotStale(run.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "");
   }
   // Review chip: count + age + tooltip, stale-marked past one tick.

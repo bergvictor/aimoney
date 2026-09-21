@@ -411,43 +411,49 @@ export async function runResearch(env, trigger) {
       // The classify AI call is skipped when fresh is empty (see verdicts guard).
     }
 
-    // 2. One AI pass: classify signals against the live priority list.
-    // Quiet ticks skip the top-60 fetch and the prompt build entirely (F5):
-    // the guarded block runs only with fresh signals, otherwise verdicts
-    // stay [] and the run continues to the brief pass below.
-    let verdicts = [];
-    if (fresh.length) {
-      const opps = await env.DB.prepare(
-        "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
-        .all().then((r) => r.results || []);
-      const classifyPrompt = buildClassifyPrompt(opps, fresh);
-      const isCron = trigger === "cron";
-      verdicts = !fresh.length ? [] : parseJsonLines(await aiComplete(env, state, {
-        model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
-        messages: classifyPrompt,
-        timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
-      }));
-    }
-    // Validate: one verdict per signal (first wins), strict action enum,
-    // numeric-or-null opportunity_id (the model once emitted repo names).
-    const seen = new Set();
-    let newInserts = 0; // new rows inserted this run (capped at maxNewThisRun)
-    // Backlog gate: once per run read bare-without-brief; while it exceeds 10
-    // cap inserts to 1 for that tick so evidence drains faster than inflow.
-    // Overflow stays processed = 0 for a later tick — reversible, no status move.
+    // Inflow gates (read once per run, BEFORE classify): while bare-without-
+    // brief exceeds 10 cap inserts to 1 for that tick so evidence drains
+    // faster than inflow; while UNREVIEWED rows exceed 10 pause inflow
+    // entirely (0 inserts) so the queue drains faster than the agent refills
+    // it. Overflow stays processed = 0 for a later tick — reversible, no
+    // status move. Best-effort: a failed count keeps the looser cap.
     let maxNewThisRun = MAX_NEW_PER_RUN;
     try {
       const bareRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL").first();
       if (bareRow && Number(bareRow.n) > BARE_BACKLOG_CAP) maxNewThisRun = 1;
     } catch { /* bare count failed; keep the default cap */ }
-    // Review-queue gate: while UNREVIEWED rows exceed 10, pause inflow
-    // entirely (0 inserts) so the queue drains faster than the agent refills
-    // it. Overflow stays processed = 0 for a later tick — reversible, no
-    // status move. Best-effort like the bare gate above.
     try {
       const unRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%UNREVIEWED%'").first();
       if (unRow && Number(unRow.n) > UNREVIEWED_BACKLOG_CAP) maxNewThisRun = 0;
     } catch { /* unreviewed count failed; keep the bare-gated cap */ }
+
+    // 2. One AI pass: classify signals against the live priority list.
+    // Quiet ticks skip the top-60 fetch and the prompt build entirely (F5):
+    // the guarded block runs only with fresh signals, otherwise verdicts
+    // stay [] and the run continues to the brief pass below. Inflow-paused
+    // ticks (maxNewThisRun == 0) skip the classify AI call entirely: every
+    // new verdict would overflow back to processed = 0 with a predetermined
+    // outcome, so the tick keeps `fresh` unprocessed and spends its AI
+    // budget on the brief passes below (logged as inflow:paused).
+    let verdicts = [];
+    if (fresh.length) {
+      if (maxNewThisRun > 0) {
+        const opps = await env.DB.prepare(
+          "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
+          .all().then((r) => r.results || []);
+        const classifyPrompt = buildClassifyPrompt(opps, fresh);
+        const isCron = trigger === "cron";
+        verdicts = !fresh.length ? [] : parseJsonLines(await aiComplete(env, state, {
+          model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
+          messages: classifyPrompt,
+          timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
+        }));
+      }
+    }
+    // Validate: one verdict per signal (first wins), strict action enum,
+    // numeric-or-null opportunity_id (the model once emitted repo names).
+    const seen = new Set();
+    let newInserts = 0; // new rows inserted this run (capped at maxNewThisRun, gated above before classify)
     // Verdict writes batch (F3): signal UPDATEs and notes appends accumulate
     // here and go out as ONE env.DB.batch after the loop — the collect phase
     // proved batching cuts ~9s to ~0.5s. New-row INSERTs and the slug-collision
@@ -617,7 +623,7 @@ export async function runResearch(env, trigger) {
     }
     // Single run-log write carrying the brief mode (a bare finish used to run
     // first and be overwritten here).
-    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : ""));
+    await finish("ok", (briefMode === "skipped" ? "" : "brief:" + briefMode) + (maxNewThisRun === 0 ? " inflow:paused" : "") + (state.stale ? ` stale:${state.stale}` : "") + (state.src_fail.length ? ` src_fail:${state.src_fail.join(",")}` : "") + (briefFailed ? " brief:failed" : "") + (briefSkipped.length ? ` brief:skipped:${briefSkipped.join(",")}` : "") + (verdictFailed ? ` verdict:${verdictFailed}_failed` : ""));
     return { status: "ok", ...(!fresh.length ? { note: "no fresh signals" } : {}), ...state };
   } catch (e) {
     await finish("error", e && e.message || e);
