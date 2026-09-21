@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import worker, { agentMoneyEstimates, buildBriefPrompt, buildClassifyPrompt, exactUrlTarget, flushVerdictWrites, insertBrief, parseBriefJson } from "./index.js";
+import worker, { agentMoneyEstimates, buildBriefPrompt, buildClassifyPrompt, exactUrlTarget, flushVerdictWrites, insertBrief, parseBriefJson, runResearch } from "./index.js";
 
 describe("manual run disclosure (/run)", () => {
   it("202 carries briefs_skipped:true with a reason", async () => {
@@ -865,5 +865,123 @@ describe("shared brief-insert helper (audit 2026-09-20-round4 Task 4)", () => {
     assert.equal(src.split("briefFailed = true").length - 1, 2, "both brief catches must record the failure");
     assert.ok(src.includes("const extraBare = bare"), "extra query lost its null-bare branch");
     assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+  });
+});
+
+describe("unreviewed inflow pause (audit 2026-09-20-round2 Task 3)", () => {
+  // Drives the real runResearch against a stubbed D1: two unprocessed
+  // signals, a classify reply carrying two "new" verdicts, and configurable
+  // bare/unreviewed backlog counts. Collectors see zero fresh signals (empty
+  // fetch stub) and the manual trigger skips the brief pass, so the only AI
+  // call is classify.
+  const verdictLine = (n, title) => JSON.stringify({
+    n, action: "new", opportunity_id: null, title,
+    one_liner: "repeatable buyer-paid test service", category: "services",
+    value: 6, effort: 3, confidence: 4, fit: 5,
+    est_monthly_low: 100, est_monthly_high: 500,
+    capital_needed: "$0", time_to_first_dollar: "1-2 weeks",
+  });
+  const CLASSIFY_REPLY = verdictLine(0, "Testable Widget Service") + "\n" + verdictLine(1, "Auditable Prompt Pack") + "\n";
+
+  function stubEnv({ bare, unreviewed }) {
+    const signals = [
+      { id: 101, source: "hn", title: "Signal A", url: "https://example.com/a", snippet: "s", processed: 0, opportunity_id: null },
+      { id: 102, source: "hn", title: "Signal B", url: "https://example.com/b", snippet: "s", processed: 0, opportunity_id: null },
+    ];
+    const inserted = [];
+    let nextId = 1000;
+    const DB = {
+      prepare(sql) {
+        const stmt = {
+          sql,
+          params: [],
+          bind(...p) { stmt.params = p; return stmt; },
+          async first() {
+            if (sql.includes("INSERT INTO agent_runs")) return { id: 1 };
+            if (sql.includes("LEFT JOIN briefs")) return { n: bare };
+            if (sql.includes("FROM opportunities WHERE notes LIKE")) return { n: unreviewed };
+            return null;
+          },
+          async all() {
+            if (sql.includes("SELECT * FROM signals WHERE processed = 0")) {
+              const limit = Number(stmt.params[0]) || signals.length;
+              return { results: signals.filter((s) => s.processed === 0).slice(0, limit) };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes("INSERT INTO opportunities")) {
+              inserted.push({ sql, params: stmt.params });
+              return { meta: { last_row_id: nextId++ } };
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1, opportunity_id")) {
+              const [oppId, sigId] = stmt.params;
+              const s = signals.find((x) => x.id === sigId);
+              if (s) { s.processed = 1; s.opportunity_id = oppId; }
+              return {};
+            }
+            if (sql.startsWith("UPDATE signals SET processed=1 WHERE id")) {
+              const s = signals.find((x) => x.id === stmt.params[0]);
+              if (s) s.processed = 1;
+              return {};
+            }
+            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) {
+              return { meta: { changes: 0 } };
+            }
+            return {};
+          },
+        };
+        return stmt;
+      },
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    };
+    const AI = { run: async () => ({ response: CLASSIFY_REPLY }) };
+    return { env: { DB, AI }, signals, inserted };
+  }
+
+  async function runTick(opts) {
+    const { env, signals, inserted } = stubEnv(opts);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+    try {
+      const result = await runResearch(env, "manual");
+      return { result, signals, inserted };
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("pauses inflow at 0 while unreviewed exceeds 10; overflow stays unprocessed", async () => {
+    const { result, signals, inserted } = await runTick({ bare: 0, unreviewed: 11 });
+    assert.equal(result.status, "ok", `run failed: ${result.error || "(no error)"}`);
+    assert.equal(result.added, 0);
+    assert.equal(inserted.length, 0);
+    assert.deepEqual(signals.map((s) => s.processed), [0, 0], "overflow signals must stay processed = 0 for a later tick");
+  });
+
+  it("keeps the 2-per-run cap at unreviewed <= 10", async () => {
+    const { result, signals, inserted } = await runTick({ bare: 0, unreviewed: 10 });
+    assert.equal(result.status, "ok", `run failed: ${result.error || "(no error)"}`);
+    assert.equal(result.added, 2);
+    assert.equal(inserted.length, 2);
+    assert.deepEqual(signals.map((s) => s.processed), [1, 1]);
+  });
+
+  it("keeps the bare-backlog drop to 1 while unreviewed is within cap", async () => {
+    const { result, signals, inserted } = await runTick({ bare: 11, unreviewed: 3 });
+    assert.equal(result.status, "ok", `run failed: ${result.error || "(no error)"}`);
+    assert.equal(result.added, 1);
+    assert.equal(inserted.length, 1);
+    assert.deepEqual(signals.map((s) => s.processed), [1, 0], "the second new-verdict signal must wait for a later tick");
+  });
+
+  it("README documents the pause beside the bare-backlog gate", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("while unreviewed exceeds 10 the cap drops to 0 for that tick"), "README lost the inflow-pause gate");
+    assert.ok(readme.includes("at most 2 new proposals"), "README lost the inflow cap");
   });
 });

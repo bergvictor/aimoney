@@ -29,7 +29,27 @@ check() { # name, url, grep-pattern
 
 echo "==> verifying ${PAGES} (?${CB})"
 check "dashboard-html"      "$PAGES/?$CB"                  "AIMoney Lab"
-check "dashboard-appjs"     "$PAGES/app.js?$CB"            "renderLedger"
+# dashboard-appjs is PARSED, not just grepped: one SyntaxError anywhere in the
+# bundle kills every dashboard interaction while the renderLedger marker still
+# matches (audit 2026-09-20-round2 F5), so the marker alone cannot gate a
+# rollout. Both must pass: marker present AND node --check clean.
+APPJS_BODY="$(curl -fsSL --max-time 25 "$PAGES/app.js?$CB" 2>/dev/null || true)"
+if [ -z "$APPJS_BODY" ]; then
+  echo "FAIL dashboard-appjs: unreachable ($PAGES/app.js)"; FAIL=1
+elif ! printf '%s' "$APPJS_BODY" | grep -q "renderLedger"; then
+  echo "FAIL dashboard-appjs: marker not found /renderLedger/"; FAIL=1
+elif ! command -v node >/dev/null 2>&1; then
+  echo "FAIL dashboard-appjs: node not found (cannot parse app.js)"; FAIL=1
+else
+  APPJS_DIR="$(mktemp -d)"
+  printf '%s' "$APPJS_BODY" > "$APPJS_DIR/app.js"
+  if node --check "$APPJS_DIR/app.js" 2>"$APPJS_DIR/parse.err"; then
+    echo "ok   dashboard-appjs"
+  else
+    echo "FAIL dashboard-appjs: app.js does not parse as JS ($(tr '\n' ' ' < "$APPJS_DIR/parse.err" | cut -c1-160))"; FAIL=1
+  fi
+  rm -rf "$APPJS_DIR"
+fi
 check "release-marker"      "$PAGES/release.json?$CB"      '"project":"aimoney"'
 check "api-health"          "$PAGES/api/health?$CB"        '"ok":true'
 check "api-priority-list"   "$PAGES/api/opportunities?$CB" '"opportunities"'

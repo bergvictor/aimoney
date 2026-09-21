@@ -134,6 +134,33 @@ describe("shared D1 migration script (audit 2026-09-20-round2 Task 1)", () => {
   });
 });
 
+describe("dashboard-appjs parse gate (audit 2026-09-20-round2 Task 2)", () => {
+  it("requires the served bundle to parse as JS, not merely contain its marker", () => {
+    const verify = read("deploy/verify.sh");
+    const appjsAt = verify.indexOf("dashboard-appjs");
+    assert.ok(appjsAt !== -1, "verify.sh lost the dashboard-appjs check");
+    const block = verify.slice(appjsAt, verify.indexOf('check "release-marker"'));
+    assert.ok(block.includes("renderLedger"), "dashboard-appjs must keep its renderLedger marker");
+    assert.ok(block.includes("node --check"), "dashboard-appjs must parse the bundle with node --check");
+    assert.ok(block.includes("does not parse as JS"), "an unparsable bundle must fail named");
+    assert.ok(block.includes("ok   dashboard-appjs"), "a parsing bundle must pass named");
+  });
+
+  it("fails named when unreachable, markerless, or node is missing", () => {
+    const verify = read("deploy/verify.sh");
+    assert.ok(verify.includes("FAIL dashboard-appjs: unreachable"), "an unreachable app.js must fail named");
+    assert.ok(verify.includes("FAIL dashboard-appjs: marker not found /renderLedger/"), "a markerless app.js must fail named");
+    assert.ok(verify.includes("FAIL dashboard-appjs: node not found"), "a missing node binary must fail named, not pass silent");
+  });
+
+  it("parses fetched bytes from a temp file and cleans up", () => {
+    const verify = read("deploy/verify.sh");
+    assert.ok(verify.includes('APPJS_DIR="$(mktemp -d)"'), "the parse gate must stage bytes in a temp dir");
+    assert.ok(verify.includes('> "$APPJS_DIR/app.js"'), "the parse gate must stage the fetched bytes as app.js");
+    assert.ok(verify.includes('rm -rf "$APPJS_DIR"'), "the parse gate must clean up its temp dir");
+  });
+});
+
 describe("worker-status gate requires ok:true (audit 2026-09-20-round3 Task 3)", () => {
   it("fails a D1-dead worker root that still serves its agent marker", () => {
     const workerChecks = lines(read("deploy/verify.sh")).filter((l) => l.includes("$WORKER/"));

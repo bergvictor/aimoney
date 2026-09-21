@@ -5,7 +5,9 @@
 // missing. Run: npm test (node --test, no framework)
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1023,5 +1025,39 @@ describe("last-good first paint (audit 2026-09-20-round3 Task 2)", () => {
     assert.ok(strip.includes("el.innerHTML ="), "live strip must still repaint on success");
     const rr = js.slice(js.indexOf("async function refreshReview"), js.indexOf("const fmtAgeH"));
     assert.ok(rr.includes("el.textContent = state.reviewList.length"), "review count must still fill from live data");
+  });
+});
+
+describe("shipped-JS parse gate (audit 2026-09-20-round2 Task 1)", () => {
+  const REPO = join(ROOT, "..");
+  const checkParses = (abs) =>
+    spawnSync(process.execPath, ["--check", abs], { encoding: "utf8" });
+
+  it("every shipped JS file parses (node --check), not just contains markers", () => {
+    const shipped = [
+      "public/app.js",
+      "functions/api/[[path]].js",
+      "worker/src/index.js",
+      "worker/src/lib.js",
+    ];
+    for (const rel of shipped) {
+      const abs = join(REPO, rel);
+      assert.ok(existsSync(abs), `shipped file missing: ${rel}`);
+      const r = checkParses(abs);
+      assert.equal(r.status, 0, `${rel} does not parse as JS: ${(r.stderr || "").split("\n").slice(0, 3).join(" ")}`);
+    }
+  });
+
+  it("positive control: the same check fails a broken-syntax fixture", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aimoney-parse-gate-"));
+    try {
+      // Same failure class as the dropped-`}` that killed the dashboard bundle.
+      const broken = join(dir, "broken.js");
+      writeFileSync(broken, "const parts = [\"a\"];\nconst el = {};\nel.innerHTML = `${parts.join(\" \") <button>Retry</button>`;\n");
+      const r = checkParses(broken);
+      assert.notEqual(r.status, 0, "parse gate passed a broken-syntax fixture — it checks nothing");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

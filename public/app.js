@@ -1219,7 +1219,7 @@ function renderApiErrors() {
   const missingCols = schemaMissingColumns();
   if (missingCols.length) parts.push(`Missing columns: ${missingCols.map((c) => esc(c)).join(", ")}.`);
   if (migLine) parts.push(`Schema migration: ${esc(migLine)}`);
-  el.innerHTML = `${parts.join(" ") <button id="api-retry" class="btn small ghost" type="button">Retry</button> <button id="api-dismiss" class="btn small ghost" type="button" aria-label="Dismiss">Dismiss</button>`;
+  el.innerHTML = `${parts.join(" ")} <button id="api-retry" class="btn small ghost" type="button">Retry</button> <button id="api-dismiss" class="btn small ghost" type="button" aria-label="Dismiss">Dismiss</button>`;
   const retry = $("#api-retry");
   if (retry) retry.addEventListener("click", () => refresh());
   const dismiss = $("#api-dismiss");

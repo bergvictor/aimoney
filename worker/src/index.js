@@ -15,6 +15,7 @@ const MAX_SIGNALS_PER_SOURCE = 8;
 const MAX_AI_SIGNALS = 6;
 const MAX_NEW_PER_RUN = 2; // inflow cap: at most 2 new proposals per run (brief capacity is 1+1 per cron tick)
 const BARE_BACKLOG_CAP = 10; // while bare-without-brief exceeds 10, cap inserts to 1 for that tick
+const UNREVIEWED_BACKLOG_CAP = 10; // while unreviewed exceeds 10, pause inflow entirely (0 inserts) for that tick
 const MAX_AI_CALLS = 4;
 const FETCH_TIMEOUT_MS = 6000;
 const CLASSIFY_TOKENS = 1200;
@@ -277,7 +278,7 @@ export async function flushVerdictWrites(env, verdictWrites) {
     return failed;
   }
 }
-async function runResearch(env, trigger) {
+export async function runResearch(env, trigger) {
   const state = { ai_calls: 0, added: 0, updated: 0, briefs: 0, seen: 0, stale: 0, src_fail: [] };
   // Reap runs a killed worker left behind: a "running" row older than the
   // cutoff is dead by definition (a live run finishes in minutes).
@@ -412,6 +413,14 @@ async function runResearch(env, trigger) {
       const bareRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL").first();
       if (bareRow && Number(bareRow.n) > BARE_BACKLOG_CAP) maxNewThisRun = 1;
     } catch { /* bare count failed; keep the default cap */ }
+    // Review-queue gate: while UNREVIEWED rows exceed 10, pause inflow
+    // entirely (0 inserts) so the queue drains faster than the agent refills
+    // it. Overflow stays processed = 0 for a later tick — reversible, no
+    // status move. Best-effort like the bare gate above.
+    try {
+      const unRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities WHERE notes LIKE '%UNREVIEWED%'").first();
+      if (unRow && Number(unRow.n) > UNREVIEWED_BACKLOG_CAP) maxNewThisRun = 0;
+    } catch { /* unreviewed count failed; keep the bare-gated cap */ }
     // Verdict writes batch (F3): signal UPDATEs and notes appends accumulate
     // here and go out as ONE env.DB.batch after the loop — the collect phase
     // proved batching cuts ~9s to ~0.5s. New-row INSERTs and the slug-collision
