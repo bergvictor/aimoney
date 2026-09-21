@@ -83,6 +83,16 @@ function makeDB(seed = {}) {
       for (const e of data.experiments) counts[e.status] = (counts[e.status] || 0) + 1;
       return { results: Object.entries(counts).map(([status, n]) => ({ status, n })) };
     }
+    if (sql.includes("FROM briefs WHERE opportunity_id")) {
+      const rows = data.briefs.filter((b) => String(b.opportunity_id) === String(args[0]))
+        .sort((a, b) => (b.version || 0) - (a.version || 0)).slice(0, 5);
+      return { results: rows };
+    }
+    if (sql.includes("FROM experiments WHERE opportunity_id")) {
+      const rows = data.experiments.filter((e) => String(e.opportunity_id) === String(args[0]))
+        .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+      return { results: rows };
+    }
     if (sql.includes("FROM agent_runs")) {
       const limit = Number(args[0]) || 20;
       const rows = data.runs.slice().sort((a, b) => b.id - a.id).slice(0, limit);
@@ -256,7 +266,7 @@ function makeDB(seed = {}) {
       return (stmts || []).map((s) => {
         const sql = (s && s._sql) || "";
         const args = (s && s._args) || [];
-        if (sql.includes("GROUP BY status")) return handleAll(sql, args);
+        if (sql.includes("GROUP BY status") || sql.includes("FROM briefs WHERE opportunity_id") || sql.includes("FROM experiments WHERE opportunity_id")) return handleAll(sql, args);
         const row = handleFirst(sql, args);
         return { results: row ? [row] : [] };
       });
@@ -1273,5 +1283,54 @@ describe("one-click Lose (audit 2026-09-20-round2 Task 2)", () => {
     assert.ok(noPm.body.fields && noPm.body.fields.post_mortem);
     assert.equal(db.data.experiments[0].status, "planned");
     assert.equal(db.data.experiments[0].ended_at, "");
+  });
+});
+
+describe("batched detail + notes-only shape (audit 2026-09-20-round3 Task 3)", () => {
+  const detailSeed = () => ({
+    opportunities: oppSeed(),
+    briefs: [
+      { id: 1, opportunity_id: 2, version: 1, summary: "v1", first_steps: "s1" },
+      { id: 2, opportunity_id: 2, version: 2, summary: "v2", first_steps: "s2" },
+    ],
+    experiments: [
+      { id: 1, opportunity_id: 2, name: "Old", status: "planned", updated_at: "2026-01-01T00:00:00Z" },
+      { id: 2, opportunity_id: 2, name: "New", status: "running", updated_at: "2026-02-01T00:00:00Z" },
+    ],
+  });
+
+  it("serves the three detail SELECTs in one batch with a byte-identical payload", async () => {
+    const db = makeDB(detailSeed());
+    const r = await callApi(["opportunities", "2"], "http://localhost/api/opportunities/2", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(db._batchCalls, 1, "detail must issue exactly one DB.batch");
+    assert.equal((db._prepared || []).length, 3, "detail must prepare exactly 3 statements");
+    assert.deepEqual(Object.keys(r.body), ["opportunity", "briefs", "experiments"]);
+    assert.equal(r.body.opportunity.id, 2);
+    assert.equal(r.body.opportunity.score, 6000);
+    assert.ok(String(r.body.opportunity.notes).includes("UNREVIEWED"));
+    assert.deepEqual(r.body.briefs.map((b) => b.version), [2, 1]);
+    assert.deepEqual(r.body.experiments.map((e) => e.name), ["New", "Old"]);
+  });
+
+  it("?only=notes returns just { opportunity } with full notes and the capped score", async () => {
+    const db = makeDB(detailSeed());
+    const r = await callApi(["opportunities", "2"], "http://localhost/api/opportunities/2?only=notes", {}, db);
+    assert.equal(r.status, 200);
+    assert.deepEqual(Object.keys(r.body), ["opportunity"]);
+    assert.ok(String(r.body.opportunity.notes).includes("UNREVIEWED"), "notes-only lost the full notes writers append to");
+    assert.equal(r.body.opportunity.score, 6000);
+    assert.equal(db._batchCalls || 0, 0, "notes-only must stay a single SELECT, not a batch");
+  });
+
+  it("both shapes 404 on unknown id; other ?only values keep the full shape", async () => {
+    const db = makeDB(detailSeed());
+    const missing = await callApi(["opportunities", "999"], "http://localhost/api/opportunities/999", {}, db);
+    assert.equal(missing.status, 404);
+    const missingNotes = await callApi(["opportunities", "999"], "http://localhost/api/opportunities/999?only=notes", {}, db);
+    assert.equal(missingNotes.status, 404);
+    const other = await callApi(["opportunities", "2"], "http://localhost/api/opportunities/2?only=nope", {}, db);
+    assert.equal(other.status, 200);
+    assert.deepEqual(Object.keys(other.body), ["opportunity", "briefs", "experiments"]);
   });
 });

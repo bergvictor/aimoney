@@ -268,6 +268,10 @@ async function runResearch(env, trigger) {
     // signal URL is linked as supports before triage — reversible, notes
     // newest-kept, no status move. Linked rows leave `fresh` in place, so the
     // classify prompt and verdict indices below only see genuinely new signals.
+    // Verdict writes batch (F3): the exact-URL pre-pass pushes its signal
+    // UPDATEs and notes appends here too, and the single flush after the
+    // verdict loop below covers both — no inline awaits in the pre-pass.
+    const verdictWrites = [];
     if (fresh.length) {
       // Bounded pre-pass (F4): match only the ≤6 fresh URLs in SQL instead of
       // loading two full-table URL sets. Empty URLs never match (exactUrlTarget
@@ -289,8 +293,8 @@ async function runResearch(env, trigger) {
         const target = exactUrlTarget(sig.url, oppUrls, linkedUrls);
         if (target === null) { rest.push(sig); continue; }
         state.updated++;
-        await env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(target, sig.id).run();
-        await env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, target).run().catch(() => null);
+        verdictWrites.push(env.DB.prepare("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?").bind(target, sig.id));
+        verdictWrites.push(env.DB.prepare(`UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).bind(`\n[signal ${new Date().toISOString().slice(0, 10)}] ${sig.title} — ${sig.url}`, target));
       }
       fresh.length = 0;
       fresh.push(...rest);
@@ -337,7 +341,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
     // lookup stay inline since they branch. A failed batch loses this tick's
     // verdict writes (signals stay unprocessed, retried next tick) — the same
     // tradeoff round 2's health batching already accepted.
-    const verdictWrites = [];
+    // (verdictWrites is declared above the pre-pass; pre-pass + verdict writes flush together below.)
     for (const v of verdicts) {
       if (!v || typeof v !== "object") continue;
       const n = Number(v.n);
@@ -594,4 +598,3 @@ export default {
     return json({ error: "not found" }, 404);
   },
 };
-

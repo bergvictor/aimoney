@@ -433,10 +433,10 @@ describe("closed-experiment money in drawer (audit 2026-09-20-round3 Task 1)", (
 });
 
 describe("token modal + inline post-mortem (audit 2026-09-20-round3 Task 2)", () => {
-  it("Vet/Kill/Start/Lose/Win/Starter open the admin modal when the token is missing", () => {
+  it("Vet/Kill/Start/Lose/Win/Starter/Add/Log/Run open the admin modal when the token is missing", () => {
     assert.ok(js.includes("function openAdminModal"), "app.js lost openAdminModal");
     assert.ok(js.includes('openAdminModal("Enter the admin token first.")'), "gated taps must open the admin modal with the toast text as subnote");
-    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 9, "Vet/Kill/Starter wrappers + Vet/Kill/Start/Lose/Win/Starter handlers must all open the modal");
+    assert.equal(js.split('openAdminModal("Enter the admin token first.")').length - 1, 12, "Vet/Kill/Starter wrappers + Vet/Kill/Start/Lose/Win/Starter/Add/Log/Run handlers must all open the modal");
     assert.ok(js.includes("[data-admin-subnote]"), "modal must pin the subnote");
     assert.ok(js.includes('$("#btn-admin").click()'), "openAdminModal must reuse the Admin showModal block");
   });
@@ -543,7 +543,7 @@ describe("win revenue source (audit 2026-09-20-round3 Task 2)", () => {
   it("empty post-mortem line still cancels with the row untouched", () => {
     const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
     assert.ok(winRow.includes("if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }"), "Win empty line must cancel with the row untouched");
-    assert.ok(winRow.includes("onSubmit(pm, revenueCents, revenueSource)"), "Win submit must pass the source through");
+    assert.ok(winRow.includes("onSubmit(pm, revenueCents, revenueSource, spentCents)"), "Win submit must pass the source and spend through");
   });
 });
 
@@ -748,16 +748,16 @@ describe("needs_review bit + detail-before-write (audit 2026-09-20-round3 Task 2
     assert.ok(!strip.includes("api(`/api/opportunities/${top.id}`)"), "strip must not fetch the detail endpoint");
   });
 
-  it("Vet, Vet-&-starter, and Kill fetch detail first, then append byte-identical tags", () => {
+  it("Vet, Vet-&-starter, and Kill fetch notes-only detail first, then append byte-identical tags", () => {
     for (const [name, start, end] of [
       ["vet", "async function vetOpportunity", "async function vetOpportunityInner"],
       ["starter", "async function vetAndLogStarter", "async function vetAndLogStarterInner"],
       ["kill", "async function killOpportunity", "async function killOpportunityInner"],
     ]) {
       const fn = js.slice(js.indexOf(start), js.indexOf(end));
-      assert.ok(fn.includes("api(`/api/opportunities/${id}`)"), `${name} must GET the detail endpoint first`);
+      assert.ok(fn.includes("api(`/api/opportunities/${id}?only=notes`)"), `${name} must GET the notes-only detail shape first`);
       assert.ok(fn.includes("o.notes = d.opportunity.notes"), `${name} must stash full detail notes for the write`);
-      assert.ok(fn.indexOf("api(`/api/opportunities/${id}`)") < fn.indexOf("Inner(id"), `${name} must fetch before delegating to the write`);
+      assert.ok(fn.indexOf("api(`/api/opportunities/${id}?only=notes`)") < fn.indexOf("Inner(id"), `${name} must fetch before delegating to the write`);
     }
     assert.ok(js.includes("[${day} vetted] Human vetted; cap lifted."), "vetted tag changed");
     assert.ok(js.includes("[${day} killed] ${pm.trim()}"), "killed tag changed");
@@ -776,5 +776,92 @@ describe("meta once + delayed-only triage refresh (audit 2026-09-20-round1 Task 
     const fn = js.slice(js.indexOf('$("#btn-run")'), js.indexOf("/* ---- read-only warnings"));
     assert.ok(fn.includes("setTimeout(refresh, 45000)"), "manual run lost its delayed refresh");
     assert.ok(!fn.includes("await refresh()"), "manual run still paints an immediate no-op refresh");
+  });
+});
+
+// Audit round-3 task suites live inside this group (closed by the file's trailing closers).
+describe("audit 2026-09-20-round3 proposed tasks", () => {
+  describe("dashboard", () => {
+describe("review outage honesty + token modal for Add/Log/Run (audit 2026-09-20-round3 Task 1)", () => {
+  it("failed opportunities fetch keeps the stale list instead of overwriting with []", () => {
+    const rt = js.slice(js.indexOf("async function refreshTargets"));
+    assert.ok(rt.includes('state.apiFailures.push("/api/opportunities"); return null;'), "opps failure must resolve null so the stale list survives");
+    assert.ok(!rt.includes("return { opportunities: [] };"), "opps failure still wipes the list with []");
+    assert.ok(rt.includes("if (opps) state.opportunities = opps.opportunities || [];"), "stale list must survive a null fetch");
+  });
+
+  it("review empty-state shows the failure + Retry wording like the ledger, never the all-clear", () => {
+    const fn = js.slice(js.indexOf("function renderReview"), js.indexOf("// Review queue derivation"));
+    assert.ok(fn.includes('state.apiFailures.includes("/api/opportunities")'), "review empty-state lost its failure check");
+    assert.ok(fn.includes("Could not load the review queue"), "review empty-state lost the failure copy");
+    assert.ok(fn.includes("see the banner above and retry"), "review empty-state lost the Retry wording");
+    assert.ok(fn.includes("Review queue empty"), "review empty-state lost the genuine all-clear copy");
+    assert.ok(fn.indexOf("Could not load the review queue") < fn.indexOf("Review queue empty"), "failure copy must win over the all-clear");
+  });
+
+  it("Add-opportunity, Log-experiment, and Run-triage open the admin modal with a subnote", () => {
+    const add = js.slice(js.indexOf('$("#btn-add")'), js.indexOf("function openExperimentModal"));
+    assert.ok(add.includes('openAdminModal("Enter the admin token first.")'), "Add must open the admin modal without a token");
+    assert.ok(!add.includes('return toast("Enter the admin token first.")'), "Add still dead-ends in a toast");
+    const logFn = js.slice(js.indexOf("function openExperimentModal"), js.indexOf('$("#btn-add-exp")'));
+    assert.ok(logFn.includes('openAdminModal("Enter the admin token first.")'), "Log experiment must open the admin modal without a token");
+    assert.ok(!logFn.includes('return toast("Enter the admin token first.")'), "Log experiment still dead-ends in a toast");
+    const run = js.slice(js.indexOf('$("#btn-run")'), js.indexOf("/* ---- read-only warnings"));
+    assert.ok(run.includes('openAdminModal("Enter the admin token first.")'), "Run triage must open the admin modal without a token");
+    assert.ok(!run.includes('return toast("Enter the admin token first.")'), "Run triage still dead-ends in a toast");
+    assert.ok(run.includes("Run triage now (briefs on cron)"), "run button lost its triage-only copy");
+  });
+});
+
+describe("one-click Win/Lose spend (audit 2026-09-20-round3 Task 2)", () => {
+  it("Win inline row owns an optional spend-$ input beside revenue, source, and post-mortem", () => {
+    const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
+    assert.ok(winRow.includes("dataset.winSpend"), "Win row lacks its spend input");
+    assert.ok(winRow.includes("Spend $ (optional)"), "Win spend input lost its optional copy");
+    assert.ok(winRow.includes("row.appendChild(spend)"), "Win row must render the spend input");
+    assert.ok(winRow.indexOf("row.appendChild(spend)") > winRow.indexOf("row.appendChild(source)"), "spend must sit beside revenue + source");
+    assert.ok(winRow.indexOf("row.appendChild(spend)") < winRow.indexOf("row.appendChild(input)"), "spend must sit before the post-mortem line");
+  });
+
+  it("Lose inline row owns an optional spend-$ input; Kill keeps the single input", () => {
+    const pmRow = js.slice(js.indexOf("function inlinePostMortem"), js.indexOf("function inlineWinClose"));
+    assert.ok(pmRow.includes("withSpend"), "inlinePostMortem lost the withSpend flag");
+    assert.ok(pmRow.includes("dataset.pmSpend"), "lose row lacks its spend input");
+    assert.ok(pmRow.includes("Spend $ (optional)"), "lose spend input lost its optional copy");
+    assert.ok(js.includes("withSpend: true"), "lose must open the row with spend enabled");
+    const kill = js.slice(js.indexOf("async function killOpportunityInner"), js.indexOf('document.querySelectorAll(".filters .chip")'));
+    assert.ok(!kill.includes("withSpend"), "kill must keep the single post-mortem input");
+  });
+
+  it("inline spend clamps to 0 exactly like the modal; empty still cancels with the row untouched", () => {
+    assert.ok(js.includes('Math.max(0, Math.round(Number($("#m-spend").value.trim()) * 100) || 0)'), "modal lost its spend clamp");
+    assert.ok(js.includes("Math.max(0, Math.round(Number(spend.value.trim()) * 100) || 0)"), "Win must clamp the inline spend exactly like the modal");
+    assert.ok(js.includes("Math.max(0, Math.round(Number(spendEl.value.trim()) * 100) || 0)"), "Lose must clamp the inline spend exactly like the modal");
+    const winRow = js.slice(js.indexOf("function inlineWinClose"), js.indexOf("function cleanUnreviewed"));
+    assert.ok(winRow.includes("if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }"), "Win empty line must cancel with the row untouched");
+  });
+
+  it("close sends spent_cents; $0 closes render exactly as today", () => {
+    assert.ok(js.includes("spent_cents: spentCents"), "Win/Lose close must send spent_cents");
+    const lose = js.slice(js.indexOf("async function loseExperiment"), js.indexOf("async function winExperiment"));
+    assert.ok(lose.includes('status: "lost"'), "Lose must still PATCH status=lost");
+    assert.ok(lose.includes("result: pm.trim(), post_mortem: pm.trim()"), "Lose must still send the line as result + post-mortem");
+    assert.ok(js.includes("e.spent_cents > 0 ?"), "$0 closes must keep rendering without the spend figure");
+  });
+});
+
+describe("notes-only write prefetches (audit 2026-09-20-round3 Task 3)", () => {
+  it("exactly the three write-path prefetches use ?only=notes", () => {
+    assert.equal(js.split("?only=notes").length - 1, 3, "only Vet, Vet-&-starter, and Kill may prefetch notes-only");
+  });
+
+  it("drawer keeps the full detail fetch (briefs + experiments)", () => {
+    const drawer = js.slice(js.indexOf("async function openDrawer"), js.indexOf("function closeDrawer"));
+    assert.ok(drawer.includes("api(`/api/opportunities/${id}`)"), "drawer must keep the full detail fetch");
+    assert.ok(!drawer.includes("?only=notes"), "drawer must not use the notes-only shape");
+    assert.ok(drawer.includes("d.briefs[0]"), "drawer lost its brief render");
+    assert.ok(drawer.includes("d.experiments.length"), "drawer lost its experiments render");
+  });
+});
   });
 });

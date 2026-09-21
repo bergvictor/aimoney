@@ -203,7 +203,9 @@ function renderReview() {
       <td class="num money">${money(o.est_monthly_low, o.est_monthly_high)}</td>
       <td class="muted">${esc(o.time_to_first_dollar || "—")}</td>
     </tr>`).join("")
-    : `<tr><td colspan="10" class="muted">Review queue empty — every agent proposal has been vetted or killed.</td></tr>`;
+    : (state.apiFailures.includes("/api/opportunities")
+      ? `<tr><td colspan="10" class="muted">Could not load the review queue — see the banner above and retry.</td></tr>`
+      : `<tr><td colspan="10" class="muted">Review queue empty — every agent proposal has been vetted or killed.</td></tr>`);
   document.querySelectorAll("#ledger-body tr.row").forEach((tr) => {
     tr.addEventListener("click", () => openDrawer(Number(tr.dataset.id)));
   });
@@ -280,8 +282,10 @@ function updateReviewChipTitle() {
 // Inline one-line post-mortem row: replaces blocking prompt() with an in-page
 // input + Confirm/Cancel so a phone keeps context. Empty confirms cancel with
 // the row untouched; the API closure gate (result + post_mortem required)
-// stays unchanged. Returns false when a row is already open.
-function inlinePostMortem(container, { label, placeholder, confirmText, onSubmit, cancelToast }) {
+// stays unchanged. With withSpend, an optional spend-$ input is prepended and
+// its clamped cents pass as the second onSubmit arg (lose rows only; kill
+// rows keep the single input). Returns false when a row is already open.
+function inlinePostMortem(container, { label, placeholder, confirmText, onSubmit, cancelToast, withSpend = false }) {
   if (!container) return false;
   if (container.querySelector("[data-pm-input]")) return false;
   const row = document.createElement("div");
@@ -305,8 +309,10 @@ function inlinePostMortem(container, { label, placeholder, confirmText, onSubmit
   const submit = () => {
     const pm = input.value;
     if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }
+    const spendEl = row.querySelector("[data-pm-spend]");
+    const spentCents = spendEl ? Math.max(0, Math.round(Number(spendEl.value.trim()) * 100) || 0) : 0;
     cleanup();
-    onSubmit(pm);
+    onSubmit(pm, spentCents);
   };
   ok.addEventListener("click", (ev) => { ev.stopPropagation(); submit(); });
   input.addEventListener("keydown", (ev) => {
@@ -317,6 +323,21 @@ function inlinePostMortem(container, { label, placeholder, confirmText, onSubmit
   row.appendChild(ok);
   row.appendChild(cancel);
   container.appendChild(row);
+  if (withSpend) {
+    const spend = document.createElement("input");
+    spend.type = "text";
+    spend.dataset.pmSpend = "1";
+    spend.placeholder = "Spend $ (optional)";
+    spend.setAttribute("aria-label", "Spend in dollars");
+    spend.inputMode = "decimal";
+    spend.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+      if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
+    });
+    row.prepend(spend);
+    spend.focus();
+    return true;
+  }
   input.focus();
   return true;
 }
@@ -324,7 +345,9 @@ function inlinePostMortem(container, { label, placeholder, confirmText, onSubmit
 // human-entered revenue input, so a win costs the same single click as a loss.
 // Empty lines cancel with the row untouched; bad/negative $ clamps to 0
 // exactly like the modal; the source truncates to 120 chars like the modal and
-// empty renders exactly as today (no via bit). Returns false when a row is already open.
+// empty renders exactly as today (no via bit). An optional spend-$ input rides
+// beside revenue so quick closes record spend like the modal (empty clamps to
+// 0 and renders unchanged). Returns false when a row is already open.
 function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, cancelToast }) {
   if (!container) return false;
   if (container.querySelector("[data-pm-input]")) return false;
@@ -342,6 +365,12 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
   source.placeholder = "Revenue source (optional)";
   source.setAttribute("aria-label", "Revenue source");
   source.maxLength = 120;
+  const spend = document.createElement("input");
+  spend.type = "text";
+  spend.dataset.winSpend = "1";
+  spend.placeholder = "Spend $ (optional)";
+  spend.setAttribute("aria-label", "Spend in dollars");
+  spend.inputMode = "decimal";
   const input = document.createElement("input");
   input.type = "text";
   input.dataset.pmInput = "1";
@@ -363,8 +392,9 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
     if (!pm || !pm.trim()) { cleanup(); toast(cancelToast); return; }
     const revenueCents = Math.max(0, Math.round(Number(amount.value.trim()) * 100) || 0);
     const revenueSource = source.value.trim().slice(0, 120);
+    const spentCents = Math.max(0, Math.round(Number(spend.value.trim()) * 100) || 0);
     cleanup();
-    onSubmit(pm, revenueCents, revenueSource);
+    onSubmit(pm, revenueCents, revenueSource, spentCents);
   };
   ok.addEventListener("click", (ev) => { ev.stopPropagation(); submit(); });
   input.addEventListener("keydown", (ev) => {
@@ -379,8 +409,13 @@ function inlineWinClose(container, { label, placeholder, confirmText, onSubmit, 
     if (ev.key === "Enter") { ev.preventDefault(); submit(); }
     if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
   });
+  spend.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    if (ev.key === "Escape") { ev.preventDefault(); cleanup(); toast(cancelToast); }
+  });
   row.appendChild(amount);
   row.appendChild(source);
+  row.appendChild(spend);
   row.appendChild(input);
   row.appendChild(ok);
   row.appendChild(cancel);
@@ -394,12 +429,13 @@ function cleanUnreviewed(notes) {
 }
 
 async function vetOpportunity(id) {
-  // Detail-before-write (F2): list rows no longer ship notes, so the full
-  // body is fetched first and stashed on the list row for the write below.
-  // Transient write-path cache — the post-write refresh replaces the row.
+  // Notes-before-write: list rows ship the needs_review bit instead of notes,
+  // so the notes-only detail shape is fetched first and stashed on the list
+  // row for the write below. Transient cache — the post-write refresh
+  // replaces the row.
   if (!state.token) return openAdminModal("Enter the admin token first.");
   try {
-    const d = await api(`/api/opportunities/${id}`);
+    const d = await api(`/api/opportunities/${id}?only=notes`);
     const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
     if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
   } catch (e) { toast(`Vet failed: ${e.message}`); return; }
@@ -433,11 +469,11 @@ async function vetOpportunityInner(id) {
 // behind one tap. Token-gated like vetOpportunity; the toast carries a Start
 // shortcut for the created experiment. Human-pressed, one decision.
 async function vetAndLogStarter(id) {
-  // Detail-before-write (F2): see vetOpportunity — the starter's vetted tag
-  // appends to full detail notes, not the bit-only list row.
+  // Notes-before-write: see vetOpportunity — the starter's vetted tag
+  // appends to notes-only detail, not the bit-only list row.
   if (!state.token) return openAdminModal("Enter the admin token first.");
   try {
-    const d = await api(`/api/opportunities/${id}`);
+    const d = await api(`/api/opportunities/${id}?only=notes`);
     const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
     if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
   } catch (e) { toast(`Starter failed: ${e.message}`); return; }
@@ -477,11 +513,11 @@ async function vetAndLogStarterInner(id) {
 }
 
 async function killOpportunity(id, anchorEl) {
-  // Detail-before-write (F2): see vetOpportunity — the killed tag appends to
-  // full detail notes. Fetched before the post-mortem row opens.
+  // Notes-before-write: see vetOpportunity — the killed tag appends to
+  // notes-only detail. Fetched before the post-mortem row opens.
   if (!state.token) return openAdminModal("Enter the admin token first.");
   try {
-    const d = await api(`/api/opportunities/${id}`);
+    const d = await api(`/api/opportunities/${id}?only=notes`);
     const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
     if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
   } catch (e) { toast(`Kill failed: ${e.message}`); return; }
@@ -587,54 +623,57 @@ async function startExperiment(id) {
   } catch (e) { toast(`Start failed: ${e.message}`); }
 }
 
-// One-click Lose for planned/running experiments: one inline input for the
-// post-mortem line, then a single PATCH to lost sending that line as both
-// result and post_mortem so the API closure gate holds unchanged. Token-gated
-// like startExperiment; orphaned cards never render the button; an empty
-// inline line cancels with the row untouched. Human-pressed, one decision.
+// One-click Lose for planned/running experiments: one optional spend-$ input,
+// one inline input for the post-mortem line, then a single PATCH to lost
+// sending that line as both result and post_mortem plus the clamped spend,
+// so the API closure gate holds unchanged. Token-gated like startExperiment;
+// orphaned cards never render the button; an empty inline line cancels with
+// the row untouched; bad/negative spend clamps to 0 exactly like the modal.
+// Human-pressed, one decision.
 async function loseExperiment(id, anchorEl) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
   // (modal gate above supersedes the toast gate on the next line)
   if (!state.token) return toast("Enter the admin token first.");
   const loseContainer = (anchorEl ? (anchorEl.closest(".card") || anchorEl.closest(".review-actions") || anchorEl.parentElement) : null) || document.querySelector("#board") || document.body;
-  const doLose = async (pm) => {
+  const doLose = async (pm, spentCents = 0) => {
   // (cancel handled by inline row: empty still cancels, row untouched)
   try {
     await api(`/api/experiments/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status: "lost", result: pm.trim(), post_mortem: pm.trim() }),
+      body: JSON.stringify({ status: "lost", result: pm.trim(), post_mortem: pm.trim(), spent_cents: spentCents }),
     });
     toast("Experiment closed as lost");
     await refreshTargets({ runs: false });
   } catch (e) { toast(`Close failed: ${e.message}`); }
   };
-  inlinePostMortem(loseContainer, { label: "One-line post-mortem (required to close as lost):", placeholder: "One-line post-mortem (required to close as lost):", confirmText: "Lose", onSubmit: (pm) => doLose(pm), cancelToast: "Close cancelled — post-mortem required." });
+  inlinePostMortem(loseContainer, { label: "One-line post-mortem (required to close as lost):", placeholder: "One-line post-mortem (required to close as lost):", confirmText: "Lose", onSubmit: (pm, spentCents) => doLose(pm, spentCents), cancelToast: "Close cancelled — post-mortem required.", withSpend: true });
 }
 
 // One-click Win for planned/running experiments: one inline $ amount, one optional
-// source line, one inline line, then a single PATCH to won sending that line as both result
-// and post_mortem, the human-entered amount as revenue_cents, and the source
-// as revenue_source, so the API closure gate holds unchanged (ended_at stamped by the API). Token-gated
-// like loseExperiment; orphaned cards never render the button; an empty
-// inline line cancels with the row untouched; bad/negative $ clamps to 0
-// exactly like the modal. Human-pressed, one decision.
+// source line, one optional spend-$ input, one inline line, then a single PATCH
+// to won sending that line as both result and post_mortem, the human-entered
+// amount as revenue_cents, the source as revenue_source, and the clamped spend
+// as spent_cents, so the API closure gate holds unchanged (ended_at stamped by
+// the API). Token-gated like loseExperiment; orphaned cards never render the
+// button; an empty inline line cancels with the row untouched; bad/negative $
+// clamps to 0 exactly like the modal. Human-pressed, one decision.
 async function winExperiment(id, anchorEl) {
   if (!state.token) return openAdminModal("Enter the admin token first.");
   // (modal gate above supersedes the toast gate on the next line)
   if (!state.token) return toast("Enter the admin token first.");
   const winContainer = (anchorEl ? (anchorEl.closest(".card") || anchorEl.closest(".review-actions") || anchorEl.parentElement) : null) || document.querySelector("#board") || document.body;
-  const doWin = async (pm, revenueCents, revenueSource) => {
+  const doWin = async (pm, revenueCents, revenueSource, spentCents) => {
   // (cancel handled by inline row: empty still cancels, row untouched)
   try {
     await api(`/api/experiments/${id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status: "won", result: pm.trim(), post_mortem: pm.trim(), revenue_cents: revenueCents, revenue_source: revenueSource }),
+      body: JSON.stringify({ status: "won", result: pm.trim(), post_mortem: pm.trim(), revenue_cents: revenueCents, revenue_source: revenueSource, spent_cents: spentCents }),
     });
     toast("Experiment closed as won");
     await refreshTargets({ runs: false });
   } catch (e) { toast(`Close failed: ${e.message}`); }
   };
-  inlineWinClose(winContainer, { label: "One-line post-mortem (required to close as won):", placeholder: "One-line post-mortem (required to close as won):", confirmText: "Win", onSubmit: (pm, revenueCents, revenueSource) => doWin(pm, revenueCents, revenueSource), cancelToast: "Win cancelled — post-mortem required." });
+  inlineWinClose(winContainer, { label: "One-line post-mortem (required to close as won):", placeholder: "One-line post-mortem (required to close as won):", confirmText: "Win", onSubmit: (pm, revenueCents, revenueSource, spentCents) => doWin(pm, revenueCents, revenueSource, spentCents), cancelToast: "Win cancelled — post-mortem required." });
 }
 
 function renderExperiments() {
@@ -941,9 +980,9 @@ function showModal(html) {
   return f;
 }
 
-// Token modal, reused by gated taps (vet/kill/start/lose): reuses the Admin
-// button's showModal block, then pins the dead-end toast text as a subnote so
-// a phone tap lands in the token field instead of a toast.
+// Token modal, reused by gated taps (vet/kill/start/lose/win/starter/add/log/run):
+// reuses the Admin button's showModal block, then pins the dead-end toast text
+// as a subnote so a phone tap lands in the token field instead of a toast.
 function openAdminModal(subnote = "") {
   const modal = $("#modal");
   if (!modal.open) $("#btn-admin").click();
@@ -982,7 +1021,7 @@ $("#btn-admin").addEventListener("click", () => {
 });
 
 $("#btn-add").addEventListener("click", () => {
-  if (!state.token) return toast("Enter the admin token first.");
+  if (!state.token) return openAdminModal("Enter the admin token first.");
   const f = showModal(`
     <h3>Add opportunity</h3>
     <label>Title<input id="m-title" required maxlength="200"></label>
@@ -1030,7 +1069,7 @@ $("#btn-add").addEventListener("click", () => {
 });
 
 function openExperimentModal(exp, defaultOpp = null) {
-  if (!state.token) return toast("Enter the admin token first.");
+  if (!state.token) return openAdminModal("Enter the admin token first.");
   const isNew = !exp;
   const opps = state.opportunities;
   const f = showModal(`
@@ -1112,7 +1151,7 @@ $("#board").addEventListener("click", (ev) => {
 
 /* ---- manual research trigger ---- */
 $("#btn-run").addEventListener("click", async () => {
-  if (!state.token) return toast("Enter the admin token first.");
+  if (!state.token) return openAdminModal("Enter the admin token first.");
   const worker = state.meta.worker_url;
   if (!worker) return toast("Worker URL not configured (RESEARCH_WORKER_URL).");
   const btn = $("#btn-run");
@@ -1199,11 +1238,13 @@ async function refreshTargets(want = {}) {
   ]);
   state.apiFailures = (state.apiFailures || []).filter((f) => !refetching.has(f));
   const [opps, exps, runs, health] = await Promise.all([
-    fetchOpps ? api("/api/opportunities?limit=200").catch(() => { state.apiFailures.push("/api/opportunities"); return { opportunities: [] }; }) : null,
+    fetchOpps ? api("/api/opportunities?limit=200").catch(() => { state.apiFailures.push("/api/opportunities"); return null; }) : null,
     fetchExps ? api("/api/experiments").catch(() => { state.apiFailures.push("/api/experiments"); return { experiments: [] }; }) : null,
     fetchRuns ? api("/api/runs?limit=20").catch(() => { state.apiFailures.push("/api/runs"); return { runs: [] }; }) : null,
     fetchHealth ? api("/api/health").catch(() => { state.apiFailures.push("/api/health"); return {}; }) : null,
   ]);
+  // A failed opportunities fetch resolves null above, so the stale list survives
+  // (the review tab and chip keep their counts instead of reading all-clear).
   if (opps) state.opportunities = opps.opportunities || [];
   if (exps) state.experiments = exps.experiments || [];
   if (runs) state.runs = runs.runs || [];

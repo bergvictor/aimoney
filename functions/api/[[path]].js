@@ -87,17 +87,26 @@ async function listOpportunities(env, url) {
   return json({ opportunities: capped });
 }
 
-async function getOpportunity(env, id) {
-  const row = await env.DB.prepare("SELECT * FROM opportunities WHERE id = ?")
-    .bind(id).first();
+async function getOpportunity(env, id, url) {
+  // Notes-only shape for the write-path prefetches (vet/starter/kill append
+  // to notes and discard briefs + experiments): one SELECT, no sibling
+  // payload. The drawer keeps the full shape below.
+  if (url && url.searchParams.get("only") === "notes") {
+    const row = await env.DB.prepare("SELECT * FROM opportunities WHERE id = ?")
+      .bind(id).first();
+    if (!row) return json({ error: "not found" }, 404);
+    return json({ opportunity: { ...row, score: effectiveScore(row) } });
+  }
+  // One batched round-trip for the three independent detail SELECTs; the
+  // payload stays byte-identical ({ opportunity, briefs, experiments }).
+  const detailRes = await env.DB.batch([
+    env.DB.prepare("SELECT * FROM opportunities WHERE id = ?").bind(id),
+    env.DB.prepare("SELECT * FROM briefs WHERE opportunity_id = ? ORDER BY version DESC LIMIT 5").bind(id),
+    env.DB.prepare("SELECT * FROM experiments WHERE opportunity_id = ? ORDER BY updated_at DESC").bind(id),
+  ]);
+  const row = (detailRes[0].results || [])[0] || null;
   if (!row) return json({ error: "not found" }, 404);
-  const briefs = await env.DB.prepare(
-    "SELECT * FROM briefs WHERE opportunity_id = ? ORDER BY version DESC LIMIT 5")
-    .bind(id).all();
-  const experiments = await env.DB.prepare(
-    "SELECT * FROM experiments WHERE opportunity_id = ? ORDER BY updated_at DESC")
-    .bind(id).all();
-  return json({ opportunity: { ...row, score: effectiveScore(row) }, briefs: briefs.results || [], experiments: experiments.results || [] });
+  return json({ opportunity: { ...row, score: effectiveScore(row) }, briefs: detailRes[1].results || [], experiments: detailRes[2].results || [] });
 }
 
 async function createOpportunity(request, env) {
@@ -450,7 +459,7 @@ export async function onRequest(context) {
     if (parts[0] === "opportunities" && parts.length === 1 && method === "POST")
       return createOpportunity(request, env);
     if (parts[0] === "opportunities" && parts.length === 2 && method === "GET")
-      return getOpportunity(env, parts[1]);
+      return getOpportunity(env, parts[1], url);
     if (parts[0] === "opportunities" && parts.length === 2 && (method === "PATCH" || method === "PUT"))
       return updateOpportunity(request, env, parts[1]);
     if (parts[0] === "briefs" && method === "GET") return listBriefs(env, url);

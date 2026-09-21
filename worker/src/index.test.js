@@ -429,3 +429,32 @@ describe("agentMoneyEstimates zero-spend normalization (audit 2026-09-20-round2 
     assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
   });
 });
+
+describe("batched pre-pass writes (audit 2026-09-20-round3 Task 3)", () => {
+  const prePass = () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    return src.slice(src.indexOf("Exact-URL supports pre-pass"), src.indexOf("fresh.push(...rest)"));
+  };
+
+  it("pre-pass signal + notes writes accumulate into the verdict batch, never awaited inline", () => {
+    const block = prePass();
+    assert.equal(block.split("verdictWrites.push").length - 1, 2, "pre-pass must push its signal UPDATE and notes append");
+    assert.ok(block.includes("UPDATE signals SET processed=1, opportunity_id=? WHERE id=?"), "pre-pass lost the signal-parent UPDATE");
+    assert.ok(block.includes("substr(notes || ?, -8000)"), "pre-pass lost the newest-kept notes append");
+    assert.ok(!block.includes(".run()"), "pre-pass still awaits D1 writes inline");
+    assert.ok(!block.includes(".catch(() => null)"), "pre-pass still swallows the evidence-append failure");
+  });
+
+  it("one declaration, one flush; matching, caps, AI budget, and status rules unchanged", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.equal(src.split("const verdictWrites = [];").length - 1, 1, "verdict accumulator must be declared exactly once");
+    assert.equal(src.split("await env.DB.batch(verdictWrites)").length - 1, 1, "pre-pass + verdict writes must flush as one batch");
+    assert.ok(src.includes("exactUrlTarget(sig.url, oppUrls, linkedUrls)"), "pre-pass must still match via exactUrlTarget");
+    assert.ok(src.includes("WHERE source_url IN ("), "pre-pass lost its bounded opportunity IN select");
+    assert.ok(src.includes("AND url IN ("), "pre-pass lost its bounded linked-signal IN select");
+    assert.ok(src.includes("const MAX_NEW_PER_RUN = 2;"), "worker lost the inflow cap");
+    assert.equal(src.split("await aiComplete(env, state").length - 1, 3, "AI call sites must stay at 3");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+  });
+});
