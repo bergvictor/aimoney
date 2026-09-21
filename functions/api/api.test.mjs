@@ -90,7 +90,11 @@ function makeDB(seed = {}) {
     }
     if (sql.includes("FROM opportunities") && sql.includes("vetted]%") && !sql.includes("COUNT(*)") && (sql.includes("substr(notes, -500)") || sql.includes("SELECT notes FROM opportunities"))) {
       const wantKilled = sql.includes("killed]%");
-      return { results: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]") || (wantKilled && String(o.notes || "").includes("killed]"))).map((o) => ({ notes: String(o.notes || "").slice(-500) })) };
+      let rows = data.opportunities.filter((o) => String(o.notes || "").includes("vetted]") || (wantKilled && String(o.notes || "").includes("killed]")));
+      if (sql.includes("ORDER BY updated_at DESC")) rows = rows.slice().sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+      const limit = /LIMIT\s+(\d+)/.exec(sql);
+      if (limit) rows = rows.slice(0, Number(limit[1]));
+      return { results: rows.map((o) => ({ notes: String(o.notes || "").slice(-500) })) };
     }
     return { results: [] };
   }
@@ -2241,6 +2245,56 @@ describe("kill verdicts in health verdict date (audit 2026-09-20-round3 Task 2)"
     assert.equal(probeSql.length, 1, "health must carry exactly one verdict-date SELECT");
     assert.ok(probeSql[0].includes("substr(notes, -500)"), "verdict probe must select the bounded substr tail");
     assert.ok(probeSql[0].includes("killed]%"), "verdict probe must match killed rows");
+  });
+});
+
+describe("last-verdict probe row bound (audit 2026-09-20-round3 Task 3)", () => {
+  it("probe 11 orders by updated_at DESC with LIMIT 2000", async () => {
+    const db = makeDB({ opportunities: oppSeed() });
+    await callApi(["health"], "http://localhost/api/health", {}, db);
+    const probeSql = (db._prepared || []).filter((s) => s.includes("vetted]%") && !s.includes("COUNT(*)") && !s.includes("NOT EXISTS"));
+    assert.equal(probeSql.length, 1, "health must carry exactly one verdict-date SELECT");
+    assert.ok(probeSql[0].includes("ORDER BY updated_at DESC LIMIT 2000"), "verdict probe must bound rows to the newest 2000 touches");
+  });
+
+  it("LIMIT+1 verdict rows still report the newest tag on both dates, other keys byte-identical", async () => {
+    const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+    const today = daysAgo(0);
+    const yesterday = daysAgo(1);
+    // 1999 old filler verdicts with ascending touches, then the two newest
+    // verdicts on the two most-recently-touched rows: newest vetted tag
+    // yesterday, newest killed tag today. Only the oldest touch falls
+    // outside the 2000-row window.
+    const opportunities = [];
+    for (let i = 1; i <= 1999; i++) {
+      opportunities.push({ id: i, slug: `old-${i}`, title: `Old ${i}`, status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: `filler [2026-01-05 vetted] Human vetted; cap lifted.`, created_at: "2026-01-05T00:00:00Z", updated_at: `2026-02-${String((i % 27) + 1).padStart(2, "0")}T00:00:${String(i % 60).padStart(2, "0")}Z` });
+    }
+    opportunities.push({ id: 2000, slug: "new-vet", title: "New vet", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: `x [${yesterday} vetted] Human vetted; cap lifted.`, created_at: "2026-09-10T00:00:00Z", updated_at: new Date(Date.now() - 3600000).toISOString() });
+    opportunities.push({ id: 2001, slug: "new-kill", title: "New kill", status: "killed", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: `y [${today} killed] no demand`, created_at: "2026-09-10T00:00:00Z", updated_at: new Date().toISOString() });
+    const db = makeDB({ opportunities });
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.last_vetted, yesterday, "newest vetted tag must survive the window");
+    assert.equal(r.body.last_verdict, today, "newest killed tag must survive the window");
+    // The window transferred 2000 of 2001 rows (oldest touch excluded).
+    const probeSql = (db._prepared || []).filter((s) => s.includes("vetted]%") && !s.includes("COUNT(*)") && !s.includes("NOT EXISTS"));
+    const tailRows = await db.prepare(probeSql[0]).all();
+    assert.equal((tailRows.results || []).length, 2000, "probe must transfer exactly the 2000-row window");
+    // Every other health key byte-identical (values + order for verify.sh).
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "time"]);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.db, "up");
+    assert.equal(r.body.opportunities, 2001);
+    assert.equal(r.body.unreviewed, 0);
+    assert.equal(r.body.bare_without_brief, 2001);
+    assert.deepEqual(r.body.experiments_by_status, {});
+    assert.equal(r.body.decisions_last_7d, 0);
+    assert.equal(r.body.revenue_last_7d, 0);
+    assert.equal(r.body.revenue_total, 0);
+    assert.equal(r.body.spent_total, 0);
+    assert.equal(r.body.vetted_last_7d, 1, "only the yesterday tag falls in the 7-day window");
+    assert.equal(r.body.vetted_no_experiment, 2000, "all 2000 vetted rows lack experiments");
+    assert.equal(r.body.noise_24h, 0);
   });
 });
 

@@ -1384,3 +1384,134 @@ describe("dashboard api timeout (audit 2026-09-20-round3 Task 3)", () => {
     assert.ok(js.includes("function renderApiErrors"), "banner renderer lost");
   });
 });
+
+describe("review detail prefetch (audit 2026-09-20-round3 Task 1)", () => {
+  // Cache helpers + nextReviewId extracted from the shipped source (not
+  // copied) so these cases fail if the contract drifts. prefetchReviewDetail
+  // stays out: it closes over api(), covered by static guards below.
+  function shippedDetailCache() {
+    const start = js.indexOf("const DETAIL_CACHE_TTL_MS");
+    assert.ok(start !== -1, "app.js lost DETAIL_CACHE_TTL_MS");
+    const end = js.indexOf("function prefetchReviewDetail", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the detail-cache block boundary");
+    return new Function("state", "Date", "Map",
+      `${js.slice(start, end)}; return { detailCache, getCachedDetailNotes, setCachedDetailNotes, invalidateDetailCache, nextReviewId, DETAIL_CACHE_TTL_MS };`);
+  }
+
+  it("cache serves fresh notes and evicts past the 5-min TTL", () => {
+    const factory = shippedDetailCache();
+    const api = factory({ reviewList: [] }, Date, Map);
+    assert.equal(api.DETAIL_CACHE_TTL_MS, 5 * 60 * 1000, "TTL must be 5 min");
+    assert.equal(api.getCachedDetailNotes(7, 1000), null, "miss must read null");
+    api.setCachedDetailNotes(7, "full notes", 1000);
+    assert.equal(api.getCachedDetailNotes(7, 1000 + 60 * 1000), "full notes", "fresh hit must serve notes");
+    assert.equal(api.getCachedDetailNotes(7, 1000 + 6 * 60 * 1000), null, "stale hit must read null");
+    assert.equal(api.detailCache.has(7), false, "stale read must evict the entry");
+  });
+
+  it("invalidation drops one id or the whole cache", () => {
+    const factory = shippedDetailCache();
+    const api = factory({ reviewList: [] }, Date, Map);
+    api.setCachedDetailNotes(1, "a", 1000);
+    api.setCachedDetailNotes(2, "b", 1000);
+    api.invalidateDetailCache(1);
+    assert.equal(api.getCachedDetailNotes(1, 1000), null, "single-id invalidate must drop that row");
+    assert.equal(api.getCachedDetailNotes(2, 1000), "b", "single-id invalidate must keep the rest");
+    api.invalidateDetailCache();
+    assert.equal(api.getCachedDetailNotes(2, 1000), null, "bare invalidate must clear everything");
+  });
+
+  it("nextReviewId walks the queue in order, null at the end or off-queue", () => {
+    const factory = shippedDetailCache();
+    const api = factory({ reviewList: [{ id: 11 }, { id: 12 }, { id: 13 }] }, Date, Map);
+    assert.equal(api.nextReviewId(11), 12);
+    assert.equal(api.nextReviewId(12), 13);
+    assert.equal(api.nextReviewId(13), null, "last row has no N+1");
+    assert.equal(api.nextReviewId(99), null, "off-queue id has no N+1");
+    const empty = factory({ reviewList: [] }, Date, Map);
+    assert.equal(empty.nextReviewId(11), null, "empty queue has no N+1");
+  });
+
+  it("verdicting row N prefetches N+1 and reuses the cache on a hit", () => {
+    const fetchSlice = js.slice(js.indexOf("async function fetchDetailForWrite"), js.indexOf("async function vetOpportunity("));
+    assert.ok(fetchSlice.includes("prefetchReviewDetail(nextReviewId(id))"), "verdicting N must warm N+1");
+    assert.ok(!fetchSlice.includes("await prefetchReviewDetail"), "prefetch must stay fire-and-forget, never awaited");
+    const cacheAt = fetchSlice.indexOf("getCachedDetailNotes(id)");
+    const apiAt = fetchSlice.indexOf("api(`/api/opportunities/${id}`)");
+    assert.ok(cacheAt !== -1 && apiAt !== -1 && cacheAt < apiAt, "cache must be checked before the detail fetch");
+    assert.ok(fetchSlice.includes("setCachedDetailNotes(id, o.notes)"), "a fetched detail must warm the cache");
+    assert.ok(fetchSlice.includes("if (!state.token)"), "token gate must stay ahead of the cache read");
+    assert.ok(fetchSlice.indexOf("if (!state.token)") < cacheAt, "token gate must stay ahead of the cache read");
+  });
+
+  it("focusing row N prefetches N+1", () => {
+    const focusSlice = js.slice(js.indexOf("function focusReviewRow"), js.indexOf("function advanceReviewFocus"));
+    assert.ok(focusSlice.includes("prefetchReviewDetail(nextReviewId(id))"), "focusing N must warm N+1");
+    assert.ok(!focusSlice.includes("await prefetchReviewDetail"), "focus prefetch must stay fire-and-forget");
+  });
+
+  it("prefetch skips cached rows and fails silent (the verdict fetch owns the toast)", () => {
+    const preStart = js.indexOf("function prefetchReviewDetail");
+    const preSlice = js.slice(preStart, js.indexOf("// Detail-before-write (F2)", preStart));
+    assert.ok(preSlice.includes("if (id === null || id === undefined) return;"), "prefetch must no-op at the queue end");
+    assert.ok(preSlice.includes("if (getCachedDetailNotes(id) !== null) return;"), "prefetch must skip fresh rows");
+    assert.ok(preSlice.includes(".catch(() => {})"), "prefetch failures must stay silent");
+    assert.ok(!preSlice.includes("toast("), "prefetch must never toast");
+  });
+
+  it("a refresh invalidates the cache so verdicts never write from replaced rows", () => {
+    const targets = js.slice(js.indexOf("async function refreshTargets"), js.indexOf("paintLastGood();"));
+    assert.ok(targets.includes("invalidateDetailCache()"), "opportunities refresh must drop the detail cache");
+  });
+
+  it("a failed PATCH keeps the row visible with the existing toast (no silent drop)", () => {
+    const vetInner = js.slice(js.indexOf("async function vetOpportunityInner"), js.indexOf("async function vetAndLogStarter"));
+    assert.ok(vetInner.includes("toast(`Vet failed:"), "Vet failure must keep its toast");
+    assert.ok(!vetInner.includes("invalidateDetailCache"), "failed Vet must not drop the cache (retry reuses it)");
+    assert.ok(js.includes("toast(`Kill failed:"), "Kill failure must keep its toast");
+    assert.ok(js.includes("toast(`Starter failed:"), "Starter failure must keep its toast");
+  });
+});
+
+describe("stale running badge (audit 2026-09-20-round3 Task 2)", () => {
+  // isStaleRunning extracted from the shipped source (not copied) so these
+  // cases fail if the 30-min contract drifts.
+  function shippedStale() {
+    const start = js.indexOf("const STALE_RUN_MINUTES");
+    assert.ok(start !== -1, "app.js lost STALE_RUN_MINUTES");
+    const end = js.indexOf("function renderRuns", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the stale-run block boundary");
+    return new Function("Date",
+      `${js.slice(start, end)}; return { isStaleRunning, STALE_RUN_MINUTES };`)(Date);
+  }
+
+  it("flags running rows older than 30 min, nothing else", () => {
+    const { isStaleRunning, STALE_RUN_MINUTES } = shippedStale();
+    assert.equal(STALE_RUN_MINUTES, 30, "window must be 30 min");
+    const now = Date.parse("2026-09-21T12:00:00Z");
+    const agoMin = (m) => new Date(now - m * 60000).toISOString();
+    assert.equal(isStaleRunning({ status: "running", started_at: agoMin(31) }, now), true, "31-min running must badge");
+    assert.equal(isStaleRunning({ status: "running", started_at: agoMin(5) }, now), false, "fresh running must stay clean");
+    assert.equal(isStaleRunning({ status: "running", started_at: agoMin(30) }, now), false, "exactly 30 min is not older than 30 min");
+    assert.equal(isStaleRunning({ status: "ok", started_at: agoMin(5000) }, now), false, "finished rows never badge");
+    assert.equal(isStaleRunning({ status: "error", started_at: agoMin(5000) }, now), false, "error rows never badge");
+    assert.equal(isStaleRunning({ status: "running", started_at: "" }, now), false, "missing started_at never badges");
+    assert.equal(isStaleRunning({ status: "running", started_at: "not-a-date" }, now), false, "unparseable started_at never badges");
+    assert.equal(isStaleRunning(null, now), false, "null row never badges");
+  });
+
+  it("window mirrors the worker reaper", () => {
+    const workerJs = readFileSync(join(ROOT, "..", "worker", "src", "index.js"), "utf8");
+    assert.ok(workerJs.includes("const STUCK_RUN_MINUTES = 30"), "worker reaper window changed — mirror it in STALE_RUN_MINUTES");
+  });
+
+  it("renderRuns badges stale rows read-only with the existing pill styles", () => {
+    const runsSlice = js.slice(js.indexOf("function renderRuns"), js.indexOf("function jumpToReviewQueue"));
+    assert.ok(runsSlice.includes("isStaleRunning(r)"), "log must call the stale helper per row");
+    assert.ok(runsSlice.includes(">stale?</span>"), "log lost the 'stale?' copy");
+    assert.ok(runsSlice.includes("st-paused"), "badge must reuse an existing pill style (no new CSS)");
+    assert.ok(runsSlice.includes("30-min reaper window"), "badge must explain itself in its title");
+    assert.ok(runsSlice.includes('<span class="pill st-testing">running</span>'), "fresh running must render exactly as today");
+    assert.ok(!runsSlice.includes('method: "PATCH"') && !runsSlice.includes("POST /run"), "badge must stay read-only (no status writes)");
+  });
+});

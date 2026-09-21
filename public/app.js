@@ -475,17 +475,69 @@ function vettedNotes(notes) {
   return `${cleanUnreviewed(notes)}\n[${day} vetted] Human vetted; cap lifted.`.trim().slice(-8000);
 }
 
+// Review detail prefetch (audit 2026-09-20-round3 Task 1): each V/K verdict
+// costs a detail GET plus the PATCH. The detail GET for row N+1 is
+// predictable — the review queue is oldest-first and verdicts advance in
+// order — so focusing or verdicting row N prefetches row N+1 in the
+// background, and the next verdict costs only its PATCH. The cache holds
+// notes only (never rendered), goes stale after 5 min, and is dropped
+// wholesale on every opportunities refresh; a failed PATCH keeps the row
+// visible with the existing "<Action> failed" toast, exactly as today.
+const DETAIL_CACHE_TTL_MS = 5 * 60 * 1000;
+const detailCache = new Map(); // id -> { notes, at }
+function getCachedDetailNotes(id, now = Date.now()) {
+  const hit = detailCache.get(id);
+  if (!hit) return null;
+  if (!Number.isFinite(hit.at) || now - hit.at > DETAIL_CACHE_TTL_MS) { detailCache.delete(id); return null; }
+  return hit.notes;
+}
+function setCachedDetailNotes(id, notes, now = Date.now()) {
+  detailCache.set(id, { notes: String(notes ?? ""), at: now });
+}
+// Invalidation: one id after its verdict commits (the row left the queue),
+// everything when a refresh replaces the list rows.
+function invalidateDetailCache(id) {
+  if (id === undefined || id === null) detailCache.clear();
+  else detailCache.delete(id);
+}
+// Next review id after `id` in the oldest-first queue, or null at the end.
+function nextReviewId(id) {
+  const ids = (state.reviewList || []).map((o) => o.id);
+  const at = ids.indexOf(id);
+  return at === -1 || at + 1 >= ids.length ? null : ids[at + 1];
+}
+// Fire-and-forget: reads are public, so no token gate; failures stay silent
+// (the verdict fetch below is the honest path and keeps its toast). Never
+// awaited — the verdict must stay one round trip on a cache hit.
+function prefetchReviewDetail(id) {
+  if (id === null || id === undefined) return;
+  if (getCachedDetailNotes(id) !== null) return;
+  api(`/api/opportunities/${id}`).then((d) => {
+    if (d && d.opportunity) setCachedDetailNotes(id, d.opportunity.notes || "");
+  }).catch(() => {});
+}
+
 // Detail-before-write (F2): list rows no longer ship notes, so Vet, Starter,
 // and Kill share one token-gated detail fetch that stashes full notes on the
 // list row for the write below. Returns the row, or null (after the modal or
-// a "<Action> failed" toast) when the caller must return early. Transient
-// write-path cache — the post-write refresh replaces the row.
+// a "<Action> failed" toast) when the caller must return early. The
+// prefetch cache above serves repeat/focused rows; the post-write refresh
+// replaces the row and drops the cache.
 async function fetchDetailForWrite(id, actionLabel) {
   if (!state.token) { openAdminModal("Enter the admin token first."); return null; }
+  const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
+  prefetchReviewDetail(nextReviewId(id)); // verdicting N warms N+1; never awaited
+  const cached = getCachedDetailNotes(id);
+  if (cached !== null) {
+    if (o) o.notes = cached;
+    return o || null;
+  }
   try {
     const d = await api(`/api/opportunities/${id}`);
-    const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
-    if (o && d && d.opportunity) o.notes = d.opportunity.notes || "";
+    if (o && d && d.opportunity) {
+      o.notes = d.opportunity.notes || "";
+      setCachedDetailNotes(id, o.notes);
+    }
     return o || null;
   } catch (e) { toast(`${actionLabel} failed: ${e.message}`); return null; }
 }
@@ -625,6 +677,7 @@ function focusReviewRow(id) {
   }
   const tr = document.querySelector(`#ledger-body tr.row[data-id="${id}"]`);
   if (tr) tr.focus();
+  prefetchReviewDetail(nextReviewId(id)); // focusing N warms N+1; never awaited
 }
 
 function advanceReviewFocus(verdictId, orderBefore) {
@@ -849,6 +902,16 @@ function renderExperiments() {
 }
 
 /* ---- research log ---- */
+// Stale-running badge (audit 2026-09-20-round3 Task 2 / F5): a manual triage
+// run that overruns 30s dies in waitUntil and strands its `running` row
+// until the worker's 30-min reaper. The log flags such rows read-only —
+// no status writes; the worker reaper keeps owning transitions.
+const STALE_RUN_MINUTES = 30; // mirrors worker STUCK_RUN_MINUTES
+const isStaleRunning = (run, now = Date.now()) => {
+  if (!run || run.status !== "running") return false;
+  const ms = Date.parse(String(run.started_at || ""));
+  return Number.isFinite(ms) && now - ms > STALE_RUN_MINUTES * 60 * 1000;
+};
 function renderRuns() {
   const runs = state.runs;
   const last = runs[0];
@@ -890,7 +953,7 @@ function renderRuns() {
     <tr><td class="mono">#${r.id} ${esc(r.agent)}</td><td>${esc(r.trigger)}</td>
       <td class="mono">${esc((r.finished_at || "—").slice(0, 16).replace("T", " "))}</td>
       <td>${r.status === "ok" ? `<span class="pill st-scaling">ok</span>`
-        : r.status === "running" ? `<span class="pill st-testing">running</span>`
+        : r.status === "running" ? `<span class="pill st-testing">running</span>${isStaleRunning(r) ? ` <span class="pill st-paused" title="Running past the 30-min reaper window — likely stranded, the worker reaps it">stale?</span>` : ""}`
         : `<span class="pill st-killed">error</span>`}</td>
       <td class="num">${r.signals_seen}</td><td class="num">${r.added}</td>
       <td class="num">${r.updated}</td><td class="num">${r.briefs}</td>
@@ -1529,7 +1592,7 @@ async function refreshTargets(want = {}) {
     fetchRuns ? api("/api/runs?limit=20").catch(() => { state.apiFailures.push("/api/runs"); return { runs: [] }; }) : null,
     fetchHealth ? api("/api/health").catch(() => { state.apiFailures.push("/api/health"); return {}; }) : null,
   ]);
-  if (opps) state.opportunities = opps.opportunities || [];
+  if (opps) { state.opportunities = opps.opportunities || []; invalidateDetailCache(); }
   if (exps) state.experiments = exps.experiments || [];
   if (runs) state.runs = runs.runs || [];
   if (health) state.health = health || {};

@@ -523,7 +523,7 @@ export async function onRequest(context) {
         env.DB.prepare(`SELECT COUNT(*) AS n FROM opportunities WHERE ${vettedDays.map((d) => `notes LIKE '%[${d} vetted]%'`).join(" OR ")}`),
         env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
         env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso),
-        env.DB.prepare("SELECT substr(notes, -500) AS notes FROM opportunities WHERE notes LIKE '%vetted]%' OR notes LIKE '%killed]%'"),
+        env.DB.prepare("SELECT substr(notes, -500) AS notes FROM opportunities WHERE notes LIKE '%vetted]%' OR notes LIKE '%killed]%' ORDER BY updated_at DESC LIMIT 2000"),
       ] : [];
       let healthRes = healthStmts.length ? await env.DB.batch(healthStmts).catch(() => null) : null;
       // Isolation fallback (F1): one bad probe (e.g. a SELECT touching a
@@ -618,7 +618,10 @@ export async function onRequest(context) {
       // shows its age without a told count. The probe selects only the
       // trailing 500 chars per row: vettedNotes/kill notes append newest-last
       // under the same 8000-char cap, so the newest tag always lands in the
-      // tail while full bodies never cross D1.
+      // tail while full bodies never cross D1. Row count is bounded too
+      // (ORDER BY updated_at DESC LIMIT 2000): verdict tags are appended on
+      // touch, so the newest tag rides a recently-touched row inside the
+      // window while thousand-verdict histories stop scanning whole-table.
       const lastVettedRows = (healthRes && healthRes[11] && healthRes[11].results) || [];
       let last_vetted = null;
       let last_verdict = null;
