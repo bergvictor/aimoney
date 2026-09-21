@@ -28,26 +28,10 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-      # Mirror of the deploy/deploy.sh D1 migration loop (sorted glob, same
-      # tolerate-list): keep both in sync so CI and manual deploys converge.
+      # D1 migrations run via the shared deploy/apply-d1-migrations.sh (same file
+      # deploy/deploy.sh calls) so CI and manual deploys converge.
       - name: Apply D1 migrations in sorted order
-        run: |
-          for f in d1/migrate-*.sql; do
-            [ -e "$f" ] || continue
-            echo "==> D1: migration $f"
-            if out=$(wrangler d1 execute aimoney --file="$f" --remote 2>&1); then
-              echo "$out"
-            else
-              case "$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')" in
-                *"duplicate column"*|*"already exists"*)
-                  echo "==> D1: $f already applied (continuing)" ;;
-                *)
-                  echo "$out"
-                  echo "::error::D1 migration $f failed (not a duplicate-column no-op)"
-                  exit 1 ;;
-              esac
-            fi
-          done
+        run: ./deploy/apply-d1-migrations.sh
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}

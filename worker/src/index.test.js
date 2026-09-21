@@ -469,6 +469,33 @@ describe("hygiene: dead rails gone, shared auth (audit 2026-09-20-round1 Task 4)
   // shared compare now checks, so no second copy is kept here.
 });
 
+describe("bare-backlog inflow gate (audit 2026-09-20-round2 Task 3)", () => {
+  it("caps inserts to 1 per run while bare-without-brief exceeds 10", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes("const BARE_BACKLOG_CAP = 10;"), "worker lost the bare-backlog gate threshold");
+    assert.ok(src.includes("let maxNewThisRun = MAX_NEW_PER_RUN;"), "worker lost the per-run cap variable");
+    assert.ok(src.includes("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL"), "worker lost the once-per-run bare-count query");
+    assert.ok(src.includes("Number(bareRow.n) > BARE_BACKLOG_CAP"), "worker lost the bare-backlog comparison");
+    assert.ok(src.includes("maxNewThisRun = 1"), "worker lost the 1-per-run gate when backlog exceeds 10");
+    assert.ok(src.includes("newInserts >= maxNewThisRun"), "overflow guard must use the gated per-run cap");
+    assert.ok(src.includes("stay processed = 0"), "overflow must stay processed = 0 for a later tick");
+  });
+
+  it("keeps AI budget, verdict validation, status rules, and manual skip", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
+    assert.ok(src.includes('v.action !== "new" && v.action !== "supports" && v.action !== "noise"'), "verdict validation changed");
+    assert.ok(src.includes("const MAX_AI_CALLS = 4;"), "AI budget must stay at 4");
+    assert.ok(!src.includes("UPDATE opportunities SET status"), "worker must never move opportunity status");
+    assert.ok(src.includes("briefs_skipped"), "manual run lost its briefs_skipped disclosure");
+  });
+
+  it("README documents the backlog gate in one line", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    assert.ok(readme.includes("while bare-without-brief exceeds 10 the cap drops to 1 for that tick"), "README lost the backlog gate");
+    assert.ok(readme.includes("at most 2 new proposals"), "README lost the inflow cap");
+  });
+});
+
 describe("extra brief ungated from first pass (audit 2026-09-20-round3 Task 3)", () => {
   it("extra gate drops the bare requirement but keeps cron, budget, clock, and 48h gates", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");

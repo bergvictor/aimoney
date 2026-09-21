@@ -1320,6 +1320,39 @@ describe("health probe isolation (audit 2026-09-20-round1 Task 1)", () => {
     assert.ok(!JSON.stringify(r.body).includes("SQLITE_ERROR"), "detail must not leak driver verbiage");
   });
 
+  it("names only the missing table, never SQL or driver verbiage", async () => {
+    // A probe error naming a missing table must yield exactly the identifier.
+    const db = makeDB({
+      opportunities: oppSeed(),
+      experiments: [
+        { id: 1, opportunity_id: 1, status: "won", ended_at: new Date().toISOString(), revenue_cents: 50000, spent_cents: 1200 },
+      ],
+    });
+    const realPrepare = db.prepare.bind(db);
+    const leakyDB = {
+      ...db,
+      batch: async () => { throw new Error("batch bad"); },
+      prepare: (sql) => {
+        const stmt = realPrepare(sql);
+        if (sql.includes("SUM(spent_cents)") && !sql.includes("-7 days")) {
+          const boom = new Error("SELECT * FROM experiments failed: no such table: experiments (SQLITE_ERROR)");
+          stmt.all = async () => { throw boom; };
+          stmt.first = async () => { throw boom; };
+        }
+        return stmt;
+      },
+    };
+    const r = await callApi(["health"], "http://localhost/api/health", {}, leakyDB);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.db, "up");
+    assert.deepEqual(r.body.health_probe_failures, ["revenue_lifetime"]);
+    assert.deepEqual(r.body.health_probe_detail, { revenue_lifetime: "experiments" });
+    assert.ok(!JSON.stringify(r.body).includes("SELECT"), "detail must not leak SQL text");
+    assert.ok(!JSON.stringify(r.body).includes("SQLITE_ERROR"), "detail must not leak driver verbiage");
+    assert.ok(JSON.stringify(r.body).includes('"ok":true'), "partial payload must keep the verify.sh marker");
+  });
+
   it("names the failing probe, keeps existing keys byte-identical for verify.sh", async () => {
     const r = await callApi(["health"], "http://localhost/api/health", {}, oneBadProbeDB());
     assert.deepEqual(r.body.health_probe_failures, ["revenue_lifetime"]);

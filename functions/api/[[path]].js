@@ -422,11 +422,11 @@ export async function onRequest(context) {
           } catch (err) {
             perProbe.push(null);
             failed.push(healthProbeNames[i] || String(i));
-            // Schema-drift hint: name ONLY the missing column (narrow regex on
+            // Schema-drift hint: name ONLY the missing column or table (narrow regex on
             // the driver message) - never the SQL or the raw error text.
             const driftMsg = err instanceof Error ? err.message : String(err ?? "");
-            const driftMatch = /no such column:\s*([A-Za-z_][A-Za-z0-9_]*)/i.exec(driftMsg);
-            if (driftMatch) failedDetail[healthProbeNames[i] || String(i)] = driftMatch[1];
+            const driftMatch = /no such (column|table):\s*([A-Za-z_][\w.]*)/i.exec(driftMsg);
+            if (driftMatch) failedDetail[healthProbeNames[i] || String(i)] = driftMatch[2];
           }
         }
         if (perProbe.some((r) => r !== null)) {

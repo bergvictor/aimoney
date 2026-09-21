@@ -36,24 +36,24 @@ function experimentsColumns(schemaSql) {
 }
 
 describe("CI applies sorted d1/migrate-*.sql (audit 2026-09-20-round4 Task 1)", () => {
-  it("runs schema.sql before every migration file, in sorted order", () => {
+  it("runs schema.sql before the shared migration call, loop lives in one home", () => {
     const yml = read(".github/workflows/deploy-worker.yml");
+    const shared = read("deploy/apply-d1-migrations.sh");
     const schemaAt = yml.indexOf("--file=d1/schema.sql");
     assert.ok(schemaAt !== -1, "workflow must apply d1/schema.sql");
-    const loopAt = yml.indexOf("d1/migrate-*.sql");
-    assert.ok(loopAt !== -1, "workflow must loop d1/migrate-*.sql");
-    assert.ok(schemaAt < loopAt, "schema.sql must run before the migration loop");
-    assert.ok(/for f in d1\/migrate-\*\.sql/.test(yml), "migration loop must iterate the sorted glob");
+    assert.ok(yml.includes("deploy/apply-d1-migrations.sh"), "workflow must invoke the shared migration script");
+    assert.ok(schemaAt < yml.indexOf("deploy/apply-d1-migrations.sh"), "schema.sql must run before the shared migration call");
+    assert.ok(/for f in d1\/migrate-\*\.sql/.test(shared), "shared script must iterate the sorted glob");
   });
 
   it("tolerates only duplicate-column re-runs and fails anything else", () => {
-    const yml = read(".github/workflows/deploy-worker.yml");
-    assert.ok(yml.includes("duplicate column"), "workflow must tolerate the duplicate-column no-op");
-    assert.ok(yml.includes("already exists"), "workflow must tolerate the already-exists no-op");
-    assert.ok(/exit 1/.test(yml), "a broken migration must fail the job");
+    const shared = read("deploy/apply-d1-migrations.sh");
+    assert.ok(shared.includes("duplicate column"), "shared script must tolerate the duplicate-column no-op");
+    assert.ok(shared.includes("already exists"), "shared script must tolerate the already-exists no-op");
+    assert.ok(/exit 1/.test(shared), "a broken migration must fail the job");
     assert.ok(
-      !/\|\| echo "==> D1: \$f already applied/.test(yml),
-      "workflow must not blanket-claim every failure as already applied"
+      !/\|\| echo "==> D1: \$f already applied/.test(shared),
+      "shared script must not blanket-claim every failure as already applied"
     );
   });
 

@@ -33,8 +33,8 @@ const BRIEF_SLUGS = [
   "ai-automation-agency",
 ];
 
-// The tolerate-list case statement, indentation-normalized so the deploy.sh /
-// CI comparison is about the list itself, not YAML nesting depth.
+// The tolerate-list case statement, indentation-normalized so the shared-script
+// comparison is about the list itself, not nesting depth.
 function caseBlock(text, label) {
   const norm = text.replace(/\r\n/g, "\n");
   const start = norm.indexOf('case "$(printf');
@@ -97,31 +97,40 @@ describe("seed guard fails closed (audit 2026-09-20-round1 Task 1)", () => {
   });
 });
 
-describe("deploy.sh shares the CI migration tolerate-list (audit 2026-09-20-round1 Task 2)", () => {
-  it("applies schema.sql before every migration in sorted order", () => {
-    const deploy = read("deploy/deploy.sh");
-    const schemaAt = deploy.indexOf("--file=d1/schema.sql");
-    assert.ok(schemaAt !== -1, "deploy.sh must apply d1/schema.sql");
-    assert.ok(deploy.includes("for f in d1/migrate-*.sql"), "deploy.sh must loop the sorted migration glob");
-    assert.ok(schemaAt < deploy.indexOf("for f in d1/migrate-*.sql"), "schema.sql must run before the migration loop");
-    assert.ok(deploy.includes("mirrors .github/workflows/deploy-worker.yml"), "deploy.sh must name the file it mirrors");
-  });
-
-  it("tolerates only duplicate-column re-runs and fails anything else", () => {
-    const deploy = read("deploy/deploy.sh");
-    assert.ok(deploy.includes('*"duplicate column"*'), "deploy.sh must tolerate the duplicate-column no-op");
-    assert.ok(deploy.includes('*"already exists"*'), "deploy.sh must tolerate the already-exists no-op");
-    assert.ok(deploy.includes("::error::D1 migration"), "a broken migration must fail with a named error");
-    assert.ok(!deploy.includes('|| echo "==> D1: $f already applied'), "deploy.sh must not blanket-claim every failure as already applied");
-    const surfacedAt = deploy.indexOf('echo "$out"');
-    const namedAt = deploy.indexOf("::error::D1 migration");
-    assert.ok(surfacedAt !== -1 && namedAt !== -1 && surfacedAt < namedAt, "a broken migration must surface the driver error");
-  });
-
-  it("carries the CI case-statement verbatim", () => {
+describe("shared D1 migration script (audit 2026-09-20-round2 Task 1)", () => {
+  it("both callers invoke the shared script, schema first", () => {
     const deploy = read("deploy/deploy.sh");
     const yml = read(".github/workflows/deploy-worker.yml");
-    assert.deepEqual(caseBlock(deploy, "deploy.sh"), caseBlock(yml, "deploy-worker.yml"));
+    assert.ok(deploy.includes("deploy/apply-d1-migrations.sh"), "deploy.sh must invoke the shared migration script");
+    assert.ok(yml.includes("deploy/apply-d1-migrations.sh"), "workflow must invoke the shared migration script");
+    assert.ok(yml.includes("Apply D1 migrations in sorted order"), "workflow must keep the migration step name");
+    const schemaAt = deploy.indexOf("--file=d1/schema.sql");
+    assert.ok(schemaAt !== -1, "deploy.sh must apply d1/schema.sql");
+    assert.ok(schemaAt < deploy.indexOf("deploy/apply-d1-migrations.sh"), "schema.sql must run before the shared migration call");
+    const ymlSchemaAt = yml.indexOf("--file=d1/schema.sql");
+    assert.ok(ymlSchemaAt !== -1 && ymlSchemaAt < yml.indexOf("deploy/apply-d1-migrations.sh"), "workflow schema must run before the shared migration call");
+  });
+
+  it("shared script loops the sorted glob and owns the tolerate-list", () => {
+    const shared = read("deploy/apply-d1-migrations.sh");
+    assert.ok(shared.includes("for f in d1/migrate-*.sql"), "shared script must loop the sorted migration glob");
+    assert.ok(shared.includes('*"duplicate column"*'), "shared script must tolerate the duplicate-column no-op");
+    assert.ok(shared.includes('*"already exists"*'), "shared script must tolerate the already-exists no-op");
+    assert.ok(shared.includes("::error::D1 migration"), "a broken migration must fail with a named error");
+    assert.ok(!shared.includes('|| echo "==> D1: $f already applied'), "shared script must not blanket-claim every failure as already applied");
+    const surfacedAt = shared.indexOf('echo "$out"');
+    const namedAt = shared.indexOf("::error::D1 migration");
+    assert.ok(surfacedAt !== -1 && namedAt !== -1 && surfacedAt < namedAt, "a broken migration must surface the driver error");
+    caseBlock(shared, "apply-d1-migrations.sh");
+  });
+
+  it("callers carry no duplicated loop or tolerate-list", () => {
+    const deploy = read("deploy/deploy.sh");
+    const yml = read(".github/workflows/deploy-worker.yml");
+    assert.ok(!deploy.includes("for f in d1/migrate-*.sql"), "deploy.sh must not duplicate the migration loop");
+    assert.ok(!yml.includes("for f in d1/migrate-*.sql"), "workflow must not duplicate the migration loop");
+    assert.ok(!deploy.includes('*"duplicate column"*'), "deploy.sh must not duplicate the tolerate-list");
+    assert.ok(!yml.includes('*"duplicate column"*'), "workflow must not duplicate the tolerate-list");
   });
 });
 

@@ -14,6 +14,7 @@ const AI_BRIEF = "@cf/meta/llama-3.1-8b-instruct";          // quality writing
 const MAX_SIGNALS_PER_SOURCE = 8;
 const MAX_AI_SIGNALS = 6;
 const MAX_NEW_PER_RUN = 2; // inflow cap: at most 2 new proposals per run (brief capacity is 1+1 per cron tick)
+const BARE_BACKLOG_CAP = 10; // while bare-without-brief exceeds 10, cap inserts to 1 for that tick
 const MAX_AI_CALLS = 4;
 const FETCH_TIMEOUT_MS = 6000;
 const CLASSIFY_TOKENS = 1200;
@@ -328,7 +329,15 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
     // Validate: one verdict per signal (first wins), strict action enum,
     // numeric-or-null opportunity_id (the model once emitted repo names).
     const seen = new Set();
-    let newInserts = 0; // new rows inserted this run (capped at MAX_NEW_PER_RUN)
+    let newInserts = 0; // new rows inserted this run (capped at maxNewThisRun)
+    // Backlog gate: once per run read bare-without-brief; while it exceeds 10
+    // cap inserts to 1 for that tick so evidence drains faster than inflow.
+    // Overflow stays processed = 0 for a later tick — reversible, no status move.
+    let maxNewThisRun = MAX_NEW_PER_RUN;
+    try {
+      const bareRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o LEFT JOIN briefs b ON b.opportunity_id = o.id WHERE b.id IS NULL").first();
+      if (bareRow && Number(bareRow.n) > BARE_BACKLOG_CAP) maxNewThisRun = 1;
+    } catch { /* bare count failed; keep the default cap */ }
     // Verdict writes batch (F3): signal UPDATEs and notes appends accumulate
     // here and go out as ONE env.DB.batch after the loop — the collect phase
     // proved batching cuts ~9s to ~0.5s. New-row INSERTs and the slug-collision
@@ -353,7 +362,7 @@ Rules: DEFAULT TO NOISE. "new" only when the signal shows a repeatable way to ea
         v.action = "noise"; // supports without a valid id is noise, not new
       }
       if (v.action === "new" && v.title) {
-        if (newInserts >= MAX_NEW_PER_RUN) continue; // overflow new-verdict signals stay processed = 0 for a later tick
+        if (newInserts >= maxNewThisRun) continue; // newInserts >= MAX_NEW_PER_RUN when backlog low; overflow new-verdict signals stay processed = 0 for a later tick
         const slug = slugify(v.title) || `agent-${sig.id}`;
         // Code-enforced humility: live runs proved model calibration is
         // fiction (confidence 10 for a random GitHub repo, outranking the

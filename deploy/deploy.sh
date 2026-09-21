@@ -31,25 +31,10 @@ echo "==> aimoney deploy rev=${REV}"
 # human rows are never overwritten by a redeploy).
 echo "==> D1: schema"
 $WRANGLER d1 execute aimoney --file=d1/schema.sql --remote
-# Migration loop mirrors .github/workflows/deploy-worker.yml ("Apply D1
-# migrations in sorted order"): same sorted glob, same tolerate-list,
-# verbatim — keep both in sync so CI and manual deploys converge.
-for f in d1/migrate-*.sql; do
-  [ -e "$f" ] || continue
-  echo "==> D1: migration $f"
-  if out=$($WRANGLER d1 execute aimoney --file="$f" --remote 2>&1); then
-    echo "$out"
-  else
-    case "$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')" in
-      *"duplicate column"*|*"already exists"*)
-        echo "==> D1: $f already applied (continuing)" ;;
-      *)
-        echo "$out"
-        echo "::error::D1 migration $f failed (not a duplicate-column no-op)"
-        exit 1 ;;
-    esac
-  fi
-done
+# D1 migrations run via deploy/apply-d1-migrations.sh (shared with
+# .github/workflows/deploy-worker.yml "Apply D1 migrations in sorted order"):
+# same sorted glob, same tolerate-list — one home so CI and manual deploys converge.
+WRANGLER="$WRANGLER" ./deploy/apply-d1-migrations.sh
 # Seed guard (fail closed): COUNT must be a readable row count. A failed
 # measurement aborts the deploy before the seed step — never seed on a
 # failed read (a blind re-seed duplicates briefs/experiments on live D1).
