@@ -134,7 +134,10 @@ export const outcomeLedgerLine = ({ day, name, status, result, revenue_cents, sp
 // rejections land here.
 const missingColumnOf = (err) => {
   const msg = err instanceof Error ? err.message : String(err ?? "");
-  const m = /no such column:\s*([A-Za-z_][\w.]*)/i.exec(msg);
+  // SQLite words the same fault two ways: UPDATE/SELECT say "no such column: X",
+  // INSERT says "table T has no column named X". Matching only the first left the
+  // $0 INSERT retry dead on the live pre-money table (POST answered 500).
+  const m = /(?:no such column:\s*|has no column named\s+)([A-Za-z_][\w.]*)/i.exec(msg);
   return m ? m[1] : null;
 };
 function authed(request, env) {

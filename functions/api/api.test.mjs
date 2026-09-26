@@ -2035,15 +2035,24 @@ describe("failed self-migration retry (audit 2026-09-20-round8 Task 4)", () => {
   });
 });
 
+// Real SQLite (D1) wording, checked with node:sqlite: an INSERT naming a missing
+// column says "table experiments has no column named X"; UPDATE/SELECT say
+// "no such column: X". Stubs must use the right one per statement, or a handler
+// that recognises only one wording passes here and fails live.
+const sqliteMissingColumn = (sql, col) => new Error(/^\s*INSERT/i.test(sql)
+  ? `D1_ERROR: table experiments has no column named ${col}: SQLITE_ERROR`
+  : `D1_ERROR: no such column: ${col}: SQLITE_ERROR`);
+
 describe("experiment-write revenue_source tolerance (audit 2026-09-20-round3 Task 2)", () => {
-  const columnBoom = new Error("INSERT INTO experiments (...) failed: no such column: revenue_source (SQLITE_ERROR)");
   // Old-schema table: statements touching revenue_source throw the narrow
-  // driver error; the retried statements (without that column) succeed.
+  // driver error, worded as real SQLite words it for that statement type; the
+  // retried statements (without that column) succeed.
   const oldWriteDB = () => {
     const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
     const realPrepare = db.prepare.bind(db);
     db.prepare = (sql) => {
       if (sql.includes("revenue_source")) {
+        const columnBoom = sqliteMissingColumn(sql, "revenue_source");
         return {
           _sql: sql, _args: [],
           bind(...a) { return this; },
@@ -2881,7 +2890,7 @@ describe("$0 experiment writes on pre-money tables (audit 2026-09-26-round2 Task
         ? missing.find((c) => sql.includes(c))
         : null;
       if (hit) {
-        const boom = new Error(`experiments write failed: no such column: ${hit} (SQLITE_ERROR)`);
+        const boom = sqliteMissingColumn(sql, hit);
         return {
           _sql: sql, _args: [],
           bind(...a) { return this; },
