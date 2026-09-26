@@ -3,7 +3,7 @@
 // Run: npm test (node --test, no framework)
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { onRequest, _resetSchemaMigrationForTests, outcomeLedgerLine } from "./[[path]].js";
+import { onRequest, _resetSchemaMigrationForTests, _resetSweptSplitForTests, outcomeLedgerLine } from "./[[path]].js";
 import { effectiveScore as workerEffectiveScore } from "../../worker/src/lib.js";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -36,7 +36,8 @@ function makeDB(seed = {}) {
     if (unreviewed) rows = rows.filter((o) => String(o.notes || "").includes("UNREVIEWED"));
     if (vettedNoExp) {
       const withExp = new Set(data.experiments.map((e) => String(e.opportunity_id)));
-      rows = rows.filter((o) => String(o.notes || "").includes("vetted]") && !withExp.has(String(o.id)));
+      const excludeKilled = sql.includes("status != 'killed'");
+      rows = rows.filter((o) => String(o.notes || "").includes("vetted]") && (!excludeKilled || o.status !== "killed") && !withExp.has(String(o.id)));
     }
     if (sql.includes("o.created_at ASC")) {
       rows.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || a.id - b.id);
@@ -190,10 +191,19 @@ function makeDB(seed = {}) {
       return { n };
     }
     if (sql.includes("FROM signals") && sql.includes("COUNT(*)")) {
+      // Swept split (audit 2026-09-26-round3 Task 3): the swept-total probe
+      // counts every swept row (no window — swept rows are old by
+      // definition); the verdict-only probe drops swept rows from the 24h
+      // window; the legacy combined probe counts the window unfiltered.
+      if (sql.includes("swept = 1") && !sql.includes("processed")) {
+        return { n: data.signals.filter((s) => Number(s.swept) === 1).length };
+      }
+      const verdictOnly = sql.includes("swept = 0");
       const cutoffArg = Date.parse(args[0] || "");
       const cutoff = Number.isFinite(cutoffArg) ? cutoffArg : Date.now() - 86400000;
       let n = 0;
       for (const s of data.signals) {
+        if (verdictOnly && Number(s.swept) === 1) continue;
         if (Number(s.processed) !== 1) continue;
         if (s.opportunity_id !== null && s.opportunity_id !== undefined) continue;
         const ms = Date.parse(s.created_at || "");
@@ -203,7 +213,8 @@ function makeDB(seed = {}) {
     }
     if (sql.includes("vetted]%") && sql.includes("NOT EXISTS")) {
       const withExp = new Set(data.experiments.map((e) => String(e.opportunity_id)));
-      return { n: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]") && !withExp.has(String(o.id))).length };
+      const excludeKilled = sql.includes("status != 'killed'");
+      return { n: data.opportunities.filter((o) => String(o.notes || "").includes("vetted]") && (!excludeKilled || o.status !== "killed") && !withExp.has(String(o.id))).length };
     }
     if (sql.includes("vetted]%") && /\[\d{4}-\d{2}-\d{2} vetted\]/.test(sql)) {
       // Tag-date vetted count: emulate each inlined [YYYY-MM-DD vetted] LIKE.
@@ -421,6 +432,24 @@ function oldSchemaDB(seed = {}, opts = {}) {
     return realBatch(stmts);
   };
   db._oldSchema = { columns, writes, pragmaCalls: () => pragmaCalls };
+  return db;
+}
+
+// Pre-migration signals table (audit 2026-09-26-round3 Task 3): every base
+// column except swept. Any SELECT naming swept throws "no such column" —
+// while the batched legacy probes (which never name it) keep answering,
+// like live D1.
+function oldSignalsSchemaDB(seed = {}) {
+  const db = makeDB(seed);
+  const realPrepare = db.prepare.bind(db);
+  db.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (sql.includes("swept")) {
+      stmt.first = async () => { throw new Error("no such column: swept"); };
+      stmt.all = async () => { throw new Error("no such column: swept"); };
+    }
+    return stmt;
+  };
   return db;
 }
 
@@ -822,7 +851,7 @@ describe("triage noise (Task 3)", () => {
     const db = makeDB({ opportunities: oppSeed(), signals: [] });
     const r = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(r.status, 200);
-    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "time"]) {
+    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "swept_total", "time"]) {
       assert.ok(k in r.body, "health missing " + k);
     }
   });
@@ -917,7 +946,7 @@ describe("experiment revenue/spend cents (audit 2026-09-20 Task 4)", () => {
     const db = makeDB({ opportunities: oppSeed() });
     const r = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(r.status, 200);
-    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "revenue_last_7d", "time"]) {
+    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "swept_total", "revenue_last_7d", "time"]) {
       assert.ok(k in r.body, "health missing " + k);
     }
     assert.equal(r.body.revenue_last_7d, 0);
@@ -1230,7 +1259,7 @@ describe("lifetime revenue/spend totals (audit 2026-09-20-round1 Task 3)", () =>
     const db = makeDB({ opportunities: oppSeed() });
     const r = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(r.status, 200);
-    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "revenue_last_7d", "revenue_total", "spent_total", "time"]) {
+    for (const k of ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "swept_total", "revenue_last_7d", "revenue_total", "spent_total", "time"]) {
       assert.ok(k in r.body, "health missing " + k);
     }
     assert.equal(r.body.revenue_total, 0);
@@ -1319,7 +1348,7 @@ describe("health batch + rev cache (audit 2026-09-20-round2 Task 2)", () => {
     assert.equal(r.status, 200);
     assert.equal(db._batchCalls, 1, "health must issue exactly one DB.batch");
     const prepared = db._prepared || [];
-    assert.equal(prepared.length, 12, `health must prepare 12 statements, got ${prepared.length}`);
+    assert.equal(prepared.length, 14, `health must prepare 14 statements (12 batched + 2 noise/swept split), got ${prepared.length}`);
     assert.ok(prepared.some((s) => s.includes("COUNT(*)") && s.includes("FROM experiments") && s.includes("-7 days") && !s.includes("SUM(")), "decisions COUNT must run without any money column");
     assert.ok(prepared.some((s) => s.includes("SUM(revenue_cents)") && s.includes("-7 days") && !s.includes("COUNT(*)")), "revenue week SUM must run as its own probe");
     assert.ok(prepared.some((s) => s.includes("SUM(revenue_cents)") && s.includes("SUM(spent_cents)")), "lifetime totals must merge to one scan");
@@ -1330,7 +1359,7 @@ describe("health batch + rev cache (audit 2026-09-20-round2 Task 2)", () => {
     const db = makeDB({ opportunities: oppSeed() });
     const r = await callApi(["health"], "http://localhost/api/health", {}, db);
     assert.equal(r.status, 200);
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "swept_total", "inflow_paused", "time"]);
   });
 
   it("reports merged figures identical to the old per-query math", async () => {
@@ -1409,7 +1438,7 @@ describe("list needs_review bit + excerpt cap (audit 2026-09-20-round3 Task 2)",
 });
 
 describe("health outage honesty (audit 2026-09-20-round2 Task 1)", () => {
-  const COUNT_KEYS = ["opportunities", "unreviewed", "bare_without_brief", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h"];
+  const COUNT_KEYS = ["opportunities", "unreviewed", "bare_without_brief", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "swept_total"];
   // Total outage: the batch AND every individual statement fail, so the
   // isolation fallback finds zero answering probes (a batch-only throw now
   // recovers via the per-probe re-run below).
@@ -1444,7 +1473,7 @@ describe("health outage honesty (audit 2026-09-20-round2 Task 1)", () => {
     assert.equal(r.body.last_verdict, null, "health last_verdict must be null during a DB outage");
     assert.equal(r.body.experiments_by_status, null, "health experiments_by_status must be null during a DB outage, not {}");
     assert.equal(r.body.inflow_paused, null, "health inflow_paused must be null during a DB outage, not false");
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "swept_total", "inflow_paused", "time"]);
   });
 
   it("unchanged verify.sh ok:true grep fails the outage payload, passes the healthy one", async () => {
@@ -1579,7 +1608,7 @@ describe("health probe isolation (audit 2026-09-20-round1 Task 1)", () => {
   it("names the failing probe, keeps existing keys byte-identical for verify.sh", async () => {
     const r = await callApi(["health"], "http://localhost/api/health", {}, oneBadProbeDB());
     assert.deepEqual(r.body.health_probe_failures, ["revenue_lifetime"]);
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time", "health_probe_failures", "health_probe_detail"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "swept_total", "inflow_paused", "time", "health_probe_failures", "health_probe_detail"]);
     assert.deepEqual(r.body.health_probe_detail, { revenue_lifetime: "spent_cents" });
     assert.ok(JSON.stringify(r.body).includes('"ok":true'), "partial payload must keep the verify.sh marker");
   });
@@ -1621,7 +1650,7 @@ describe("health probe isolation (audit 2026-09-20-round1 Task 1)", () => {
     assert.equal(r.body.db, "up");
     assert.ok(!("health_probe_failures" in r.body), "a batch that rejects spuriously must not attach an empty failures key");
     assert.ok(!("health_probe_detail" in r.body), "a batch that rejects spuriously must not attach a detail key either");
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "swept_total", "inflow_paused", "time"]);
     assert.equal(r.body.opportunities, 3);
     assert.equal(r.body.unreviewed, 2);
     assert.equal(r.body.decisions_last_7d, 1);
@@ -2206,7 +2235,7 @@ describe("decisions COUNT split from revenue SUM (audit 2026-09-20-round4 Task 1
     assert.equal(r.body.spent_total, 1200);
     assert.deepEqual(r.body.health_probe_failures, ["revenue_week"]);
     assert.deepEqual(r.body.health_probe_detail, { revenue_week: "revenue_cents" });
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time", "health_probe_failures", "health_probe_detail"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "swept_total", "inflow_paused", "time", "health_probe_failures", "health_probe_detail"]);
   });
 });
 
@@ -2603,7 +2632,7 @@ describe("experiments_by_status null on probe failure (audit 2026-09-20-round2 T
   it("all other keys stay byte-identical when only the status probe fails", async () => {
     const healthy = await callApi(["health"], "http://localhost/api/health", {}, makeDB(twoExpSeed()));
     const partial = await callApi(["health"], "http://localhost/api/health", {}, statusProbeDownDB());
-    for (const k of ["opportunities", "unreviewed", "bare_without_brief", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h"]) {
+    for (const k of ["opportunities", "unreviewed", "bare_without_brief", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "vetted_no_experiment", "noise_24h", "swept_total"]) {
       assert.deepEqual(partial.body[k], healthy.body[k], `key ${k} changed while only the status probe failed`);
     }
     assert.deepEqual(partial.body.last_vetted, healthy.body.last_vetted);
@@ -2611,7 +2640,7 @@ describe("experiments_by_status null on probe failure (audit 2026-09-20-round2 T
     assert.deepEqual(partial.body.inflow_paused, healthy.body.inflow_paused, "inflow_paused changed while only the status probe failed");
     assert.deepEqual(healthy.body.experiments_by_status, { won: 1, planned: 1 });
     assert.equal(partial.body.experiments_by_status, null);
-    assert.deepEqual(Object.keys(partial.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time", "health_probe_failures", "health_probe_detail"]);
+    assert.deepEqual(Object.keys(partial.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "swept_total", "inflow_paused", "time", "health_probe_failures", "health_probe_detail"]);
   });
 });
 
@@ -2715,7 +2744,7 @@ describe("last-verdict probe row bound (audit 2026-09-20-round3 Task 3)", () => 
     const tailRows = await db.prepare(probeSql[0]).all();
     assert.equal((tailRows.results || []).length, 2000, "probe must transfer exactly the 2000-row window");
     // Every other health key byte-identical (values + order for verify.sh).
-    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "inflow_paused", "time"]);
+    assert.deepEqual(Object.keys(r.body), ["ok", "rev", "db", "opportunities", "unreviewed", "bare_without_brief", "experiments_by_status", "hours_since_last_ok_run", "oldest_unreviewed_age_h", "decisions_last_7d", "revenue_last_7d", "revenue_total", "spent_total", "vetted_last_7d", "last_vetted", "last_verdict", "vetted_no_experiment", "noise_24h", "swept_total", "inflow_paused", "time"]);
     assert.equal(r.body.ok, true);
     assert.equal(r.body.db, "up");
     assert.equal(r.body.opportunities, 2001);
@@ -3032,7 +3061,10 @@ describe("$0 experiment writes on pre-money tables (audit 2026-09-26-round2 Task
 describe("vetted_no_experiment list filter (audit 2026-09-26-round2 Task 3)", () => {
   // Same discriminators as the health probe's own fixture (round3 Task 2):
   // vetted bare, vetted with an experiment, a bare "vetted]" mention, an
-  // unreviewed row, and a never-vetted row ("vetted" without the bracket).
+  // unreviewed row, and a never-vetted row ("vetted" without the bracket) —
+  // plus the killed-exclusion pair (audit 2026-09-26-round3 Task 2): a
+  // vetted-then-killed bare row (kept vetted tag, must read nowhere) and a
+  // vetted paused bare row (live, must still read).
   const filterSeed = () => ({
     opportunities: [
       { id: 1, slug: "vetted-bare", title: "Vetted bare", one_liner: "", category: "services", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x\n[2026-09-18 vetted] Human vetted; cap lifted.", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
@@ -3040,6 +3072,8 @@ describe("vetted_no_experiment list filter (audit 2026-09-26-round2 Task 3)", ()
       { id: 3, slug: "mention-only", title: "Mention only", one_liner: "", category: "other", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal vetted] but never an experiment", created_at: "2026-09-12T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
       { id: 4, slug: "unreviewed", title: "Unreviewed", one_liner: "", category: "other", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal UNREVIEWED", created_at: "2026-09-13T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
       { id: 5, slug: "plain", title: "Plain", one_liner: "", category: "other", status: "backlog", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "human seed, never vetted", created_at: "2026-09-14T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
+      { id: 6, slug: "vet-then-killed", title: "Vet then killed", one_liner: "", category: "services", status: "killed", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x\n[2026-09-18 vetted] Human vetted; cap lifted.\n[2026-09-19 killed] no demand", created_at: "2026-09-15T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
+      { id: 7, slug: "vetted-paused", title: "Vetted paused", one_liner: "", category: "services", status: "paused", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "z\n[2026-09-18 vetted] Human vetted; cap lifted.", created_at: "2026-09-16T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
     ],
     experiments: [
       { id: 1, opportunity_id: 2, name: "E", status: "running" },
@@ -3051,7 +3085,16 @@ describe("vetted_no_experiment list filter (audit 2026-09-26-round2 Task 3)", ()
     const db = makeDB(filterSeed());
     const r = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1", {}, db);
     assert.equal(r.status, 200);
-    assert.deepEqual(ids(r.body.opportunities), [1, 3]);
+    assert.deepEqual(ids(r.body.opportunities), [1, 3, 7]);
+  });
+
+  it("a vetted-then-killed bare row counts nowhere while a vetted paused row still counts", async () => {
+    const db = makeDB(filterSeed());
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.status, 200);
+    assert.equal(health.body.vetted_no_experiment, 3, "probe must exclude the killed row and include the paused row");
+    const list = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1", {}, db);
+    assert.deepEqual(ids(list.body.opportunities), [1, 3, 7], "filter must exclude the killed row and include the paused row");
   });
 
   it("matches the health vetted_no_experiment probe row-for-row on the same fixture", async () => {
@@ -3062,7 +3105,7 @@ describe("vetted_no_experiment list filter (audit 2026-09-26-round2 Task 3)", ()
     assert.equal(list.body.opportunities.length, health.body.vetted_no_experiment, "filter count must equal the probe count");
     const withExp = new Set(db.data.experiments.map((e) => String(e.opportunity_id)));
     const predicateIds = db.data.opportunities
-      .filter((o) => String(o.notes || "").includes("vetted]") && !withExp.has(String(o.id)))
+      .filter((o) => String(o.notes || "").includes("vetted]") && o.status !== "killed" && !withExp.has(String(o.id)))
       .map((o) => o.id).sort((a, b) => a - b);
     assert.deepEqual(ids(list.body.opportunities), predicateIds, "filter rows must equal the probe predicate rows");
   });
@@ -3073,8 +3116,12 @@ describe("vetted_no_experiment list filter (audit 2026-09-26-round2 Task 3)", ()
     assert.deepEqual(ids(byStatus.body.opportunities), [1, 3]);
     const testingOnly = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1&status=testing", {}, db);
     assert.deepEqual(ids(testingOnly.body.opportunities), [], "the testing vetted row has an experiment, so the filter reads empty");
+    const pausedOnly = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1&status=paused", {}, db);
+    assert.deepEqual(ids(pausedOnly.body.opportunities), [7], "paused rows can resume, so they stay in the filter");
+    const killedOnly = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1&status=killed", {}, db);
+    assert.deepEqual(ids(killedOnly.body.opportunities), [], "killed rows never need an experiment, even with a vetted tag");
     const oldest = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1&sort=oldest", {}, db);
-    assert.deepEqual((oldest.body.opportunities || []).map((o) => o.id), [1, 3], "oldest-first must order by created_at");
+    assert.deepEqual((oldest.body.opportunities || []).map((o) => o.id), [1, 3, 7], "oldest-first must order by created_at");
     const limited = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1&limit=1", {}, db);
     assert.equal(limited.body.opportunities.length, 1);
   });
@@ -3083,6 +3130,65 @@ describe("vetted_no_experiment list filter (audit 2026-09-26-round2 Task 3)", ()
     const db = makeDB(filterSeed());
     const r = await callApi(["opportunities"], "http://localhost/api/opportunities", {}, db);
     assert.equal(r.status, 200);
-    assert.deepEqual(ids(r.body.opportunities), [1, 2, 3, 4, 5]);
+    assert.deepEqual(ids(r.body.opportunities), [1, 2, 3, 4, 5, 6, 7]);
+  });
+});
+
+describe("swept/noise split (audit 2026-09-26-round3 Task 3)", () => {
+  const hoursAgo = (n) => new Date(Date.now() - n * 3600000).toISOString();
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+  // Two verdict-noise rows (one legacy-shaped, no swept key), one
+  // recent-but-swept row (synthetic — real sweeps only mark >30d rows — to
+  // prove swept rows no longer inflate the 24h noise count), one old swept
+  // row, plus supports/unprocessed controls that never count as noise.
+  const splitSeed = () => ({
+    opportunities: oppSeed(),
+    signals: [
+      { id: 1, processed: 1, opportunity_id: null, swept: 0, created_at: hoursAgo(2) },
+      { id: 2, processed: 1, opportunity_id: null, created_at: hoursAgo(20) },
+      { id: 3, processed: 1, opportunity_id: null, swept: 1, created_at: hoursAgo(5) },
+      { id: 4, processed: 1, opportunity_id: null, swept: 1, created_at: daysAgo(40) },
+      { id: 5, processed: 1, opportunity_id: 1, swept: 0, created_at: hoursAgo(2) },
+      { id: 6, processed: 0, opportunity_id: null, swept: 0, created_at: hoursAgo(2) },
+    ],
+  });
+
+  it("splits verdict-only noise_24h from the swept_total count", async () => {
+    _resetSweptSplitForTests();
+    const db = makeDB(splitSeed());
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.noise_24h, 2, "verdict-only noise must exclude swept rows");
+    assert.equal(r.body.swept_total, 2, "swept_total must count every swept row regardless of age");
+    const prepared = db._prepared || [];
+    assert.ok(prepared.some((s) => s.includes("swept = 0") && s.includes("created_at >=")), "health lost the verdict-only noise probe");
+    assert.ok(prepared.some((s) => s.includes("swept = 1") && !s.includes("processed")), "health lost the swept-total probe");
+  });
+
+  it("pre-migration tables report the combined count under noise_24h with swept_total null, never failing", async () => {
+    _resetSweptSplitForTests();
+    const db = oldSignalsSchemaDB(splitSeed());
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.db, "up");
+    assert.equal(r.body.noise_24h, 3, "old tables report the combined count under the old key");
+    assert.equal(r.body.swept_total, null, "unknown swept count reads null, never 0");
+    assert.ok(!("health_probe_failures" in r.body), "the expected old-schema split must not pollute the failures key");
+  });
+
+  it("caches the missing column per isolate: later calls skip the split probes", async () => {
+    _resetSweptSplitForTests();
+    const db = oldSignalsSchemaDB(splitSeed());
+    await callApi(["health"], "http://localhost/api/health", {}, db);
+    const firstSwept = (db._prepared || []).filter((s) => s.includes("swept")).length;
+    assert.ok(firstSwept >= 1, "the first call must attempt the split");
+    const before = (db._prepared || []).length;
+    const r = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(r.body.noise_24h, 3);
+    assert.equal(r.body.swept_total, null);
+    const retried = (db._prepared || []).slice(before).filter((s) => s.includes("swept")).length;
+    assert.equal(retried, 0, "later calls must skip the split once pre-migration is confirmed");
+    _resetSweptSplitForTests();
   });
 });

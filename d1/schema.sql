@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS signals (
   published_at  TEXT NOT NULL DEFAULT '',
   opportunity_id INTEGER REFERENCES opportunities(id) ON DELETE SET NULL,
   processed     INTEGER NOT NULL DEFAULT 0,
+  swept         INTEGER NOT NULL DEFAULT 0,
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   UNIQUE(source, external_id)
 );

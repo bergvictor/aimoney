@@ -53,9 +53,10 @@ describe("oldest-first triage with staleness bound (static guard)", () => {
     assert.ok(!src.includes("SELECT * FROM signals WHERE processed = 0 ORDER BY id DESC"), "triage still starves older signals newest-first");
   });
 
-  it("marks signals older than 30d as noise with a count", () => {
+  it("marks signals older than 30d as swept with a count (legacy shape kept for pre-migration tables)", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.js"), "utf8");
-    assert.ok(src.includes("UPDATE signals SET processed = 1 WHERE processed = 0"), "worker lost the stale-mark UPDATE");
+    assert.ok(src.includes("UPDATE signals SET processed = 1, swept = 1 WHERE processed = 0"), "worker lost the swept-mark UPDATE");
+    assert.ok(src.includes("UPDATE signals SET processed = 1 WHERE processed = 0"), "worker lost the legacy stale-mark retry");
     assert.ok(src.includes("-30 days"), "worker lost the 30-day staleness bound");
     assert.ok(src.includes("state.stale"), "worker lost the stale-signal count");
   });
@@ -1899,10 +1900,12 @@ describe("silent worker failures carry markers (audit 2026-09-20-round4 Task 3)"
     const bareRow = { id: 7, title: "Bare row", one_liner: "needs evidence", score: 9000, notes: "UNREVIEWED", created_at: now };
     const inserted = [];
     const briefedIds = [];
+    const prepared = [];
     let nextId = 1000;
     let runError = "";
     const DB = {
       prepare(sql) {
+        prepared.push(sql);
         const stmt = {
           sql,
           params: [],
@@ -1949,8 +1952,9 @@ describe("silent worker failures carry markers (audit 2026-09-20-round4 Task 3)"
               if (s) s.processed = 1;
               return {};
             }
-            if (sql.includes("UPDATE signals SET processed = 1 WHERE processed = 0 AND")) {
+            if (sql.includes("UPDATE signals SET processed = 1") && sql.includes("WHERE processed = 0 AND")) {
               if (failOn === "stale") throw new Error("D1 stale sweep down");
+              if (failOn === "pre-migration-sweep" && sql.includes("swept = 1")) throw new Error("no such column: swept");
               return { meta: { changes: 0 } };
             }
             if (sql.includes("UPDATE agent_runs SET finished_at")) {
@@ -1973,7 +1977,7 @@ describe("silent worker failures carry markers (audit 2026-09-20-round4 Task 3)"
         return { response: text.includes("FRESH SIGNALS") ? CLASSIFY_REPLY : BRIEF_JSON };
       },
     };
-    return { env: { DB, AI }, signals, inserted, briefedIds, runError: () => runError };
+    return { env: { DB, AI }, signals, inserted, briefedIds, prepared, runError: () => runError };
   }
 
   async function runTick(failOn) {
@@ -1983,7 +1987,7 @@ describe("silent worker failures carry markers (audit 2026-09-20-round4 Task 3)"
     globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
     try {
       const result = await runResearch(t.env, "cron");
-      return { result, signals: t.signals, inserted: t.inserted, briefedIds: t.briefedIds, runError: t.runError() };
+      return { result, signals: t.signals, inserted: t.inserted, briefedIds: t.briefedIds, prepared: t.prepared, runError: t.runError() };
     } finally {
       globalThis.fetch = realFetch;
       _resetBriefSkippedForTests();
@@ -1997,6 +2001,17 @@ describe("silent worker failures carry markers (audit 2026-09-20-round4 Task 3)"
     assert.equal(t.inserted.length, 2, "triage verdicts must still flush when the sweep throws");
     assert.deepEqual(t.signals.map((s) => s.processed), [1, 1]);
     assert.deepEqual(t.briefedIds, [7], "brief pass must still run when the sweep throws");
+  });
+
+  it("a pre-migration signals table retries the legacy sweep with no stale:failed (audit 2026-09-26-round3 Task 3)", async () => {
+    const t = await runTick("pre-migration-sweep");
+    assert.equal(t.result.status, "ok", `legacy retry must not fail the tick: ${t.result.error || "(no error)"}`);
+    assert.ok(!t.runError.includes("stale:failed"), `legacy retry must not mark the sweep failed: ${t.runError}`);
+    assert.ok(t.prepared.some((s) => s.includes("swept = 1")), "the sweep must try the swept marker first");
+    assert.ok(t.prepared.some((s) => s.includes("UPDATE signals SET processed = 1 WHERE processed = 0")), "the sweep must retry the legacy shape pre-migration");
+    assert.equal(t.inserted.length, 2, "triage verdicts must still flush after the legacy retry");
+    assert.deepEqual(t.signals.map((s) => s.processed), [1, 1]);
+    assert.deepEqual(t.briefedIds, [7], "brief pass must still run after the legacy retry");
   });
 
   it("failed pre-pass selects finish ok with prepass_select:failed and full AI triage", async () => {

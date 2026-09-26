@@ -728,6 +728,18 @@ const STARTER_TEMPLATES = {
   },
 };
 
+// Modal starter prefill (audit 2026-09-26-round3 Task 1): the generic
+// Log-experiment modal shares the draft values with Vet & log starter. Pure
+// over the opportunity list + selected id: a template slug returns the
+// draft's exact name/hypothesis/metric/target, anything else returns blanks.
+// Never touches status — the owner flips to testing in the drawer.
+function modalStarterPrefill(opps, oppId) {
+  const o = (opps || []).find((x) => String(x.id) === String(oppId));
+  const t = o ? STARTER_TEMPLATES[o.slug] : null;
+  if (!t) return { name: "", hypothesis: "", metric: "", target: "" };
+  return { name: t.name, hypothesis: t.hypothesis, metric: t.metric, target: t.target };
+}
+
 async function vetAndLogStarter(id) {
   if (!await fetchDetailForWrite(id, "Starter")) return;
   return vetAndLogStarterInner(id);
@@ -1501,20 +1513,25 @@ function openExperimentModal(exp, defaultOpp = null) {
   if (!state.token) return toast("Enter the admin token first.");
   const isNew = !exp;
   const opps = state.opportunities;
+  // Starter prefill (audit 2026-09-26-round3 Task 1): a new modal opened for
+  // one of the three $0 draft rows starts with the draft's exact
+  // name/hypothesis/metric/target; unknown slugs start blank, byte-identical
+  // to before. Every field stays editable; status never auto-moves here.
+  const pre = isNew ? modalStarterPrefill(opps, defaultOpp) : { name: "", hypothesis: "", metric: "", target: "" };
   const f = showModal(`
     <h3>${isNew ? "Log experiment" : "Update experiment"}</h3>
     <label>Opportunity
       <select id="m-opp">${opps.map((o) =>
         `<option value="${o.id}" ${String(o.id) === String(isNew ? defaultOpp : exp.opportunity_id) ? "selected" : ""}>${esc(o.title)}</option>`).join("")}</select></label>
-    <label>Name<input id="m-name" required maxlength="200" value="${esc(exp?.name || "")}"></label>
-    <label>Hypothesis<textarea id="m-hyp">${esc(exp?.hypothesis || "")}</textarea></label>
+    <label>Name<input id="m-name" required maxlength="200" value="${esc(isNew ? pre.name : (exp?.name || ""))}"></label>
+    <label>Hypothesis<textarea id="m-hyp">${esc(isNew ? pre.hypothesis : (exp?.hypothesis || ""))}</textarea></label>
     <div class="row">
       <label>Status<select id="m-status">
         ${["planned", "running", "won", "lost", "paused"].map((s) =>
           `<option ${exp?.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></label>
       <label>Budget cap<input id="m-budget" value="${esc(exp?.budget_cap || "")}"></label>
-      <label>Metric<input id="m-metric" value="${esc(exp?.metric || "")}"></label>
-      <label>Target<input id="m-target" value="${esc(exp?.target || "")}"></label>
+      <label>Metric<input id="m-metric" value="${esc(isNew ? pre.metric : (exp?.metric || ""))}"></label>
+      <label>Target<input id="m-target" value="${esc(isNew ? pre.target : (exp?.target || ""))}"></label>
       <label>Spent (free text, not counted)<input id="m-spent" value="${esc(exp?.spent || "")}"></label>
       <label>Revenue received ($)<input id="m-revenue" inputmode="decimal" value="${esc(exp?.revenue_cents ? (exp.revenue_cents / 100) : "")}"><span class="muted">Only money actually received — counts toward lifetime revenue on save.</span></label>
       <label>Precise spend ($)<input id="m-spend" inputmode="decimal" value="${esc(exp?.spent_cents ? (exp.spent_cents / 100) : "")}"><span class="muted">Only money actually spent — counts toward lifetime spend on save.</span></label>
@@ -1549,6 +1566,24 @@ function openExperimentModal(exp, defaultOpp = null) {
       if (state.detail) openDrawer(state.detail.opportunity.id);
     } catch (e) { toast(`Save failed: ${e.message}${missingMoneyColumnHint(e.message)}`); }
   });
+  // Switching the opportunity dropdown to a template slug fills only the
+  // fields the human left empty — typed edits are never overwritten, and
+  // unknown slugs leave every field untouched.
+  if (isNew) {
+    const oppSel = f.querySelector("#m-opp");
+    if (oppSel) oppSel.addEventListener("change", () => {
+      const t = modalStarterPrefill(opps, oppSel.value);
+      if (!t.name && !t.hypothesis && !t.metric && !t.target) return;
+      const nameEl = f.querySelector("#m-name");
+      if (nameEl && !nameEl.value) nameEl.value = t.name;
+      const hypEl = f.querySelector("#m-hyp");
+      if (hypEl && !hypEl.value) hypEl.value = t.hypothesis;
+      const metricEl = f.querySelector("#m-metric");
+      if (metricEl && !metricEl.value) metricEl.value = t.metric;
+      const targetEl = f.querySelector("#m-target");
+      if (targetEl && !targetEl.value) targetEl.value = t.target;
+    });
+  }
 }
 $("#btn-add-exp").addEventListener("click", () => openExperimentModal(null));
 
