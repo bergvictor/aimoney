@@ -30,7 +30,8 @@ See the result in `/api/health` on the very next call: the two missing money
 columns are added, `revenue_last_7d`/`revenue_total`/`spent_total` report
 numbers instead of null, and `schema_missing_columns` plus the
 `schema_migration: disabled …` line disappear. Until then every revenue/spend
-figure is honestly unknown (null), never $0.
+figure is honestly unknown (null), never $0. $0 starters still log, Start,
+and close before the switch — only $ figures need it.
 
 Second track: the switch adds only the two money columns (`revenue_cents`,
 `spent_cents`). The `via {source}` column (`revenue_source`) arrives via the

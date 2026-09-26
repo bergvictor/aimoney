@@ -6,6 +6,7 @@ const $ = (sel, el = document) => el.querySelector(sel);
 const state = {
   opportunities: [], experiments: [], runs: [], meta: {},
   statusFilter: "", detail: null, reviewOnly: false, reviewList: [], zeroOnly: false,
+  vettedNoExpOnly: false, vettedNoExpList: [],
   health: {},
   apiFailures: [],
   token: localStorage.getItem("aimoney_admin") || "",
@@ -192,10 +193,23 @@ function paintStartHere(el, top, staleMark) {
 function renderLedger() {
   renderStartHere();
   if (state.reviewOnly) return renderReview();
+  if (state.vettedNoExpOnly) return renderVettedNoExp();
   const rows = state.opportunities.filter((o) =>
     (!state.statusFilter || o.status === state.statusFilter) && (!state.zeroOnly || isZeroSpend(o)));
   const max = Math.max(1, ...state.opportunities.map((o) => o.score || 0));
-  $("#ledger-body").innerHTML = rows.length ? rows.map((o, i) => `
+  $("#ledger-body").innerHTML = rows.length ? rows.map((o, i) => ledgerRowHtml(o, i, max)).join("")
+    : (state.apiFailures.includes("/api/opportunities")
+      ? `<tr><td colspan="10" class="muted">Could not load the priority list — see the banner above and retry.</td></tr>`
+      : `<tr><td colspan="10" class="muted">Nothing here. The next agent run may add some — or add one yourself.</td></tr>`);
+  document.querySelectorAll("#ledger-body tr.row").forEach((tr) => {
+    tr.addEventListener("click", () => openDrawer(Number(tr.dataset.id)));
+  });
+}
+
+// Plain ledger row (shared by the full list above and the vetted-no-experiment
+// filter below): one template, so the filtered rows read identical to the same
+// rows unfiltered — same cells, same badges, same drawer click.
+const ledgerRowHtml = (o, i, max) => `
     <tr class="row" data-id="${o.id}">
       <td class="num rank">${i + 1}</td>
       <td><div class="opp-title">${esc(o.title)} <span class="cat muted">· ${esc(o.category)}</span></div>
@@ -207,13 +221,38 @@ function renderLedger() {
       <td class="meter-col">${meter(o.confidence)}</td><td class="meter-col">${meter(o.fit)}</td>
       <td class="num money">${money(o.est_monthly_low, o.est_monthly_high)}</td>
       <td class="muted">${esc(o.time_to_first_dollar || "—")}</td>
-    </tr>`).join("")
+    </tr>`;
+
+// Vetted-no-experiment filter view (audit 2026-09-26-round2 Task 3): the
+// health probe's vetted-without-experiment rows through the shared ledger
+// template above, with a notice row naming the filter and its Clear button.
+// Score bars scale against the full list so they match the unfiltered view.
+function renderVettedNoExp() {
+  const rows = state.vettedNoExpList.filter((o) => !state.zeroOnly || isZeroSpend(o));
+  const max = Math.max(1, ...state.opportunities.map((o) => o.score || 0));
+  const notice = `<tr class="filter-notice"><td colspan="10" class="muted">Showing ${rows.length} vetted without experiments <button id="vetted-noexp-clear" class="btn small ghost" type="button">Clear</button></td></tr>`;
+  $("#ledger-body").innerHTML = notice + (rows.length ? rows.map((o, i) => ledgerRowHtml(o, i, max)).join("")
     : (state.apiFailures.includes("/api/opportunities")
       ? `<tr><td colspan="10" class="muted">Could not load the priority list — see the banner above and retry.</td></tr>`
-      : `<tr><td colspan="10" class="muted">Nothing here. The next agent run may add some — or add one yourself.</td></tr>`);
+      : `<tr><td colspan="10" class="muted">None — every vetted row has an experiment.</td></tr>`));
   document.querySelectorAll("#ledger-body tr.row").forEach((tr) => {
     tr.addEventListener("click", () => openDrawer(Number(tr.dataset.id)));
   });
+  const clear = $("#vetted-noexp-clear");
+  if (clear) clear.addEventListener("click", () => setVettedNoExpFilter(false));
+}
+
+// Vetted-no-experiment list refresh: unlike the review queue this filter
+// cannot derive client-side (list rows carry no notes), so while it is open
+// every refresh re-fetches it — a just-logged experiment drops its row from
+// the view on the next paint. Best-effort: a failed re-fetch keeps the last
+// list (the banner already names any opps outage from the main fetch).
+async function refreshVettedNoExpList() {
+  if (!state.vettedNoExpOnly) return;
+  try {
+    const d = await api("/api/opportunities?vetted_no_experiment=1&limit=200");
+    state.vettedNoExpList = (d && d.opportunities) || [];
+  } catch { /* keep the last list */ }
 }
 
 // Review decision line: capital + next action + source under each review row,
@@ -658,6 +697,37 @@ const missingMoneyColumnHint = (msg) =>
     ? " — schema migration disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)"
     : "";
 
+// $0 starter templates (audit 2026-09-26-round2 Task 2): the three queued
+// drafts define exact modal values for their seed rows, so Vet & log starter
+// prefills those instead of the generic name/metric/target when the row slug
+// matches. Every field stays editable via Update; unknown slugs keep the
+// generic prefill byte-identical. Values copied from the drafts (name/metric
+// from "Logging it", hypothesis from "Hypothesis"); each target is the
+// draft's own 1+ bar (named in "Logging it" for the channel/SERP censuses,
+// in the Decide step for the buyer-signal census, whose Logging section
+// names no target). The drafts stay the source of truth — content tests pin
+// the copy word-for-word.
+const STARTER_TEMPLATES = {
+  "digital-products-prompts": {
+    name: "Buyer-signal census: 10 prompt niches",
+    hypothesis: "At least one of 10 reviewed prompt-pack niches shows two or more independent paying-buyer signals visible on public pages alone (a marketplace listing with visible sales or reviews, a public \"I paid for X\" post, a priced competitor with a changelog younger than 90 days). Falsified if zero niches pass.",
+    metric: "passing niches (0–10)",
+    target: "1+ passing niches",
+  },
+  "faceless-youtube-ai": {
+    name: "Channel census: 10 faceless niches",
+    hypothesis: "At least one of 10 reviewed faceless niches shows two or more independent monetization signals visible on public pages alone (a channel with visible subscriber counts and a steady upload cadence, a video description carrying affiliate links or a sponsor mention, a niche with three or more active channels uploading in the last 30 days). Falsified if zero niches pass.",
+    metric: "passing niches (0–10)",
+    target: "1+ passing niches",
+  },
+  "ai-seo-content-sites": {
+    name: "SERP census: 10 programmatic niches",
+    hypothesis: "At least one of 10 reviewed programmatic niches shows two or more independent traffic-monetization signals visible on public pages alone (a ranking page with visible affiliate links or display ads, a keyword whose top results include two or more thin programmatic pages, a niche with a public traffic estimate attached to a monetized page). Falsified if zero niches pass.",
+    metric: "passing niches (0–10)",
+    target: "1+ passing niches",
+  },
+};
+
 async function vetAndLogStarter(id) {
   if (!await fetchDetailForWrite(id, "Starter")) return;
   return vetAndLogStarterInner(id);
@@ -668,8 +738,9 @@ async function vetAndLogStarterInner(id) {
   const o = state.reviewList.find((x) => x.id === id) || state.opportunities.find((x) => x.id === id);
   if (!o) return;
   const notes = vettedNotes(o.notes);
-  const starterName = `Starter: ${o.title}`.slice(0, 200);
-  const starterHypothesis = String(o.one_liner || firstStepsFirstLine({ first_steps: o.brief_first_steps }) || `Smallest paid test of ${o.title}`).slice(0, 8000);
+  const template = STARTER_TEMPLATES[o.slug] || null;
+  const starterName = (template ? template.name : `Starter: ${o.title}`).slice(0, 200);
+  const starterHypothesis = String(template ? template.hypothesis : (o.one_liner || firstStepsFirstLine({ first_steps: o.brief_first_steps }) || `Smallest paid test of ${o.title}`)).slice(0, 8000);
   const orderBefore = state.reviewList.map((x) => x.id);
   try {
     await api(`/api/opportunities/${id}`, {
@@ -683,8 +754,8 @@ async function vetAndLogStarterInner(id) {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
         opportunity_id: id, name: starterName, hypothesis: starterHypothesis,
-        status: "planned", metric: "replies; revenue",
-        target: `First $ toward ${money(o.est_monthly_low, o.est_monthly_high)}/mo`,
+        status: "planned", metric: template ? template.metric : "replies; revenue",
+        target: template ? template.target : `First $ toward ${money(o.est_monthly_low, o.est_monthly_high)}/mo`,
       }),
     });
     await api(`/api/opportunities/${id}`, {
@@ -808,15 +879,43 @@ document.querySelectorAll(".filters .chip").forEach((chip) => {
     if (zeroChip) zeroChip.classList.toggle("active", !!state.zeroOnly);
     if (chip.dataset.review) {
       state.reviewOnly = true;
+      state.vettedNoExpOnly = false;
       state.statusFilter = "";
       refreshReview().then(renderLedger);
       return;
     }
     state.reviewOnly = false;
+    state.vettedNoExpOnly = false;
     state.statusFilter = chip.dataset.status;
     renderLedger();
   });
 });
+
+// Filter switch behind the week-line button and the notice Clear button
+// (audit 2026-09-26-round2 Task 3): opening fetches the server-side list and
+// jumps to the Priority tab (the filter owns the view, so review/status
+// chips deactivate); closing restores the full list. A failed open keeps the
+// empty list with its toast — never a fabricated full one. Lives after the
+// chip handler so the handler keeps the file's first chip-query literal,
+// which test slices use as a block boundary.
+async function setVettedNoExpFilter(on) {
+  state.vettedNoExpOnly = !!on;
+  if (on) {
+    state.reviewOnly = false;
+    state.statusFilter = "";
+    document.querySelectorAll(".filters .chip").forEach((c) => { if (!c.dataset.zero) c.classList.remove("active"); });
+    try {
+      const d = await api("/api/opportunities?vetted_no_experiment=1&limit=200");
+      state.vettedNoExpList = (d && d.opportunities) || [];
+    } catch (e) {
+      state.vettedNoExpList = [];
+      toast(`Filter failed: ${e.message}`);
+    }
+    activateTab("priority", true);
+  }
+  renderLedger();
+  renderExperiments();
+}
 
 /* ---- experiments board ---- */
 const EXP_COLS = [["running", "Running"], ["planned", "Planned"], ["won", "Won"], ["lost", "Lost"], ["paused", "Paused"]];
@@ -964,9 +1063,16 @@ function renderExperiments() {
     let conv = `${decisions} decisions this week · ${vetted} vetted this week → ${exps.length} total experiments`;
     if (revenue !== null) conv += ` · ${moneyCents(revenue)} revenue this week`;
     if (revenueTotal !== null) conv += ` · ${moneyCents(revenueTotal)} lifetime`;
-    if (vettedNoExp !== null && vettedNoExp > 0) conv += ` · ${vettedNoExp} vetted, no experiment`;
     summary = `${summary} · ${conv}`;
   }
+  // Vetted-no-experiment filter button (audit 2026-09-26-round2 Task 3): the
+  // week-line count renders as a button that filters the Priority ledger to
+  // those rows (server-side — list rows carry no notes). Hidden at 0 or when
+  // the week line itself is null-guarded away; otherwise the summary paints
+  // byte-identical to the text-only shape.
+  const vettedBtn = (decisions !== null && vetted !== null && vettedNoExp !== null && vettedNoExp > 0)
+    ? ` · <button id="exp-vetted-noexp" class="btn small ghost" type="button" aria-pressed="${state.vettedNoExpOnly ? "true" : "false"}" title="Show these rows on the Priority list">${vettedNoExp} vetted, no experiment</button>`
+    : "";
   // Stall nudge (read-only): when the week has zero decisions, name the
   // stalest open card with its age so the next move is one click away.
   // No auto-transitions — the human still owns every status move.
@@ -974,9 +1080,13 @@ function renderExperiments() {
   const summaryEl = $("#exp-summary");
   if (nudge) {
     const startBtn = nudge.status === "planned" ? ` <button id="exp-nudge-start" class="btn small" type="button">Start it</button>` : "";
-    summaryEl.innerHTML = `${esc(summary)} · <span class="nudge">Nudge: &ldquo;${esc(nudge.name)}&rdquo; has been ${esc(nudge.status)} ${nudge.days_in_status}d <button id="exp-nudge-open" class="btn small ghost" type="button">Show it</button>${startBtn}</span>`;
+    summaryEl.innerHTML = `${esc(summary)}${vettedBtn} · <span class="nudge">Nudge: &ldquo;${esc(nudge.name)}&rdquo; has been ${esc(nudge.status)} ${nudge.days_in_status}d <button id="exp-nudge-open" class="btn small ghost" type="button">Show it</button>${startBtn}</span>`;
     $("#exp-nudge-open").addEventListener("click", () => focusNudgeCard(nudge));
     if (nudge.status === "planned") $("#exp-nudge-start").addEventListener("click", () => startExperiment(nudge.id));
+    if (vettedBtn) $("#exp-vetted-noexp").addEventListener("click", () => setVettedNoExpFilter(!state.vettedNoExpOnly));
+  } else if (vettedBtn) {
+    summaryEl.innerHTML = `${esc(summary)}${vettedBtn}`;
+    $("#exp-vetted-noexp").addEventListener("click", () => setVettedNoExpFilter(!state.vettedNoExpOnly));
   } else {
     summaryEl.textContent = summary;
   }
@@ -1081,7 +1191,7 @@ function jumpToReviewQueue() {
   activateTab("priority", true);
   const chip = document.querySelector('.filters .chip[data-review="1"]');
   if (chip) chip.click();
-  else { state.reviewOnly = true; refreshReview().then(renderLedger); }
+  else { state.reviewOnly = true; state.vettedNoExpOnly = false; refreshReview().then(renderLedger); }
 }
 const agentPillJump = $("#agent-pill");
 if (agentPillJump) {
@@ -1736,6 +1846,7 @@ async function refreshTargets(want = {}) {
     catch { state.meta = {}; }
   }
   await refreshReview().catch(() => {});
+  await refreshVettedNoExpList().catch(() => {});
   if (health) $("#rev").textContent = health.rev ? `rev ${health.rev}` : "";
   renderApiErrors();
   renderLedger();

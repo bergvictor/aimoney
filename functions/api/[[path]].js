@@ -120,10 +120,18 @@ export const outcomeLedgerLine = ({ day, name, status, result, revenue_cents, sp
 // experiment write path retries once without that column when the write
 // fails naming exactly it (identical to its DEFAULT ''); when a non-empty
 // source is actually dropped the 200/201 names it in `dropped` so the
-// dashboard can toast the loss instead of smiling. Any other narrow
-// "no such column" failure answers 503 naming only the column — never SQL
-// or driver text (same regex as health detail). The router awaits exactly
-// these two write paths so their rejections land here.
+// dashboard can toast the loss instead of smiling.
+// $0 tolerance (audit 2026-09-26-round2 Task 1): the same pre-money table
+// also lacks revenue_cents/spent_cents, and the ordered migrations always
+// land cents before source — so a write that names a missing cents column
+// with both cents legs zero/absent retries once without both columns
+// (0 == DEFAULT 0, lossless by construction), chaining to a third shape
+// without all three when the table predates the source column too. Any
+// nonzero cent value still 503s naming the column, so no recorded cent is
+// ever silently dropped. Any other narrow "no such column" failure answers
+// 503 naming only the column — never SQL or driver text (same regex as
+// health detail). The router awaits exactly these two write paths so their
+// rejections land here.
 const missingColumnOf = (err) => {
   const msg = err instanceof Error ? err.message : String(err ?? "");
   const m = /no such column:\s*([A-Za-z_][\w.]*)/i.exec(msg);
@@ -150,12 +158,18 @@ async function listOpportunities(env, url) {
   const category = url.searchParams.get("category") || "";
   const sort = url.searchParams.get("sort") || "score";
   const unreviewedOnly = url.searchParams.get("unreviewed") === "1";
+  const vettedNoExpOnly = url.searchParams.get("vetted_no_experiment") === "1";
   const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 100));
   const where = [];
   const args = [];
   if (status && OPP_STATUSES.has(status)) { where.push("o.status = ?"); args.push(status); }
   if (category) { where.push("o.category = ?"); args.push(category); }
   if (unreviewedOnly) { where.push("o.notes LIKE '%UNREVIEWED%'"); }
+  // Vetted-without-experiment filter (audit 2026-09-26-round2 Task 3): the
+  // health probe's predicate verbatim (see the vetted_no_experiment probe
+  // below), so the dashboard button filters to exactly the rows the
+  // week-line count counts. Status/sort/limit compose as usual.
+  if (vettedNoExpOnly) { where.push("o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"); }
   const order = sort === "updated" ? "o.updated_at DESC" :
     sort === "oldest" ? "o.created_at ASC, o.id ASC" :
     sort === "value" ? "o.value DESC, o.score DESC" : "o.score DESC, o.updated_at DESC";
@@ -423,15 +437,55 @@ async function createExperiment(request, env) {
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(...insertArgs).run();
   } catch (e) {
-    // Old-schema tolerance: retry once without revenue_source (DEFAULT '').
-    if (missingColumnOf(e) !== "revenue_source") throw e;
-    r = await env.DB.prepare(
-      `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
-       spent, metric, target, result, started_at, ended_at, post_mortem,
-       revenue_cents, spent_cents)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-    ).bind(...insertArgs.slice(0, 14)).run();
-    if (revenue_source) dropped = ["revenue_source"];
+    const col = missingColumnOf(e);
+    const zeroMoney = revenue_cents === 0 && spent_cents === 0;
+    if (col === "revenue_source") {
+      // Old-schema tolerance: retry once without revenue_source (DEFAULT '').
+      try {
+        r = await env.DB.prepare(
+          `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
+           spent, metric, target, result, started_at, ended_at, post_mortem,
+           revenue_cents, spent_cents)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        ).bind(...insertArgs.slice(0, 14)).run();
+      } catch (e2) {
+        // Pre-money table: the source retry still names a cents column. Zero
+        // cents store exactly DEFAULT 0, so retry once more without all
+        // three; any nonzero cent leg rethrows naming the column (503).
+        const col2 = missingColumnOf(e2);
+        if ((col2 !== "revenue_cents" && col2 !== "spent_cents") || !zeroMoney) throw e2;
+        r = await env.DB.prepare(
+          `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
+           spent, metric, target, result, started_at, ended_at, post_mortem)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+        ).bind(...insertArgs.slice(0, 12)).run();
+      }
+      if (revenue_source) dropped = ["revenue_source"];
+    } else if ((col === "revenue_cents" || col === "spent_cents") && zeroMoney) {
+      // $0 tolerance: the table predates the money columns but this write
+      // carries no cents, so retry once without both (0 == DEFAULT 0).
+      try {
+        r = await env.DB.prepare(
+          `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
+           spent, metric, target, result, started_at, ended_at, post_mortem,
+           revenue_source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        ).bind(...insertArgs.slice(0, 12), insertArgs[14]).run();
+      } catch (e2) {
+        // Truly-old table: the cents retry still names revenue_source, so
+        // retry once more without all three (a non-empty source is dropped
+        // and named below, exactly like the source-only path).
+        if (missingColumnOf(e2) !== "revenue_source") throw e2;
+        r = await env.DB.prepare(
+          `INSERT INTO experiments (opportunity_id, name, hypothesis, status, budget_cap,
+           spent, metric, target, result, started_at, ended_at, post_mortem)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+        ).bind(...insertArgs.slice(0, 12)).run();
+        if (revenue_source) dropped = ["revenue_source"];
+      }
+    } else {
+      throw e;
+    }
   }
   if (status === "won" || status === "lost") {
     const day = nowIso.slice(0, 10);
@@ -476,22 +530,20 @@ async function updateExperiment(request, env, id) {
     if (!String(next.post_mortem || "").trim()) fields.post_mortem = "post_mortem is required to close as won/lost";
     if (Object.keys(fields).length) return json({ error: "result and post_mortem are required to close as won/lost", fields }, 400);
     if (!String(next.ended_at || "").trim()) next.ended_at = nowIso;
-    // Outcome ledger (round3 Task 3): on the transition into won/lost, append
-    // a one-line outcome to the parent opportunity notes (newest-kept 8000,
-    // same substr idiom as the worker's evidence append). Score untouched —
-    // the drawer offers a suggested rescore the human applies with one click.
-    if (cur.status !== "won" && cur.status !== "lost" && cur.opportunity_id) {
-      const day = nowIso.slice(0, 10);
-      const line = outcomeLedgerLine({ day, name: next.name, status: next.status, result: next.result, revenue_cents: next.revenue_cents, spent_cents: next.spent_cents, revenue_source: next.revenue_source });
-      await env.DB.prepare(
-        "UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?"
-      ).bind("\n" + line, cur.opportunity_id).run();
-    }
   }
+  // Pre-write snapshot for the post-UPDATE ledger decision below: the UPDATE
+  // mutates the stored row, so the transition test must read these, not cur.
+  const wasClosed = cur.status === "won" || cur.status === "lost";
+  const parentId = cur.opportunity_id;
   const updateArgs = [next.name, next.hypothesis, next.status, next.budget_cap, next.spent,
     next.metric, next.target, next.result, next.started_at, next.ended_at,
     next.post_mortem, next.revenue_cents, next.spent_cents, next.revenue_source, id];
   let dropped = null;
+  // Flag only what this write actually lost: a source the request carried.
+  // A PATCH without the key (or with "") intended '' and stored ''.
+  const flagDroppedSource = () => {
+    if (b.revenue_source !== undefined && next.revenue_source) dropped = ["revenue_source"];
+  };
   try {
     await env.DB.prepare(
       `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
@@ -500,17 +552,71 @@ async function updateExperiment(request, env, id) {
        updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
     ).bind(...updateArgs).run();
   } catch (e) {
-    // Old-schema tolerance: retry once without revenue_source (DEFAULT '').
-    if (missingColumnOf(e) !== "revenue_source") throw e;
+    const col = missingColumnOf(e);
+    const zeroMoney = next.revenue_cents === 0 && next.spent_cents === 0;
+    if (col === "revenue_source") {
+      // Old-schema tolerance: retry once without revenue_source (DEFAULT '').
+      try {
+        await env.DB.prepare(
+          `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
+           metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
+           revenue_cents=?, spent_cents=?,
+           updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
+        ).bind(...updateArgs.slice(0, 13), id).run();
+      } catch (e2) {
+        // Pre-money table: the source retry still names a cents column. Zero
+        // cents store exactly DEFAULT 0, so retry once more without all
+        // three; any nonzero cent leg rethrows naming the column (503).
+        const col2 = missingColumnOf(e2);
+        if ((col2 !== "revenue_cents" && col2 !== "spent_cents") || !zeroMoney) throw e2;
+        await env.DB.prepare(
+          `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
+           metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
+           updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
+        ).bind(...updateArgs.slice(0, 11), id).run();
+      }
+      flagDroppedSource();
+    } else if ((col === "revenue_cents" || col === "spent_cents") && zeroMoney) {
+      // $0 tolerance: the table predates the money columns but this write
+      // carries no cents, so retry once without both (0 == DEFAULT 0).
+      try {
+        await env.DB.prepare(
+          `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
+           metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
+           revenue_source=?,
+           updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
+        ).bind(...updateArgs.slice(0, 11), updateArgs[13], id).run();
+      } catch (e2) {
+        // Truly-old table: the cents retry still names revenue_source, so
+        // retry once more without all three (a carried non-empty source is
+        // dropped and named below, exactly like the source-only path).
+        if (missingColumnOf(e2) !== "revenue_source") throw e2;
+        await env.DB.prepare(
+          `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
+           metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
+           updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
+        ).bind(...updateArgs.slice(0, 11), id).run();
+        flagDroppedSource();
+      }
+    } else {
+      throw e;
+    }
+  }
+  // Outcome ledger (round3 Task 3): on the transition into won/lost, append
+  // a one-line outcome to the parent opportunity notes (newest-kept 8000,
+  // same substr idiom as the worker's evidence append) — only AFTER the
+  // UPDATE above succeeds. D1 autocommits per statement, so appending first
+  // left a phantom line for a still-open row when the UPDATE threw (and the
+  // retry doubled it); the line is fully derivable from the closed row, so a
+  // crash between UPDATE and append loses nothing unrecoverable. Score
+  // untouched — the drawer offers a suggested rescore the human applies with
+  // one click.
+  if ((next.status === "won" || next.status === "lost") && !wasClosed && parentId) {
+    const day = nowIso.slice(0, 10);
+    const line = outcomeLedgerLine({ day, name: next.name, status: next.status, result: next.result, revenue_cents: next.revenue_cents, spent_cents: next.spent_cents, revenue_source: next.revenue_source });
     await env.DB.prepare(
-      `UPDATE experiments SET name=?, hypothesis=?, status=?, budget_cap=?, spent=?,
-       metric=?, target=?, result=?, started_at=?, ended_at=?, post_mortem=?,
-       revenue_cents=?, spent_cents=?,
-       updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`
-    ).bind(...updateArgs.slice(0, 13), id).run();
-    // Flag only what this write actually lost: a source the request carried.
-    // A PATCH without the key (or with "") intended '' and stored ''.
-    if (b.revenue_source !== undefined && next.revenue_source) dropped = ["revenue_source"];
+      "UPDATE opportunities SET notes = substr(notes || ?, -8000), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?"
+    ).bind("\n" + line, parentId).run();
   }
   return json({ id: Number(id), status: next.status, ...(dropped ? { dropped } : {}) });
 }

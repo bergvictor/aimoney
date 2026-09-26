@@ -2444,3 +2444,192 @@ describe("drawer unknown cents (audit 2026-09-26-round1 Task 1)", () => {
     assert.ok(js.includes('typeof state.health.revenue_last_7d === "number"'), "week line lost its revenue guard");
   });
 });
+
+describe("Vet-&-starter draft templates (audit 2026-09-26-round2 Task 2)", () => {
+  const DRAFTS = [
+    { file: "ZERO-SPEND-STARTER.md", slug: "digital-products-prompts", name: "Buyer-signal census: 10 prompt niches", targetInLogging: false },
+    { file: "FACELESS-YOUTUBE-STARTER.md", slug: "faceless-youtube-ai", name: "Channel census: 10 faceless niches", targetInLogging: true },
+    { file: "SEO-SITES-STARTER.md", slug: "ai-seo-content-sites", name: "SERP census: 10 programmatic niches", targetInLogging: true },
+  ];
+  const collapse = (s) => String(s).replace(/\s+/g, " ").trim();
+  const section = (text, heading) => {
+    const start = text.indexOf(`## ${heading}`);
+    assert.ok(start !== -1, `draft lost its ## ${heading} section`);
+    const next = text.indexOf("\n## ", start + 1);
+    return next === -1 ? text.slice(start) : text.slice(start, next);
+  };
+  // Shipped template map extracted from the bundle (not copied) so drift fails.
+  function shippedTemplates() {
+    const start = js.indexOf("const STARTER_TEMPLATES = ");
+    assert.ok(start !== -1, "app.js lost STARTER_TEMPLATES");
+    const end = js.indexOf("};", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the template-map boundary");
+    return new Function(`${js.slice(start, end + 2)}\nreturn STARTER_TEMPLATES;`)();
+  }
+
+  for (const d of DRAFTS) {
+    it(`${d.slug} prefills its draft name, hypothesis, metric, and target`, () => {
+      const brief = readFileSync(join(ROOT, "..", "docs", d.file), "utf8");
+      assert.ok(brief.includes(d.slug), `draft lost its seed row ${d.slug}`);
+      const t = shippedTemplates()[d.slug];
+      assert.ok(t, `shipped templates lost the ${d.slug} row`);
+      const logging = section(brief, "Logging it");
+      assert.ok(logging.includes(`"${d.name}"`), "draft lost its exact experiment name");
+      assert.equal(t.name, d.name, "shipped name must match the draft word-for-word");
+      const hypothesis = collapse(section(brief, "Hypothesis").replace(/^## Hypothesis\s*/, ""));
+      assert.ok(hypothesis.length > 0 && hypothesis.length <= 8000, `draft hypothesis must fit 8000 chars, got ${hypothesis.length}`);
+      assert.equal(collapse(t.hypothesis), hypothesis, "shipped hypothesis must match the draft paragraph word-for-word");
+      assert.ok(logging.includes('"passing niches (0–10)" into the metric field'), "draft lost its exact metric value");
+      assert.equal(t.metric, "passing niches (0–10)", "shipped metric must match the draft");
+      assert.ok(brief.includes("1+ passing niches"), "template target must come from the draft");
+      if (d.targetInLogging) assert.ok(logging.includes('"1+ passing niches" into the target field'), "draft lost its exact target value");
+      assert.equal(t.target, "1+ passing niches", "shipped target must match the draft's 1+ bar");
+    });
+  }
+
+  it("unknown slugs keep the generic prefill", () => {
+    assert.deepEqual(Object.keys(shippedTemplates()).sort(),
+      ["ai-seo-content-sites", "digital-products-prompts", "faceless-youtube-ai"],
+      "template map must carry exactly the three draft rows");
+    const inner = js.slice(js.indexOf("async function vetAndLogStarterInner"), js.indexOf("async function killOpportunity"));
+    assert.ok(inner.includes("STARTER_TEMPLATES[o.slug]"), "starter must look up the row slug");
+    assert.ok(inner.includes("`Starter: ${o.title}`"), "unknown slugs lost the generic name");
+    assert.ok(inner.includes('"replies; revenue"'), "unknown slugs lost the generic metric");
+    assert.ok(inner.includes("First $ toward"), "unknown slugs lost the generic target");
+  });
+
+  it("templates name no $ revenue figure and fit the modal bounds", () => {
+    for (const [slug, v] of Object.entries(shippedTemplates())) {
+      const blob = `${v.name}\n${v.hypothesis}\n${v.metric}\n${v.target}`;
+      const claim = blob.replace(/\$0/g, "").match(/\$\s*\d/);
+      assert.ok(!claim, `${slug} template names a revenue figure: ${claim && claim[0]}`);
+      assert.ok(v.name.length > 0 && v.name.length <= 200, `${slug} name must fit 200 chars, got ${v.name.length}`);
+      assert.ok(v.hypothesis.length > 0 && v.hypothesis.length <= 8000, `${slug} hypothesis must fit 8000 chars, got ${v.hypothesis.length}`);
+      assert.ok(v.metric.length > 0 && v.metric.length <= 300, `${slug} metric must fit 300 chars, got ${v.metric.length}`);
+      assert.ok(v.target.length > 0 && v.target.length <= 300, `${slug} target must fit 300 chars, got ${v.target.length}`);
+    }
+  });
+});
+
+describe("vetted-no-experiment filter button (audit 2026-09-26-round2 Task 3)", () => {
+  // renderVettedNoExp + the shared ledger row extracted from the shipped
+  // source (not copied) with stubbed sinks, so these cases fail if the
+  // filter renders the wrong ids or the wrong empty states.
+  function shippedVettedNoExp() {
+    const start = js.indexOf("function renderVettedNoExp");
+    assert.ok(start !== -1, "app.js lost renderVettedNoExp");
+    const end = js.indexOf("// Vetted-no-experiment list refresh", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the renderVettedNoExp block boundary");
+    const rowStart = js.indexOf("const ledgerRowHtml");
+    assert.ok(rowStart !== -1, "app.js lost ledgerRowHtml");
+    const rowEnd = js.indexOf("`;", rowStart);
+    assert.ok(rowEnd !== -1 && rowEnd > rowStart, "app.js lost the ledger-row boundary");
+    return new Function("state", "$", "document", "esc", "money", "meter", "statusPill",
+      "noBriefBadge", "isZeroSpend", "testingBadge", "testingIdleBadge", "openDrawer", "setVettedNoExpFilter",
+      `${js.slice(rowStart, rowEnd + 2)}${js.slice(start, end)}; return renderVettedNoExp;`);
+  }
+
+  function renderVettedHtml(vettedNoExpList, opportunities, apiFailures) {
+    const factory = shippedVettedNoExp();
+    const els = {};
+    const $ = (sel) => (els[sel] ??= { innerHTML: "", textContent: "", addEventListener() {} });
+    const noop = () => "";
+    const renderVettedNoExp = factory(
+      { vettedNoExpList, opportunities, zeroOnly: false, apiFailures },
+      $, { querySelectorAll: () => [] },
+      (s) => String(s ?? ""), noop, noop, noop, noop, () => true, noop, noop, () => {}, () => {});
+    renderVettedNoExp();
+    return els["#ledger-body"].innerHTML;
+  }
+
+  const vettedRows = () => ([
+    { id: 7, title: "Vetted bare", one_liner: "", category: "services", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 100, est_monthly_low: 0, est_monthly_high: 0, time_to_first_dollar: "" },
+    { id: 9, title: "Mention only", one_liner: "", category: "other", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 50, est_monthly_low: 0, est_monthly_high: 0, time_to_first_dollar: "" },
+  ]);
+
+  it("renders the fetched ids through the shared ledger template with a Clear notice", () => {
+    const html = renderVettedHtml(vettedRows(), [...vettedRows(), { id: 1, score: 1 }], []);
+    assert.ok(html.includes('data-id="7"') && html.includes('data-id="9"'), `filtered rows missing, got: ${html}`);
+    assert.ok(!html.includes('data-id="1"'), "rows outside the filter must not render");
+    assert.ok(html.includes("Showing 2 vetted without experiments"), "notice lost the filter count");
+    assert.ok(html.includes('id="vetted-noexp-clear"'), "notice lost its Clear button");
+    assert.ok(html.includes("Vetted bare") && html.includes("Mention only"), "rows lost their titles");
+  });
+
+  it("empty filter prints the converted all-clear; an opps outage prints the failure row", () => {
+    const clear = renderVettedHtml([], [], []);
+    assert.ok(clear.includes("every vetted row has an experiment"), `all-clear missing, got: ${clear}`);
+    assert.ok(!clear.includes("Could not load"), "a healthy empty filter must not print a failure row");
+    const failed = renderVettedHtml([], [], ["/api/opportunities"]);
+    assert.ok(failed.includes("Could not load the priority list"), `failure row missing, got: ${failed}`);
+    assert.ok(failed.includes("see the banner above and retry"), "failure row must reuse the ledger retry copy");
+    assert.ok(!failed.includes("every vetted row has an experiment"), "an outage must never print the all-clear");
+  });
+
+  it("the full list and the filter share one row template", () => {
+    const ledger = js.slice(js.indexOf("function renderLedger"), js.indexOf("const reviewDecisionLine"));
+    assert.ok(ledger.includes("ledgerRowHtml(o, i, max)"), "full list and filter must share ledgerRowHtml");
+    assert.equal(js.split("const ledgerRowHtml").length - 1, 1, "the shared row template must live in exactly one place");
+    assert.ok(js.includes("if (state.vettedNoExpOnly) return renderVettedNoExp();"), "ledger must branch to the filter view on the flag");
+  });
+
+  it("week-line count renders as a button that toggles the server-side filter", () => {
+    const summary = js.slice(js.indexOf("function renderExperiments"), js.indexOf("/* ---- research log ---- */"));
+    assert.ok(summary.includes('id="exp-vetted-noexp"'), "week line lost the filter button");
+    assert.ok(summary.includes("vetted, no experiment"), "button lost the vetted-no-experiment copy");
+    assert.ok(summary.includes("vettedNoExp > 0"), "button must hide at 0 like the old text count");
+    assert.ok(summary.includes("setVettedNoExpFilter(!state.vettedNoExpOnly)"), "button must toggle the filter");
+    const toggle = js.slice(js.indexOf("async function setVettedNoExpFilter"), js.indexOf("/* ---- experiments board ---- */"));
+    assert.ok(toggle.includes('api("/api/opportunities?vetted_no_experiment=1'), "toggle must fetch the server-side filter (list rows carry no notes)");
+    assert.ok(toggle.includes('activateTab("priority"'), "opening the filter must jump to the Priority tab");
+  });
+
+  it("button executes: the count shows with N>0 and hides at 0/null", () => {
+    const start = js.indexOf("function renderExperiments");
+    const end = js.indexOf("/* ---- research log ---- */", start);
+    const fbStart = js.indexOf("const fallbackDecisions");
+    const fallbackDecisions = new Function(
+      `${js.slice(fbStart, js.indexOf("\n};", fbStart) + 3)} return fallbackDecisions;`)();
+    const stStart = js.indexOf("const stalestOpenExp");
+    const stalestOpenExp = new Function(
+      `${js.slice(stStart, js.indexOf("\n};", stStart) + 3)} return stalestOpenExp;`)();
+    const moneyStart = js.indexOf("const moneyCents");
+    const moneyCents = new Function(
+      `${js.slice(moneyStart, js.indexOf("\n", moneyStart))}; return moneyCents;`)();
+    const colsStart = js.indexOf("const EXP_COLS");
+    const EXP_COLS = new Function(
+      `${js.slice(colsStart, js.indexOf("\n", colsStart))}; return EXP_COLS;`)();
+    const factory = new Function("state", "$", "document", "esc", "moneyCents",
+      "fallbackDecisions", "stalestOpenExp", "focusNudgeCard", "startExperiment",
+      "statusPill", "ageChip", "runningMismatchBadge", "EXP_COLS",
+      `${js.slice(start, end)}; return renderExperiments;`);
+    const summaryHtml = (health) => {
+      const els = {};
+      const $ = (sel) => (els[sel] ??= { innerHTML: "", textContent: "", addEventListener() {} });
+      const noop = () => "";
+      factory({ experiments: [], health, apiFailures: [], vettedNoExpOnly: false },
+        $, { querySelectorAll: () => [] }, (s) => String(s ?? ""),
+        moneyCents, fallbackDecisions, stalestOpenExp,
+        () => {}, () => {}, noop, noop, noop, EXP_COLS)();
+      return els["#exp-summary"].textContent + els["#exp-summary"].innerHTML;
+    };
+    const shown = summaryHtml({ decisions_last_7d: 2, vetted_last_7d: 1, vetted_no_experiment: 3 });
+    assert.ok(shown.includes('id="exp-vetted-noexp"'), `button missing at N=3, got: ${shown}`);
+    assert.ok(shown.includes("3 vetted, no experiment"), "button lost its count copy");
+    const zero = summaryHtml({ decisions_last_7d: 2, vetted_last_7d: 1, vetted_no_experiment: 0 });
+    assert.ok(!zero.includes("exp-vetted-noexp"), `button must hide at 0, got: ${zero}`);
+    const nullish = summaryHtml({ decisions_last_7d: 2, vetted_last_7d: 1 });
+    assert.ok(!nullish.includes("exp-vetted-noexp"), `button must hide when the probe is null, got: ${nullish}`);
+  });
+
+  it("clearing restores the full list (chips, notice Clear, and refresh keep the flag honest)", () => {
+    const chips = js.slice(js.indexOf('document.querySelectorAll(".filters .chip")'), js.indexOf("/* ---- experiments board ---- */"));
+    assert.equal(chips.split("state.vettedNoExpOnly = false").length - 1, 2, "both chip branches (review + status) must clear the filter flag");
+    const notice = js.slice(js.indexOf("function renderVettedNoExp"), js.indexOf("// Vetted-no-experiment list refresh"));
+    assert.ok(notice.includes("setVettedNoExpFilter(false)"), "notice Clear must close the filter");
+    const rt = js.slice(js.indexOf("async function refreshTargets"));
+    assert.ok(rt.includes("await refreshVettedNoExpList()"), "refresh must re-fetch the filter list while it is open");
+    const rf = js.slice(js.indexOf("async function refreshVettedNoExpList"), js.indexOf("const reviewDecisionLine"));
+    assert.ok(rf.includes("if (!state.vettedNoExpOnly) return;"), "filter re-fetch must cost nothing while the filter is closed");
+  });
+});

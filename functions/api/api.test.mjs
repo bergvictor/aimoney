@@ -29,10 +29,15 @@ function makeDB(seed = {}) {
     if (sql.includes("o.category = ?")) category = filterArgs[idx++];
     const whereAt = sql.indexOf("WHERE");
     const unreviewed = whereAt !== -1 && sql.slice(whereAt).includes("UNREVIEWED");
+    const vettedNoExp = whereAt !== -1 && sql.slice(whereAt).includes("vetted]%") && sql.slice(whereAt).includes("NOT EXISTS");
     let rows = data.opportunities.slice();
     if (status) rows = rows.filter((o) => o.status === status);
     if (category) rows = rows.filter((o) => o.category === category);
     if (unreviewed) rows = rows.filter((o) => String(o.notes || "").includes("UNREVIEWED"));
+    if (vettedNoExp) {
+      const withExp = new Set(data.experiments.map((e) => String(e.opportunity_id)));
+      rows = rows.filter((o) => String(o.notes || "").includes("vetted]") && !withExp.has(String(o.id)));
+    }
     if (sql.includes("o.created_at ASC")) {
       rows.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || a.id - b.id);
     } else if (sql.includes("o.value DESC")) {
@@ -221,9 +226,20 @@ function makeDB(seed = {}) {
 
   function handleRun(sql, args) {
     if (sql.includes("INSERT INTO experiments")) {
-      // Production emits two shapes: the full 15-bind INSERT and the
-      // old-schema retry without revenue_source (14 binds, DEFAULT '').
-      const [opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, revenue_source] = args;
+      // Production emits four shapes: the full 15-bind INSERT, the
+      // old-schema retry without revenue_source (14 binds, DEFAULT ''), the
+      // $0 retry without both cents columns (13 binds: 12 + source), and the
+      // chained retry without all three (12 binds). Columns the SQL omits
+      // read back as their DEFAULTs, like real D1.
+      const hasCents = sql.includes("revenue_cents");
+      const hasSource = sql.includes("revenue_source");
+      const [opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, ...rest] = args;
+      let revenue_cents = 0;
+      let spent_cents = 0;
+      let revenue_source = "";
+      let tail = rest;
+      if (hasCents) { [revenue_cents, spent_cents, ...tail] = tail; }
+      if (hasSource) { [revenue_source] = tail; }
       const id = data.experiments.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0) + 1;
       const now = new Date().toISOString();
       data.experiments.push({ id, opportunity_id, name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents: revenue_cents || 0, spent_cents: spent_cents || 0, revenue_source: revenue_source || "", created_at: now, updated_at: now });
@@ -240,12 +256,21 @@ function makeDB(seed = {}) {
       return { success: true, meta: { last_row_id: row.id } };
     }
     if (sql.includes("UPDATE experiments SET")) {
-      // Two shapes: the full 15-bind UPDATE and the old-schema retry
-      // without revenue_source (14 binds, id last in both).
+      // Four shapes: the full 15-bind UPDATE (id last), the old-schema retry
+      // without revenue_source (14 binds), the $0 retry without both cents
+      // columns (13 binds: 11 + source + id), and the chained retry without
+      // all three (12 binds: 11 + id). Columns the SQL omits read back as
+      // their DEFAULTs (0/0/''), like a real pre-migration D1 row.
       const hasSource = sql.includes("revenue_source");
-      const [name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, ...rest] = args;
-      const id = hasSource ? rest[1] : rest[0];
-      const revenue_source = hasSource ? rest[0] : "";
+      const hasCents = sql.includes("revenue_cents");
+      const [name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, ...rest] = args;
+      let tail = rest;
+      let revenue_cents = 0;
+      let spent_cents = 0;
+      let revenue_source = "";
+      if (hasCents) { [revenue_cents, spent_cents, ...tail] = tail; }
+      if (hasSource) { [revenue_source, ...tail] = tail; }
+      const [id] = tail;
       const row = data.experiments.find((e) => String(e.id) === String(id));
       if (row) {
         Object.assign(row, { name, hypothesis, status, budget_cap, spent, metric, target, result, started_at, ended_at, post_mortem, revenue_cents, spent_cents, revenue_source });
@@ -2071,17 +2096,17 @@ describe("experiment-write revenue_source tolerance (audit 2026-09-20-round3 Tas
     assert.equal(db.data.experiments[0].revenue_source, "");
   });
 
-  it("any other missing column still 503s naming only it", async () => {
+  it("nonzero cents on a pre-money table still 503s naming only it (audit 2026-09-26-round2 Task 1 narrows this contract: zero-cents writes now pass — 0 == DEFAULT 0, lossless — while any nonzero leg still 503s so no recorded cent is silently dropped; the SQL-leak asserts below are unchanged)", async () => {
     const spentBoom = new Error("UPDATE experiments (...) failed: no such column: spent_cents (SQLITE_ERROR)");
     const post = await callApi(["experiments"], "http://localhost/api/experiments",
-      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, writeFailDB(spentBoom));
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter", revenue_cents: 500 } }, writeFailDB(spentBoom));
     assert.equal(post.status, 503);
     assert.equal(post.body.column, "spent_cents");
     assert.ok(String(post.body.error).includes("spent_cents"), "503 must name the missing column");
     assert.ok(!JSON.stringify(post.body).includes("UPDATE"), "503 must not leak SQL text");
     assert.ok(!JSON.stringify(post.body).includes("SQLITE_ERROR"), "503 must not leak driver verbiage");
     const patch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
-      { method: "PATCH", token: "secret", body: { status: "running" } }, writeFailDB(spentBoom));
+      { method: "PATCH", token: "secret", body: { status: "running", spent_cents: 100 } }, writeFailDB(spentBoom));
     assert.equal(patch.status, 503);
     assert.equal(patch.body.column, "spent_cents");
     assert.ok(String(patch.body.error).includes("spent_cents"), "503 must name the missing column");
@@ -2839,5 +2864,216 @@ describe("lane-metric health contract (audit 2026-09-26-round1 Task 3)", () => {
       delete mutated[k];
       assert.throws(() => assertLaneMetricContract(mutated), new RegExp(k), `contract must fail when ${k} is deleted`);
     }
+  });
+});
+
+describe("$0 experiment writes on pre-money tables (audit 2026-09-26-round2 Task 1)", () => {
+  // Pre-money table: experiment INSERT/UPDATE statements naming a missing
+  // money column throw the narrow driver error; shapes avoiding those
+  // columns run (mirrors oldWriteDB above, extended to the cents columns).
+  // `missing` lists absent columns in statement order so the stub names the
+  // same column real SQLite would name first.
+  const moneyMissingDB = (missing) => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql) => {
+      const hit = (sql.includes("INSERT INTO experiments") || sql.includes("UPDATE experiments SET"))
+        ? missing.find((c) => sql.includes(c))
+        : null;
+      if (hit) {
+        const boom = new Error(`experiments write failed: no such column: ${hit} (SQLITE_ERROR)`);
+        return {
+          _sql: sql, _args: [],
+          bind(...a) { return this; },
+          all: async () => { throw boom; },
+          first: async () => { throw boom; },
+          run: async () => { throw boom; },
+        };
+      }
+      return realPrepare(sql);
+    };
+    return db;
+  };
+  const CENTS_MISSING = ["revenue_cents", "spent_cents"];
+  const ALL_MONEY_MISSING = ["revenue_cents", "spent_cents", "revenue_source"];
+
+  it("$0 POST passes on a cents-missing table (201, stored 0/0, no dropped flag)", async () => {
+    const db = moneyMissingDB(CENTS_MISSING);
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, db);
+    assert.equal(r.status, 201);
+    assert.ok(!("dropped" in r.body), "a $0 retry dropped nothing, so it must not flag");
+    const stored = db.data.experiments.find((e) => e.id === r.body.id);
+    assert.equal(stored.revenue_cents, 0);
+    assert.equal(stored.spent_cents, 0);
+  });
+
+  it("$0 Start and Lose PATCHes pass on a cents-missing table (the $0 loop to the first decision)", async () => {
+    const db = moneyMissingDB(CENTS_MISSING);
+    const started = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running" } }, db);
+    assert.equal(started.status, 200);
+    assert.equal(db.data.experiments[0].status, "running");
+    const lost = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "lost", result: "0/10 pass", post_mortem: "no buyer signal" } }, db);
+    assert.equal(lost.status, 200);
+    assert.equal(db.data.experiments[0].status, "lost");
+    assert.ok(String(db.data.opportunities[0].notes).includes("outcome] Experiment"), "the $0 close must still append its ledger line");
+  });
+
+  it("nonzero cents still 503 naming the column on a cents-missing table", async () => {
+    const winPost = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Win", status: "won", result: "r", post_mortem: "pm", revenue_cents: 500 } }, moneyMissingDB(CENTS_MISSING));
+    assert.equal(winPost.status, 503);
+    assert.equal(winPost.body.column, "revenue_cents");
+    const spendPatch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running", spent_cents: 100 } }, moneyMissingDB(["spent_cents"]));
+    assert.equal(spendPatch.status, 503);
+    assert.equal(spendPatch.body.column, "spent_cents");
+  });
+
+  it("all-three-missing table: $0 writes pass via the chained retry, carried sources still named", async () => {
+    const postDb = moneyMissingDB(ALL_MONEY_MISSING);
+    const post = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, postDb);
+    assert.equal(post.status, 201);
+    assert.ok(!("dropped" in post.body), "a $0 retry that dropped no source must not flag");
+    const patchDb = moneyMissingDB(ALL_MONEY_MISSING);
+    const patch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running" } }, patchDb);
+    assert.equal(patch.status, 200);
+    assert.equal(patchDb.data.experiments[0].status, "running");
+    const sourceDb = moneyMissingDB(ALL_MONEY_MISSING);
+    const sourced = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter", revenue_source: "Stripe" } }, sourceDb);
+    assert.equal(sourced.status, 201);
+    assert.deepEqual(sourced.body.dropped, ["revenue_source"]);
+    const moneyDb = moneyMissingDB(ALL_MONEY_MISSING);
+    const money = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Win", status: "won", result: "r", post_mortem: "pm", revenue_cents: 500 } }, moneyDb);
+    assert.equal(money.status, 503);
+    assert.equal(money.body.column, "revenue_cents");
+  });
+
+  it("a missing non-money column still 503s even on $0 bodies (tolerance is money-only)", async () => {
+    const db = moneyMissingDB(["metric"]);
+    const r = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, db);
+    assert.equal(r.status, 503);
+    assert.equal(r.body.column, "metric");
+  });
+
+  it("post-migration $0 writes store explicit zeros with no dropped flag (unchanged shape)", async () => {
+    const db = makeDB({ opportunities: oppSeed(), experiments: expSeed() });
+    const post = await callApi(["experiments"], "http://localhost/api/experiments",
+      { method: "POST", token: "secret", body: { opportunity_id: 1, name: "Starter" } }, db);
+    assert.equal(post.status, 201);
+    assert.ok(!("dropped" in post.body));
+    const stored = db.data.experiments.find((e) => e.id === post.body.id);
+    assert.equal(stored.revenue_cents, 0);
+    assert.equal(stored.spent_cents, 0);
+    assert.equal(stored.revenue_source, "");
+    const patch = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: { status: "running" } }, db);
+    assert.equal(patch.status, 200);
+    assert.ok(!("dropped" in patch.body));
+  });
+
+  it("a failed PATCH-close appends no ledger line; the retry appends exactly one", async () => {
+    const seed = () => ({
+      opportunities: [
+        { id: 1, slug: "a", title: "A", status: "testing", value: 7, effort: 3, confidence: 5, fit: 8, score: 7000, notes: "seed notes", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+      ],
+      experiments: [
+        { id: 1, opportunity_id: 1, name: "Landing test", hypothesis: "", status: "running", budget_cap: "", spent: "", metric: "", target: "", result: "", started_at: "2026-09-01T00:00:00Z", ended_at: "", post_mortem: "" },
+      ],
+    });
+    const db = makeDB(seed());
+    const realPrepare = db.prepare.bind(db);
+    let failOpen = true;
+    db.prepare = (sql) => {
+      if (sql.includes("UPDATE experiments SET") && failOpen) {
+        failOpen = false;
+        const boom = new Error("D1 timeout writing experiments");
+        return {
+          _sql: sql, _args: [],
+          bind(...a) { return this; },
+          all: async () => { throw boom; },
+          first: async () => { throw boom; },
+          run: async () => { throw boom; },
+        };
+      }
+      return realPrepare(sql);
+    };
+    const close = { status: "won", result: "12 signups in 7d", post_mortem: "headline worked" };
+    const failed = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: close }, db);
+    assert.equal(failed.status, 500);
+    assert.equal(db.data.opportunities[0].notes, "seed notes", "a failed close must leave no phantom ledger line");
+    assert.equal(db.data.experiments[0].status, "running", "a failed close must leave the row open");
+    const retried = await callApi(["experiments", "1"], "http://localhost/api/experiments/1",
+      { method: "PATCH", token: "secret", body: close }, db);
+    assert.equal(retried.status, 200);
+    assert.equal(db.data.experiments[0].status, "won");
+    const lines = String(db.data.opportunities[0].notes).split("\n").filter((l) => l.includes("outcome] Experiment"));
+    assert.equal(lines.length, 1, "the retry must append exactly one ledger line");
+  });
+});
+
+describe("vetted_no_experiment list filter (audit 2026-09-26-round2 Task 3)", () => {
+  // Same discriminators as the health probe's own fixture (round3 Task 2):
+  // vetted bare, vetted with an experiment, a bare "vetted]" mention, an
+  // unreviewed row, and a never-vetted row ("vetted" without the bracket).
+  const filterSeed = () => ({
+    opportunities: [
+      { id: 1, slug: "vetted-bare", title: "Vetted bare", one_liner: "", category: "services", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "x\n[2026-09-18 vetted] Human vetted; cap lifted.", created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
+      { id: 2, slug: "vetted-with-exp", title: "Vetted with exp", one_liner: "", category: "services", status: "testing", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "y\n[2026-09-18 vetted] Human vetted; cap lifted.", created_at: "2026-09-11T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
+      { id: 3, slug: "mention-only", title: "Mention only", one_liner: "", category: "other", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal vetted] but never an experiment", created_at: "2026-09-12T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
+      { id: 4, slug: "unreviewed", title: "Unreviewed", one_liner: "", category: "other", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal UNREVIEWED", created_at: "2026-09-13T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
+      { id: 5, slug: "plain", title: "Plain", one_liner: "", category: "other", status: "backlog", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "human seed, never vetted", created_at: "2026-09-14T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
+    ],
+    experiments: [
+      { id: 1, opportunity_id: 2, name: "E", status: "running" },
+    ],
+  });
+  const ids = (rows) => (rows || []).map((o) => o.id).sort((a, b) => a - b);
+
+  it("returns exactly the vetted rows without experiments", async () => {
+    const db = makeDB(filterSeed());
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1", {}, db);
+    assert.equal(r.status, 200);
+    assert.deepEqual(ids(r.body.opportunities), [1, 3]);
+  });
+
+  it("matches the health vetted_no_experiment probe row-for-row on the same fixture", async () => {
+    const db = makeDB(filterSeed());
+    const health = await callApi(["health"], "http://localhost/api/health", {}, db);
+    assert.equal(health.status, 200);
+    const list = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1", {}, db);
+    assert.equal(list.body.opportunities.length, health.body.vetted_no_experiment, "filter count must equal the probe count");
+    const withExp = new Set(db.data.experiments.map((e) => String(e.opportunity_id)));
+    const predicateIds = db.data.opportunities
+      .filter((o) => String(o.notes || "").includes("vetted]") && !withExp.has(String(o.id)))
+      .map((o) => o.id).sort((a, b) => a - b);
+    assert.deepEqual(ids(list.body.opportunities), predicateIds, "filter rows must equal the probe predicate rows");
+  });
+
+  it("honors status, sort, and limit alongside the filter", async () => {
+    const db = makeDB(filterSeed());
+    const byStatus = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1&status=researching", {}, db);
+    assert.deepEqual(ids(byStatus.body.opportunities), [1, 3]);
+    const testingOnly = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1&status=testing", {}, db);
+    assert.deepEqual(ids(testingOnly.body.opportunities), [], "the testing vetted row has an experiment, so the filter reads empty");
+    const oldest = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1&sort=oldest", {}, db);
+    assert.deepEqual((oldest.body.opportunities || []).map((o) => o.id), [1, 3], "oldest-first must order by created_at");
+    const limited = await callApi(["opportunities"], "http://localhost/api/opportunities?vetted_no_experiment=1&limit=1", {}, db);
+    assert.equal(limited.body.opportunities.length, 1);
+  });
+
+  it("leaves the unfiltered list unchanged", async () => {
+    const db = makeDB(filterSeed());
+    const r = await callApi(["opportunities"], "http://localhost/api/opportunities", {}, db);
+    assert.equal(r.status, 200);
+    assert.deepEqual(ids(r.body.opportunities), [1, 2, 3, 4, 5]);
   });
 });
