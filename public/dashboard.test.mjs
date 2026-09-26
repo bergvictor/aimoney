@@ -410,7 +410,7 @@ describe("revenue source (audit 2026-09-20-round2 Task 3)", () => {
   });
 
   it("drawer shows the amount with its source plus the ended date", () => {
-    assert.ok(js.includes("moneyCents(e.revenue_cents || 0)"), "drawer lost its revenue figure");
+    assert.ok(js.includes("moneyCentsOrUnknown(e.revenue_cents)"), "drawer lost its revenue figure");
     assert.ok(js.includes("rev /"), "drawer lost the '$X rev / $Y spent' copy");
     assert.ok(js.includes("via ${esc(e.revenue_source)}"), "drawer lost the via-source copy");
     assert.ok(js.includes("e.ended_at"), "drawer lost the ended_at date");
@@ -449,9 +449,9 @@ describe("dropped revenue_source toast (audit 2026-09-20-round7 Task 2)", () => 
 });
 
 describe("closed-experiment money in drawer (audit 2026-09-20-round3 Task 1)", () => {
-  it("drawer cards show fixed-2dp revenue/spend plus ended date", () => {
-    assert.ok(js.includes("moneyCents(e.revenue_cents || 0)"), "drawer lost its revenue figure");
-    assert.ok(js.includes("moneyCents(e.spent_cents || 0)"), "drawer lost its spend figure");
+  it("drawer cards show fixed-2dp revenue/spend or unknown plus ended date", () => {
+    assert.ok(js.includes("moneyCentsOrUnknown(e.revenue_cents)"), "drawer lost its revenue figure");
+    assert.ok(js.includes("moneyCentsOrUnknown(e.spent_cents)"), "drawer lost its spend figure");
     assert.ok(js.includes("rev /"), "drawer lost the '$X rev / $Y spent' copy");
     assert.ok(js.includes("e.ended_at"), "drawer lost the ended_at date");
     assert.ok(js.includes("· ended"), "drawer lost the ended date copy");
@@ -626,7 +626,7 @@ describe("win optional spend (audit 2026-09-20-round1 Task 3)", () => {
 
   it("closed rows still show both money legs on the board and in the drawer", () => {
     assert.ok(js.includes("moneyCents(e.spent_cents)} spent"), "board card lost the spent leg");
-    assert.ok(js.includes("moneyCents(e.spent_cents || 0)} spent"), "drawer lost the spent leg");
+    assert.ok(js.includes("moneyCentsOrUnknown(e.spent_cents)} spent"), "drawer lost the spent leg");
   });
 });
 
@@ -2385,12 +2385,62 @@ describe("experiment modal measured-spend labels (audit 2026-09-20-round8 Task 2
     assert.ok(readme.includes("only `Precise spend ($)` counts toward lifetime spend"), "README lost the measured-spend rule");
   });
 
-  it("drawer spend display already shows the measured value (no modal-style ambiguity)", () => {
+  it("drawer spend display shows the measured value or unknown (no modal-style ambiguity)", () => {
     const drawerStart = js.indexOf("async function openDrawer");
     assert.ok(drawerStart !== -1, "app.js lost openDrawer");
     const drawerEnd = js.indexOf("/* ---- modals ---- */", drawerStart);
     assert.ok(drawerEnd !== -1 && drawerEnd > drawerStart, "app.js lost the drawer block boundary");
     const drawer = js.slice(drawerStart, drawerEnd);
-    assert.ok(drawer.includes("moneyCents(e.spent_cents || 0)} spent"), "drawer must keep rendering measured spent_cents");
+    assert.ok(drawer.includes("moneyCentsOrUnknown(e.spent_cents)} spent"), "drawer must keep rendering measured spent_cents");
+    assert.ok(drawer.includes("moneyCentsOrUnknown(e.revenue_cents)} rev"), "drawer must keep rendering measured revenue_cents");
+    assert.ok(!drawer.includes("e.spent_cents || 0"), "drawer must not coerce unknown spent to $0.00");
+    assert.ok(!drawer.includes("e.revenue_cents || 0"), "drawer must not coerce unknown revenue to $0.00");
+  });
+});
+
+describe("drawer unknown cents (audit 2026-09-26-round1 Task 1)", () => {
+  // moneyCents + moneyCentsOrUnknown extracted from the shipped source (not
+  // copied) so these cases fail if the helper drifts from the drawer line.
+  function shippedMoneyHarness() {
+    const start = js.indexOf("const moneyCents = ");
+    assert.ok(start !== -1, "app.js lost moneyCents");
+    const end = js.indexOf("const meter = ", start);
+    assert.ok(end !== -1 && end > start, "app.js lost the money-helper block boundary");
+    return new Function(`${js.slice(start, end)}\nreturn { moneyCents, moneyCentsOrUnknown };`)();
+  }
+
+  it("absent/null/empty/non-numeric cents render as unknown", () => {
+    const h = shippedMoneyHarness();
+    for (const v of [undefined, null, "", "bogus", NaN]) {
+      assert.equal(h.moneyCentsOrUnknown(v), "unknown", `moneyCentsOrUnknown(${String(v)}) must be unknown`);
+    }
+  });
+
+  it("real zeros stay $0.00", () => {
+    const h = shippedMoneyHarness();
+    assert.equal(h.moneyCentsOrUnknown(0), "$0.00");
+  });
+
+  it("positive cents render as $X.XX", () => {
+    const h = shippedMoneyHarness();
+    assert.equal(h.moneyCentsOrUnknown(1050), "$10.50");
+    assert.equal(h.moneyCentsOrUnknown(5), "$0.05");
+  });
+
+  it("drawer experiment line uses the helper for both legs, never || 0", () => {
+    const drawerStart = js.indexOf("async function openDrawer");
+    assert.ok(drawerStart !== -1, "app.js lost openDrawer");
+    const drawerEnd = js.indexOf("/* ---- modals ---- */", drawerStart);
+    assert.ok(drawerEnd !== -1 && drawerEnd > drawerStart, "app.js lost the drawer block boundary");
+    const drawer = js.slice(drawerStart, drawerEnd);
+    assert.ok(drawer.includes("moneyCentsOrUnknown(e.revenue_cents)} rev"), "drawer lost the unknown-safe revenue leg");
+    assert.ok(drawer.includes("moneyCentsOrUnknown(e.spent_cents)} spent"), "drawer lost the unknown-safe spent leg");
+    assert.ok(!drawer.includes("e.revenue_cents || 0"), "drawer still coerces unknown revenue to $0.00");
+    assert.ok(!drawer.includes("e.spent_cents || 0"), "drawer still coerces unknown spent to $0.00");
+  });
+
+  it("board cards and week line keep their existing guards (no change)", () => {
+    assert.ok(js.includes("e.revenue_cents > 0 ?"), "board lost its revenue guard");
+    assert.ok(js.includes('typeof state.health.revenue_last_7d === "number"'), "week line lost its revenue guard");
   });
 });

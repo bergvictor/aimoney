@@ -307,3 +307,57 @@ describe("worker rev stamp + gate (audit 2026-09-20-round7 Task 3)", () => {
     assert.ok(verify.includes('case "$EXPECTED_REV" in'), "verify must prefix-match expected full against worker short");
   });
 });
+
+describe("$0 starter briefs for faceless-YouTube + SEO-sites (audit 2026-09-26-round1 Task 2)", () => {
+  const STARTERS = [
+    { file: "docs/FACELESS-YOUTUBE-STARTER.md", slug: "faceless-youtube-ai", name: "Channel census: 10 faceless niches" },
+    { file: "docs/SEO-SITES-STARTER.md", slug: "ai-seo-content-sites", name: "SERP census: 10 programmatic niches" },
+  ];
+  const section = (text, heading) => {
+    const start = text.indexOf(`## ${heading}`);
+    assert.ok(start !== -1, `brief lost its ## ${heading} section`);
+    const next = text.indexOf("\n## ", start + 1);
+    return next === -1 ? text.slice(start) : text.slice(start, next);
+  };
+
+  for (const s of STARTERS) {
+    it(`${s.file} carries its hypothesis, single metric, $0 breakdown, and modal values`, () => {
+      const brief = read(s.file);
+      assert.ok(brief.includes(s.slug), `brief lost its seed row ${s.slug}`);
+      assert.ok(brief.includes("Falsified if zero niches pass"), "brief lost its falsifiable hypothesis");
+      const metric = section(brief, "Metric and the single week-1 number");
+      assert.ok(metric.includes("passing niches (0–10)"), "brief lost its single metric");
+      assert.ok(metric.includes("count, not dollars"), "metric must read as a count, not dollars");
+      assert.ok(metric.includes("unknown"), "expected revenue must stay unknown");
+      const costs = section(brief, "$0 cost breakdown");
+      assert.ok(costs.includes("Total spend: $0"), "brief lost its $0 total");
+      const logging = section(brief, "Logging it");
+      assert.ok(logging.includes(`"${s.name}"`), "brief lost its exact experiment name");
+      assert.ok(logging.includes('"passing niches (0–10)" into the metric field'), "brief lost its exact metric value");
+      assert.ok(logging.includes('"1+ passing niches" into the target field'), "brief lost its exact target value");
+      assert.ok(logging.includes("paste the hypothesis above into the"), "brief lost its hypothesis handoff");
+    });
+
+    it(`${s.file} names no revenue figure and fits the modal bounds`, () => {
+      const brief = read(s.file);
+      const revenueClaim = brief.replace(/\$0/g, "").match(/\$\s*\d/);
+      assert.ok(!revenueClaim, `brief names a revenue figure: ${revenueClaim && revenueClaim[0]}`);
+      const logging = section(brief, "Logging it");
+      const name = logging.match(/name the experiment\n?"([^"]+)"/)[1];
+      assert.ok(name.length > 0 && name.length <= 200, `modal name must fit 200 chars, got ${name.length}`);
+      const hypothesis = section(brief, "Hypothesis");
+      assert.ok(hypothesis.length > 0 && hypothesis.length <= 8000, `hypothesis section must fit 8000 chars, got ${hypothesis.length}`);
+      const metricValue = logging.match(/"([^"]+)" into the metric field/)[1];
+      assert.ok(metricValue.length > 0 && metricValue.length <= 300, `modal metric must fit 300 chars, got ${metricValue.length}`);
+    });
+
+    it(`${s.file} queues the owner action without spend, accounts, or outbound sends`, () => {
+      const brief = read(s.file);
+      assert.ok(brief.includes("No spend, no new account"), "brief lost its no-spend queueing line");
+      assert.ok(brief.includes("no message, post, or accepted term is needed"), "brief lost its no-outbound guard");
+      assert.ok(brief.includes("this starter reads only"), "brief must read only, never send");
+      assert.ok(brief.includes("docs/OWNER-ACTIONS.md"), "brief lost its owner-action handoff");
+      assert.ok(brief.includes("Vet / Vet-&-starter, Start, and Win/Lose"), "brief lost its owner-button queue");
+    });
+  }
+});

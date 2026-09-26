@@ -486,24 +486,22 @@ export async function runResearch(env, trigger) {
     // Quiet ticks skip the top-60 fetch and the prompt build entirely (F5):
     // the guarded block runs only with fresh signals, otherwise verdicts
     // stay [] and the run continues to the brief pass below. Inflow-paused
-    // ticks (maxNewThisRun == 0) skip the classify AI call entirely: every
-    // new verdict would overflow back to processed = 0 with a predetermined
-    // outcome, so the tick keeps `fresh` unprocessed and spends its AI
-    // budget on the brief passes below (logged as inflow:paused).
+    // ticks (maxNewThisRun == 0) still run the classify pass so supports and
+    // noise verdicts are recorded instead of rotting into the 30d sweep;
+    // only `new` inserts are skipped (newInserts >= 0 overflows every new
+    // verdict back to processed = 0 for a later tick), logged as inflow:paused.
     let verdicts = [];
     if (fresh.length) {
-      if (maxNewThisRun > 0) {
-        const opps = await env.DB.prepare(
-          "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
-          .all().then((r) => r.results || []);
-        const classifyPrompt = buildClassifyPrompt(opps, fresh);
-        const isCron = trigger === "cron";
-        verdicts = !fresh.length ? [] : parseJsonLines(await aiComplete(env, state, {
-          model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
-          messages: classifyPrompt,
-          timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
-        }));
-      }
+      const opps = await env.DB.prepare(
+        "SELECT id, slug, title, status, score FROM opportunities ORDER BY score DESC LIMIT 60")
+        .all().then((r) => r.results || []);
+      const classifyPrompt = buildClassifyPrompt(opps, fresh);
+      const isCron = trigger === "cron";
+      verdicts = !fresh.length ? [] : parseJsonLines(await aiComplete(env, state, {
+        model: AI_CLASSIFY, fallback: AI_BRIEF, maxTokens: CLASSIFY_TOKENS,
+        messages: classifyPrompt,
+        timeoutMs: isCron ? 60000 : 12000, retries: isCron ? 1 : 0,
+      }));
     }
     // Validate: one verdict per signal (first wins), strict action enum,
     // numeric-or-null opportunity_id (the model once emitted repo names).
@@ -598,12 +596,13 @@ export async function runResearch(env, trigger) {
     }
     const verdictFailed = await flushVerdictWrites(env, verdictWrites);
     // Empty-classify marker (audit 2026-09-20-round8 Task 3): when the
-    // classify call ran (fresh signals, inflow open) but every line dropped
+    // classify call ran (fresh signals) but every line dropped
     // in parseJsonLines, the tick finished ok with no hint the model answered
     // garbage. Name it so the run log tells model garbage apart from a quiet
     // queue. A throw finishes error instead, so reaching here means no throw;
-    // paused ticks (maxNewThisRun == 0) and quiet ticks (no fresh) stay silent.
-    const classifyEmpty = fresh.length > 0 && maxNewThisRun > 0 && seen.size === 0;
+    // quiet ticks (no fresh) stay silent; paused ticks name garbage too since
+    // they run the classify pass (supports/noise only).
+    const classifyEmpty = fresh.length > 0 && seen.size === 0;
 
     // 3. One AI pass: brief one bare row — top-scored, or oldest-unreviewed-first past 48h —
     // unless the clock is nearly spent (it lands on a later run instead).

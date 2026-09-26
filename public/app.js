@@ -89,6 +89,14 @@ const money = (lo, hi) => {
 // Precise dollars from integer cents: always fixed-2dp ($10.50, never $10.5).
 // Separate from money(), which formats $/mo ranges with k-suffixes.
 const moneyCents = (cents) => `$${(Number(cents) / 100).toFixed(2)}`;
+// Drawer money honesty (audit 2026-09-26-round1 Task 1): pre-money rows omit
+// revenue_cents/spent_cents, so `|| 0` printed $0.00 for unknown. Missing or
+// non-numeric cents render as "unknown"; only real zeros print $0.00.
+const moneyCentsOrUnknown = (cents) => {
+  if (cents === null || cents === undefined || cents === "") return "unknown";
+  const n = Number(cents);
+  return Number.isFinite(n) ? moneyCents(n) : "unknown";
+};
 
 const meter = (v) => {
   v = Math.max(1, Math.min(10, Number(v) || 1));
@@ -1140,7 +1148,7 @@ async function openDrawer(id, focusExp = null) {
         <div class="card" data-exp="${e.id}" ${focusExp === e.id ? `style="border-color:var(--green)"` : ""}>
           <h4>${esc(e.name)}</h4>
           <p>${esc(e.hypothesis || "")}</p>
-          <div class="meta">${statusPill(e.status)}<span class="muted mono">${esc(e.result || e.target || "")}</span> <span class="muted mono">${moneyCents(e.revenue_cents || 0)} rev / ${moneyCents(e.spent_cents || 0)} spent${e.revenue_source ? ` via ${esc(e.revenue_source)}` : ""}${e.ended_at ? ` · ended ${esc(String(e.ended_at).slice(0, 10))}` : ""}</span></div>
+          <div class="meta">${statusPill(e.status)}<span class="muted mono">${esc(e.result || e.target || "")}</span> <span class="muted mono">${moneyCentsOrUnknown(e.revenue_cents)} rev / ${moneyCentsOrUnknown(e.spent_cents)} spent${e.revenue_source ? ` via ${esc(e.revenue_source)}` : ""}${e.ended_at ? ` · ended ${esc(String(e.ended_at).slice(0, 10))}` : ""}</span></div>
           ${e.post_mortem ? `<p><b>Post-mortem:</b> ${esc(e.post_mortem)}</p>` : ""}
           <p style="margin-top:6px"><button class="btn small ghost" data-edit-exp="${e.id}" type="button">Update</button></p>
         </div>`).join("") : `<p class="muted">None yet.</p>`}

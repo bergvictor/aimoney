@@ -2775,3 +2775,69 @@ describe("shared outcome-ledger builder (audit 2026-09-20-round3 Task 4)", () =>
     assert.equal(db.data.opportunities[0].notes, before);
   });
 });
+
+describe("lane-metric health contract (audit 2026-09-26-round1 Task 3)", () => {
+  // The lane runs on these nine /api/health keys; coverage asserts them
+  // alongside features but no single test fails when one is dropped or
+  // renamed. The contract helper asserts presence + shape; the control
+  // deletes each key in turn and proves the helper fails.
+  const NUMERIC_KEYS = ["decisions_last_7d", "vetted_last_7d", "revenue_last_7d",
+    "revenue_total", "spent_total", "unreviewed", "oldest_unreviewed_age_h"];
+  function assertLaneMetricContract(body) {
+    for (const k of NUMERIC_KEYS) {
+      assert.ok(k in body, `health lost lane-metric key ${k}`);
+      assert.ok(body[k] === null || typeof body[k] === "number", `health key ${k} must be number-or-null, got ${typeof body[k]}`);
+    }
+    assert.ok("inflow_paused" in body, "health lost lane-metric key inflow_paused");
+    assert.ok(body.inflow_paused === null || typeof body.inflow_paused === "boolean", `health key inflow_paused must be boolean-or-null, got ${typeof body.inflow_paused}`);
+    assert.ok("last_verdict" in body, "health lost lane-metric key last_verdict");
+    assert.ok(body.last_verdict === null || typeof body.last_verdict === "string", `health key last_verdict must be string-or-null, got ${typeof body.last_verdict}`);
+  }
+
+  function contractSeed() {
+    const today = new Date().toISOString().slice(0, 10);
+    const now = new Date().toISOString();
+    return {
+      opportunities: [
+        { id: 1, slug: "vetted-row", title: "Vetted row", status: "testing", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: `seed [${today} vetted] Human vetted; cap lifted.`, created_at: "2026-09-10T00:00:00Z", updated_at: now },
+        { id: 2, slug: "unreviewed-row", title: "Unreviewed row", status: "researching", value: 5, effort: 5, confidence: 5, fit: 5, score: 1, notes: "Agent proposal — UNREVIEWED", created_at: "2026-09-20T00:00:00Z", updated_at: "2026-09-20T00:00:00Z" },
+      ],
+      experiments: [
+        { id: 1, opportunity_id: 1, name: "Week-1 census", status: "won", ended_at: now, result: "2/10 pass", post_mortem: "niche two converts", revenue_cents: 0, spent_cents: 0 },
+      ],
+      runs: [
+        { id: 1, agent: "research-v1", status: "ok", started_at: now, finished_at: now },
+      ],
+      signals: [],
+    };
+  }
+
+  it("real health path carries every lane-metric key with the right shape", async () => {
+    const r = await callApi(["health"], "http://localhost/api/health", {}, makeDB(contractSeed()));
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assertLaneMetricContract(r.body);
+    // Values (not just shapes) prove the seed drives the contract: one
+    // decision, one vetted verdict dated today, one unreviewed row aging.
+    assert.equal(r.body.decisions_last_7d, 1);
+    assert.equal(r.body.vetted_last_7d, 1);
+    assert.equal(r.body.last_verdict, new Date().toISOString().slice(0, 10));
+    assert.equal(r.body.unreviewed, 1);
+    assert.equal(typeof r.body.oldest_unreviewed_age_h, "number");
+    assert.equal(r.body.inflow_paused, false);
+    assert.equal(typeof r.body.revenue_last_7d, "number");
+    assert.equal(typeof r.body.revenue_total, "number");
+    assert.equal(typeof r.body.spent_total, "number");
+  });
+
+  it("control: deleting any one lane-metric key fails the contract (proven, not assumed)", async () => {
+    const r = await callApi(["health"], "http://localhost/api/health", {}, makeDB(contractSeed()));
+    assert.equal(r.status, 200);
+    assertLaneMetricContract(r.body);
+    for (const k of [...NUMERIC_KEYS, "inflow_paused", "last_verdict"]) {
+      const mutated = { ...r.body };
+      delete mutated[k];
+      assert.throws(() => assertLaneMetricContract(mutated), new RegExp(k), `contract must fail when ${k} is deleted`);
+    }
+  });
+});
