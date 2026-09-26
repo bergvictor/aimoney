@@ -1057,6 +1057,7 @@ function renderExperiments() {
   const vettedNoExp = state.health && typeof state.health.vetted_no_experiment === "number" ? state.health.vetted_no_experiment : null;
   const revenue = state.health && typeof state.health.revenue_last_7d === "number" ? state.health.revenue_last_7d : null;
   const revenueTotal = state.health && typeof state.health.revenue_total === "number" ? state.health.revenue_total : null;
+  const spentTotal = state.health && typeof state.health.spent_total === "number" ? state.health.spent_total : null;
   // Fallback: when the decisions probe fails (null), count decisions from the
   // already-loaded list so the week line and the stall nudge survive the
   // outage — but only when that list actually loaded. A failed experiments
@@ -1075,6 +1076,7 @@ function renderExperiments() {
     let conv = `${decisions} decisions this week · ${vetted} vetted this week → ${exps.length} total experiments`;
     if (revenue !== null) conv += ` · ${moneyCents(revenue)} revenue this week`;
     if (revenueTotal !== null) conv += ` · ${moneyCents(revenueTotal)} lifetime`;
+    if (spentTotal !== null) conv += ` · ${moneyCents(spentTotal)} spent`;
     summary = `${summary} · ${conv}`;
   }
   // Vetted-no-experiment filter button (audit 2026-09-26-round2 Task 3): the
@@ -1150,10 +1152,12 @@ function renderRuns() {
     pill.title = "Database unreachable (health.db != up)";
   } else if (last) {
     const noise = state.health && typeof state.health.noise_24h === "number" ? state.health.noise_24h : null;
+    const swept = state.health && typeof state.health.swept_total === "number" ? state.health.swept_total : null;
     const backlogBit = reviewBacklogBit(state.health);
     const verdictBit = verdictRecencyBit(state.health, Date.now());
     const inflowPaused = state.health && state.health.inflow_paused === true;
     pill.title = noise !== null ? "Latest research run: +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise" : "Latest research run";
+    if (swept !== null) pill.title += " · " + swept + " swept";
     const probeFails = probeFailures();
     if (probeFails.length) pill.title += " · failing probes: " + probeFails.map((p) => probeLabel(p, probeDetailMap())).join(", ");
     if (backlogBit) pill.title += " · " + backlogBit;
@@ -1163,6 +1167,7 @@ function renderRuns() {
     $("#agent-text").textContent =
       `agent: ${last.status} · +${last.added}/${last.updated}/${last.briefs} · ${when.slice(0, 16).replace("T", " ")}`;
     if (noise !== null) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + noise + " noise";
+    if (swept !== null) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + swept + " swept";
     if (backlogBit) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + backlogBit;
     if (verdictBit) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + verdictBit;
     if (inflowPaused) $("#agent-text").textContent += " " + String.fromCharCode(183) + " inflow paused";
@@ -1178,7 +1183,7 @@ function renderRuns() {
       if (wrap) runsTab.insertBefore(runsSummary, wrap);
     }
     if (runsSummary) {
-      runsSummary.textContent = noise !== null ? "Last run +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise in 24h" : "";
+      runsSummary.textContent = noise !== null ? "Last run +" + last.added + "/" + last.updated + " " + String.fromCharCode(183) + " " + noise + " noise in 24h" + (swept !== null ? " " + String.fromCharCode(183) + " " + swept + " swept" : "") : "";
     }
   }
   $("#runs-body").innerHTML = runs.length ? runs.map((r) => `
@@ -1757,6 +1762,7 @@ function saveLastGood(fresh) {
     const h = state.health || {};
     snap.health = {
       noise_24h: (typeof h.noise_24h === "number" ? h.noise_24h : null),
+      swept_total: (typeof h.swept_total === "number" ? h.swept_total : null),
       bare_without_brief: (typeof h.bare_without_brief === "number" ? h.bare_without_brief : null),
       unreviewed: (typeof h.unreviewed === "number" ? h.unreviewed : null),
       oldest_unreviewed_age_h: (typeof h.oldest_unreviewed_age_h === "number" ? h.oldest_unreviewed_age_h : null),
@@ -1800,18 +1806,21 @@ function paintLastGood() {
   if (run && run.status && $("#agent-text")) {
     const when = String(run.finished_at || run.started_at || "").slice(0, 16).replace("T", " ");
     const noise = snap.health && typeof snap.health.noise_24h === "number" ? snap.health.noise_24h : null;
+    const swept = snap.health && typeof snap.health.swept_total === "number" ? snap.health.swept_total : null;
     const cachedBacklog = reviewBacklogBit(snap.health || {});
     const cachedVerdict = verdictRecencyBit(snap.health || {}, Date.now());
     const cachedPaused = snap.health && snap.health.inflow_paused === true;
     $("#agent-text").textContent =
       `agent: ${run.status} · +${run.added}/${run.updated}/${run.briefs} · ${when}` +
       (noise !== null ? ` · ${noise} noise` : "") +
+      (swept !== null ? ` · ${swept} swept` : "") +
       (cachedBacklog ? ` · ${cachedBacklog}` : "") +
       (cachedVerdict ? ` · ${cachedVerdict}` : "") +
       (cachedPaused ? " · inflow paused" : "") +
       (isSnapshotStale(run.savedAt, Date.now()) ? LAST_GOOD_STALE_MARK : "");
     const pill = $("#agent-pill");
     if (pill) pill.title = (noise !== null ? `Latest research run: +${run.added}/${run.updated} · ${noise} noise` : "Latest research run") +
+      (swept !== null ? ` · ${swept} swept` : "") +
       (cachedBacklog ? ` · ${cachedBacklog}` : "") +
       (cachedVerdict ? ` · ${cachedVerdict}` : "") +
       (cachedPaused ? " · inflow paused" : "") +

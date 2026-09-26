@@ -108,6 +108,61 @@ describe("triage noise pill (Task 3)", () => {
   });
 });
 
+describe("swept count beside triage noise (audit 2026-09-26-round4 Task 2)", () => {
+  it("live pill appends the swept count to text + title right after noise", () => {
+    const live = js.slice(js.indexOf("} else if (last) {"), js.indexOf('$("#runs-body").innerHTML'));
+    assert.ok(live.includes('typeof state.health.swept_total === "number"'), "live pill lost its swept_total typeof-guard");
+    assert.ok(live.includes('if (swept !== null) pill.title += " · " + swept + " swept";'), "pill title lost the swept bit");
+    assert.ok(live.includes('if (swept !== null) $("#agent-text").textContent += " " + String.fromCharCode(183) + " " + swept + " swept";'), "pill text lost the swept bit");
+    assert.ok(live.indexOf('+ " swept"') < live.indexOf('pill.title += " · " + backlogBit'), "swept bit must sit next to the noise bit");
+    assert.ok(!live.includes('api("/api/health")'), "pill mirror must reuse the fetched health, no new fetch");
+  });
+
+  it("runs summary appends the swept count beside noise, hidden on old backends", () => {
+    const live = js.slice(js.indexOf("} else if (last) {"), js.indexOf('$("#runs-body").innerHTML'));
+    const summaryBit = '(swept !== null ? " " + String.fromCharCode(183) + " " + swept + " swept" : "")';
+    assert.ok(live.includes(summaryBit), "runs summary lost the swept copy");
+    assert.ok(live.indexOf("noise in 24h") < live.indexOf(summaryBit), "swept count must sit beside the noise count");
+  });
+
+  it("pill + summary execute: swept shows beside noise when numeric, byte-identical without it", () => {
+    const start = js.indexOf("function renderRuns");
+    const end = js.indexOf("// Review jump", start);
+    assert.ok(start !== -1 && end !== -1 && end > start, "app.js lost the renderRuns block boundary");
+    const factory = new Function("state", "$", "document", "esc",
+      "reviewBacklogBit", "verdictRecencyBit", "probeFailures", "probeLabel", "probeDetailMap",
+      "isStaleRunning",
+      `${js.slice(start, end)}; return renderRuns;`);
+    const paint = (health) => {
+      const els = {};
+      const $ = (sel) => (els[sel] ??= { innerHTML: "", textContent: "", title: "", classList: { toggle() {}, remove() {}, add() {} }, addEventListener() {} });
+      const summaryEl = { textContent: "" };
+      const document = { querySelector: (sel) => (sel === "#runs-summary" ? summaryEl : null), createElement: () => ({}) };
+      factory({ runs: [{ id: 1, agent: "triage", trigger: "cron", finished_at: "2026-09-26T10:00:00Z", started_at: "2026-09-26T09:55:00Z", status: "ok", signals_seen: 6, added: 1, updated: 2, briefs: 1, ai_calls: 2, error: "" }], health, apiFailures: [] },
+        $, document, (s) => String(s ?? ""), () => "", () => "", () => [], () => "", () => ({}), () => false)();
+      return { text: els["#agent-text"].textContent, title: els["#agent-pill"].title, summary: summaryEl.textContent };
+    };
+    const withSwept = paint({ db: "up", noise_24h: 3, swept_total: 4 });
+    assert.equal(withSwept.summary, "Last run +1/2 · 3 noise in 24h · 4 swept");
+    assert.equal(withSwept.text, "agent: ok · +1/2/1 · 2026-09-26 10:00 · 3 noise · 4 swept");
+    assert.equal(withSwept.title, "Latest research run: +1/2 · 3 noise · 4 swept");
+    for (const health of [{ db: "up", noise_24h: 3 }, { db: "up", noise_24h: 3, swept_total: null }]) {
+      const without = paint(health);
+      assert.equal(without.summary, "Last run +1/2 · 3 noise in 24h");
+      assert.equal(without.text, "agent: ok · +1/2/1 · 2026-09-26 10:00 · 3 noise");
+      assert.equal(without.title, "Latest research run: +1/2 · 3 noise");
+    }
+  });
+
+  it("cache persists the swept key and paints it before the live refresh lands", () => {
+    const save = js.slice(js.indexOf("function saveLastGood"), js.indexOf("function paintLastGood"));
+    assert.ok(save.includes('swept_total: (typeof h.swept_total === "number"'), "snapshot lost the swept key");
+    const paint = js.slice(js.indexOf("function paintLastGood"), js.indexOf("/* ---- boot ---- */"));
+    assert.ok(paint.includes('typeof snap.health.swept_total === "number"'), "cache paint must derive the swept bit from the snapshot");
+    assert.ok(paint.includes("(swept !== null ? ` · ${swept} swept` : \"\")"), "cached pill lost the swept bit");
+  });
+});
+
 describe("decisions/week header (Task 1)", () => {
   it("experiments summary renders decisions and vetted conversion", () => {
     assert.ok(js.includes("decisions_last_7d"), "app.js never reads health.decisions_last_7d");
@@ -519,6 +574,54 @@ describe("lifetime revenue header (audit 2026-09-20-round1 Task 3)", () => {
     assert.ok(js.includes("moneyCents(revenue)"), "exp summary lost the weekly revenue format");
     assert.ok(js.includes("revenue this week"), "exp summary lost the 'revenue this week' copy");
     assert.ok(js.indexOf("revenue this week") < js.indexOf("} lifetime"), "lifetime figure must sit next to the weekly figure");
+  });
+});
+
+describe("lifetime spend leg (audit 2026-09-26-round4 Task 1)", () => {
+  it("experiments summary appends the spend figure beside lifetime, hidden on old backends", () => {
+    assert.ok(js.includes("spent_total"), "app.js never reads health.spent_total");
+    assert.ok(js.includes("moneyCents(spentTotal)"), "exp summary must format spent_total via moneyCents");
+    assert.ok(js.includes("} spent"), "exp summary lost the spend figure copy");
+    assert.ok(js.includes("spentTotal !== null"), "spend line must hide when the key is absent (old backends)");
+    assert.ok(js.indexOf("} lifetime") < js.indexOf("} spent"), "spend leg must sit beside the lifetime figure");
+  });
+
+  it("week line executes: spend shows beside revenue when numeric, byte-identical without it", () => {
+    const start = js.indexOf("function renderExperiments");
+    const end = js.indexOf("/* ---- research log ---- */", start);
+    const fbStart = js.indexOf("const fallbackDecisions");
+    const fallbackDecisions = new Function(
+      `${js.slice(fbStart, js.indexOf("\n};", fbStart) + 3)} return fallbackDecisions;`)();
+    const stStart = js.indexOf("const stalestOpenExp");
+    const stalestOpenExp = new Function(
+      `${js.slice(stStart, js.indexOf("\n};", stStart) + 3)} return stalestOpenExp;`)();
+    const moneyStart = js.indexOf("const moneyCents");
+    const moneyCents = new Function(
+      `${js.slice(moneyStart, js.indexOf("\n", moneyStart))}; return moneyCents;`)();
+    const colsStart = js.indexOf("const EXP_COLS");
+    const EXP_COLS = new Function(
+      `${js.slice(colsStart, js.indexOf("\n", colsStart))}; return EXP_COLS;`)();
+    const factory = new Function("state", "$", "document", "esc", "moneyCents",
+      "fallbackDecisions", "stalestOpenExp", "focusNudgeCard", "startExperiment",
+      "statusPill", "ageChip", "runningMismatchBadge", "EXP_COLS",
+      `${js.slice(start, end)}; return renderExperiments;`);
+    const summaryText = (health) => {
+      const els = {};
+      const $ = (sel) => (els[sel] ??= { innerHTML: "", textContent: "", addEventListener() {} });
+      const noop = () => "";
+      factory({ experiments: [], health, apiFailures: [], vettedNoExpOnly: false },
+        $, { querySelectorAll: () => [] }, (s) => String(s ?? ""),
+        moneyCents, fallbackDecisions, stalestOpenExp,
+        () => {}, () => {}, noop, noop, noop, EXP_COLS)();
+      return els["#exp-summary"].textContent + els["#exp-summary"].innerHTML;
+    };
+    const base = { decisions_last_7d: 2, vetted_last_7d: 1, revenue_last_7d: 5000, revenue_total: 12000 };
+    assert.equal(summaryText({ ...base, spent_total: 3450 }),
+      "No experiments yet. · 2 decisions this week · 1 vetted this week → 0 total experiments · $50.00 revenue this week · $120.00 lifetime · $34.50 spent");
+    assert.equal(summaryText(base),
+      "No experiments yet. · 2 decisions this week · 1 vetted this week → 0 total experiments · $50.00 revenue this week · $120.00 lifetime");
+    assert.equal(summaryText({ ...base, spent_total: null }),
+      "No experiments yet. · 2 decisions this week · 1 vetted this week → 0 total experiments · $50.00 revenue this week · $120.00 lifetime");
   });
 });
 

@@ -43,8 +43,11 @@ starter because none has evidence behind it yet.
 
 ## Logging it
 
-Press `Vet & log starter` on the seed row, name the experiment
+Seeds carry no review marker, so they never enter the Needs-review queue —
+open the seed row's drawer instead and press `Log experiment` in the admin
+zone. The modal opens prefilled for this seed — name the experiment
 "Buyer-signal census: 10 prompt niches", paste the hypothesis above into the
-hypothesis field and "passing niches (0–10)" into the metric field, then Start
-it. Close with Win/Lose only with the tally plus post-mortem in hand — never
-enter a $ figure without a receipt behind it.
+hypothesis field and "passing niches (0–10)" into the metric field — then Log
+it, flip the drawer's Status select to `testing` with Save + rescore, and
+Start it. Close with Win/Lose only with the tally plus post-mortem in hand —
+never enter a $ figure without a receipt behind it.
