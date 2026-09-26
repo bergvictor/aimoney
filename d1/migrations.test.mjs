@@ -25,9 +25,17 @@ function addedColumns(sql) {
   return out;
 }
 
-function experimentsColumns(schemaSql) {
-  const block = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?experiments\s*\(([\s\S]*?)\);/i.exec(schemaSql);
-  assert.ok(block, "schema.sql must own CREATE TABLE experiments");
+function addedColumnsByTable(sql) {
+  const out = [];
+  const re = /ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)/gi;
+  let m;
+  while ((m = re.exec(sql))) out.push({ table: m[1], column: m[2] });
+  return out;
+}
+
+function tableColumns(schemaSql, table) {
+  const block = new RegExp(`CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${table}\\s*\\(([\\s\\S]*?)\\);`, "i").exec(schemaSql);
+  assert.ok(block, `schema.sql must own CREATE TABLE ${table}`);
   return block[1]
     .split("\n")
     .map((line) => line.trim())
@@ -72,22 +80,31 @@ describe("CI applies sorted d1/migrate-*.sql (audit 2026-09-20-round4 Task 1)", 
 describe("old-schema migration convergence (audit 2026-09-20-round4 Task 3)", () => {
   // Columns the money path needs on experiments: health probes read
   // revenue_cents/spent_cents/ended_at and the API writes revenue_source.
-  const REQUIRED = ["revenue_cents", "spent_cents", "revenue_source", "ended_at"];
+  // The swept/noise split (audit 2026-09-26-round3 Task 3) needs swept on
+  // signals: the worker sweep marks it, the health split probes read it.
+  const REQUIRED = {
+    experiments: ["revenue_cents", "spent_cents", "revenue_source", "ended_at"],
+    signals: ["swept"],
+  };
 
-  function convergedColumns(withhold = null) {
-    const base = new Set(experimentsColumns(read("d1/schema.sql")));
+  function convergedColumns(table, withhold = null) {
+    const base = new Set(tableColumns(read("d1/schema.sql"), table));
     const files = migrationFiles();
     // Simulate a pre-migration database: created from an older schema.sql,
-    // so it lacks every column the migrations add.
+    // so it lacks every column the migrations add to this table.
     const migrated = new Set();
     for (const f of files) {
-      for (const c of addedColumns(read(`d1/${f}`))) migrated.add(c);
+      for (const { table: t, column: c } of addedColumnsByTable(read(`d1/${f}`))) {
+        if (t === table) migrated.add(c);
+      }
     }
     for (const c of migrated) base.delete(c);
     // Apply schema + ordered migrations (withhold one file for the control).
     for (const f of files) {
       if (f === withhold) continue;
-      for (const c of addedColumns(read(`d1/${f}`))) base.add(c);
+      for (const { table: t, column: c } of addedColumnsByTable(read(`d1/${f}`))) {
+        if (t === table) base.add(c);
+      }
     }
     return base;
   }
@@ -98,8 +115,8 @@ describe("old-schema migration convergence (audit 2026-09-20-round4 Task 3)", ()
     for (const f of files) {
       assert.ok(addedColumns(read(`d1/${f}`)).length >= 1, `${f} must add at least one column`);
     }
-    const final = convergedColumns();
-    for (const c of REQUIRED) {
+    const final = convergedColumns("experiments");
+    for (const c of REQUIRED.experiments) {
       assert.ok(final.has(c), `converged experiments table must own ${c}`);
     }
     // The required list is tied to shipped code: every SUM() column the
@@ -114,13 +131,26 @@ describe("old-schema migration convergence (audit 2026-09-20-round4 Task 3)", ()
     assert.ok(api.includes("ended_at") && final.has("ended_at"), "probed ended_at window must survive convergence");
   });
 
+  it("ends with the swept marker on signals after schema + ordered migrations", () => {
+    const final = convergedColumns("signals");
+    for (const c of REQUIRED.signals) {
+      assert.ok(final.has(c), `converged signals table must own ${c}`);
+    }
+    // Tied to shipped code both sides: the worker sweep marks the column,
+    // the health split probes read it.
+    const worker = read("worker/src/index.js");
+    const api = read("functions/api/[[path]].js");
+    assert.ok(worker.includes("swept = 1"), "worker sweep must mark the swept column");
+    assert.ok(api.includes("swept = 0") && api.includes("swept = 1"), "health split probes must read the swept column");
+  });
+
   it("withholding any one migration file breaks convergence (positive control)", () => {
     const files = migrationFiles();
     assert.ok(files.length >= 1, "positive control needs at least one migration file");
     for (const f of files) {
-      const partial = convergedColumns(f);
-      const missing = REQUIRED.filter((c) => !partial.has(c));
-      assert.ok(missing.length >= 1, `withholding ${f} must drop a required column, else the control is blind`);
+      const missingExp = REQUIRED.experiments.filter((c) => !convergedColumns("experiments", f).has(c));
+      const missingSig = REQUIRED.signals.filter((c) => !convergedColumns("signals", f).has(c));
+      assert.ok(missingExp.length + missingSig.length >= 1, `withholding ${f} must drop a required column, else the control is blind`);
     }
   });
 });

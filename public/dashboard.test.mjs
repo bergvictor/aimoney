@@ -2633,3 +2633,89 @@ describe("vetted-no-experiment filter button (audit 2026-09-26-round2 Task 3)", 
     assert.ok(rf.includes("if (!state.vettedNoExpOnly) return;"), "filter re-fetch must cost nothing while the filter is closed");
   });
 });
+
+describe("Log-experiment modal starter prefill (audit 2026-09-26-round3 Task 1)", () => {
+  // Shipped prefill helper extracted from the bundle (not copied) so drift fails.
+  function shippedModalPrefill() {
+    const tStart = js.indexOf("const STARTER_TEMPLATES = ");
+    assert.ok(tStart !== -1, "app.js lost STARTER_TEMPLATES");
+    const tEnd = js.indexOf("};", tStart);
+    assert.ok(tEnd !== -1 && tEnd > tStart, "app.js lost the template-map boundary");
+    const pStart = js.indexOf("function modalStarterPrefill");
+    assert.ok(pStart !== -1, "app.js lost modalStarterPrefill");
+    const pEnd = js.indexOf("\n}\n", pStart);
+    assert.ok(pEnd !== -1 && pEnd > pStart, "app.js lost the modalStarterPrefill boundary");
+    return new Function(
+      `${js.slice(tStart, tEnd + 2)}\n${js.slice(pStart, pEnd + 3)}\nreturn modalStarterPrefill;`)();
+  }
+
+  const DRAFTS = [
+    { file: "ZERO-SPEND-STARTER.md", slug: "digital-products-prompts", name: "Buyer-signal census: 10 prompt niches" },
+    { file: "FACELESS-YOUTUBE-STARTER.md", slug: "faceless-youtube-ai", name: "Channel census: 10 faceless niches" },
+    { file: "SEO-SITES-STARTER.md", slug: "ai-seo-content-sites", name: "SERP census: 10 programmatic niches" },
+  ];
+  const collapse = (s) => String(s).replace(/\s+/g, " ").trim();
+  const section = (text, heading) => {
+    const start = text.indexOf(`## ${heading}`);
+    assert.ok(start !== -1, `draft lost its ## ${heading} section`);
+    const next = text.indexOf("\n## ", start + 1);
+    return next === -1 ? text.slice(start) : text.slice(start, next);
+  };
+  const modalSlice = () => {
+    const modal = js.slice(js.indexOf("function openExperimentModal"), js.indexOf('$("#btn-add-exp")'));
+    assert.ok(modal.includes("function openExperimentModal"), "app.js lost the openExperimentModal block boundary");
+    return modal;
+  };
+
+  for (const d of DRAFTS) {
+    it(`${d.slug} modal prefill matches its draft word-for-word`, () => {
+      const brief = readFileSync(join(ROOT, "..", "docs", d.file), "utf8");
+      const seed = readFileSync(join(ROOT, "..", "d1", "seed.sql"), "utf8");
+      assert.ok(seed.includes(d.slug), `seed.sql lost the ${d.slug} row the modal prefill targets`);
+      const v = shippedModalPrefill()([{ id: 7, slug: d.slug, title: d.slug }], 7);
+      const logging = section(brief, "Logging it");
+      assert.ok(logging.includes(`"${d.name}"`), "draft lost its exact experiment name");
+      assert.equal(v.name, d.name, "modal prefill name must match the draft word-for-word");
+      const hypothesis = collapse(section(brief, "Hypothesis").replace(/^## Hypothesis\s*/, ""));
+      assert.equal(collapse(v.hypothesis), hypothesis, "modal prefill hypothesis must match the draft paragraph word-for-word");
+      assert.ok(logging.includes('"passing niches (0–10)" into the metric field'), "draft lost its exact metric value");
+      assert.equal(v.metric, "passing niches (0–10)", "modal prefill metric must match the draft");
+      assert.equal(v.target, "1+ passing niches", "modal prefill target must match the draft's 1+ bar");
+    });
+  }
+
+  it("unknown slugs, unknown ids, and empty lists prefill blank (generic rows byte-identical)", () => {
+    const prefill = shippedModalPrefill();
+    const blank = { name: "", hypothesis: "", metric: "", target: "" };
+    assert.deepEqual(prefill([{ id: 7, slug: "something-else", title: "Other" }], 7), blank);
+    assert.deepEqual(prefill([{ id: 7, slug: "digital-products-prompts", title: "Seed" }], 999), blank);
+    assert.deepEqual(prefill([{ id: 7, slug: "digital-products-prompts", title: "Seed" }], null), blank);
+    assert.deepEqual(prefill([], 7), blank);
+    assert.deepEqual(prefill(null, 7), blank);
+  });
+
+  it("new modals open with the prefill; switching the dropdown fills only empty fields", () => {
+    const modal = modalSlice();
+    assert.ok(modal.includes("modalStarterPrefill(opps, defaultOpp)"), "new modals lost the opening prefill lookup");
+    for (const field of ["isNew ? pre.name", "isNew ? pre.hypothesis", "isNew ? pre.metric", "isNew ? pre.target"]) {
+      assert.ok(modal.includes(field), `new modal lost its ${field} wiring`);
+    }
+    assert.ok(modal.includes('f.querySelector("#m-opp")'), "modal lost the dropdown lookup");
+    assert.ok(modal.includes('addEventListener("change"'), "modal lost the dropdown change listener");
+    assert.ok(modal.includes("modalStarterPrefill(opps, oppSel.value)"), "dropdown changes lost the selected-slug lookup");
+    assert.ok(modal.includes("if (!t.name && !t.hypothesis && !t.metric && !t.target) return;"), "unknown slugs must leave every field untouched");
+    for (const guard of ["if (nameEl && !nameEl.value)", "if (hypEl && !hypEl.value)", "if (metricEl && !metricEl.value)", "if (targetEl && !targetEl.value)"]) {
+      assert.ok(modal.includes(guard), `dropdown prefill lost its empty-field guard ${guard}`);
+    }
+  });
+
+  it("edits still save, edit mode keeps stored values, and status never auto-moves", () => {
+    const modal = modalSlice();
+    for (const key of ['name: $("#m-name").value.trim()', 'hypothesis: $("#m-hyp").value.trim()', 'metric: $("#m-metric").value.trim()', 'target: $("#m-target").value.trim()']) {
+      assert.ok(modal.includes(key), `modal save lost its ${key} payload key — edits would not save`);
+    }
+    assert.ok(modal.includes("exp?.name ||"), "edit mode lost its stored name");
+    assert.ok(modal.includes("/api/experiments"), "modal lost its experiments write path");
+    assert.ok(!modal.includes("/api/opportunities"), "modal must never touch opportunities (no status auto-move)");
+  });
+});

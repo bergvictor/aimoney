@@ -404,15 +404,28 @@ export async function runResearch(env, trigger) {
       ? env.DB.prepare("UPDATE agent_runs SET signals_seen=?, ai_calls=?, error=? WHERE id=?")
         .bind(state.seen, state.ai_calls, `phase:${phase}`).run().catch(() => null)
       : Promise.resolve();
-    // Staleness bound: unprocessed signals older than 30d become noise
+    // Staleness bound: unprocessed signals older than 30d are swept aside
     // (counted in state.stale) so the oldest-first take cannot wedge on
-    // ancient pre-deploy backlog. Best-effort; the take still bounds work.
-    // A failed sweep is named on the run log (stale:failed) instead of
-    // resolving silently — triage still proceeds.
+    // ancient pre-deploy backlog. Swept rows carry swept = 1 (audit
+    // 2026-09-26-round3 Task 3) so /api/health counts time-expired discards
+    // separately from model-verdict noise. Best-effort; the take still
+    // bounds work. A failed sweep is named on the run log (stale:failed)
+    // instead of resolving silently — triage still proceeds.
     let staleFailed = false;
     try {
-      const staleRun = await env.DB.prepare(
-        "UPDATE signals SET processed = 1 WHERE processed = 0 AND created_at != '' AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')").run();
+      let staleRun;
+      try {
+        staleRun = await env.DB.prepare(
+          "UPDATE signals SET processed = 1, swept = 1 WHERE processed = 0 AND created_at != '' AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')").run();
+      } catch (sweepErr) {
+        // Pre-migration table (no swept column): retry the legacy shape so
+        // the 30d bound still holds; any other error keeps the stale:failed
+        // path below.
+        const sweepMsg = sweepErr instanceof Error ? sweepErr.message : String(sweepErr ?? "");
+        if (!/no such column:\s*swept/i.test(sweepMsg)) throw sweepErr;
+        staleRun = await env.DB.prepare(
+          "UPDATE signals SET processed = 1 WHERE processed = 0 AND created_at != '' AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')").run();
+      }
       const staleMeta = (staleRun && staleRun.meta) || {};
       state.stale = Number(staleMeta.changes || staleMeta.rows_written) || 0;
     } catch { staleFailed = true; /* stale sweep failed; triage proceeds anyway */ }

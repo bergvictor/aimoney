@@ -33,6 +33,14 @@ const MONEY_COLUMN_DDL = {
 let schemaMigrationState = null;
 export function _resetSchemaMigrationForTests() { schemaMigrationState = null; }
 
+// Swept/noise split availability (audit 2026-09-26-round3 Task 3): live D1
+// may predate the signals.swept column the split probes read. The first
+// confirmed missing-column answer is cached per isolate (later calls skip
+// the split and report the combined count); any other outcome retries next
+// call. Tests reset via _resetSweptSplitForTests.
+let sweptSplitUnavailable = false;
+export function _resetSweptSplitForTests() { sweptSplitUnavailable = false; }
+
 async function ensureMoneyColumns(env) {
   if (schemaMigrationState) return schemaMigrationState;
   const none = { missing: [], migrated: false, disabled: false };
@@ -168,8 +176,10 @@ async function listOpportunities(env, url) {
   // Vetted-without-experiment filter (audit 2026-09-26-round2 Task 3): the
   // health probe's predicate verbatim (see the vetted_no_experiment probe
   // below), so the dashboard button filters to exactly the rows the
-  // week-line count counts. Status/sort/limit compose as usual.
-  if (vettedNoExpOnly) { where.push("o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"); }
+  // week-line count counts. Status/sort/limit compose as usual. Killed rows
+  // are excluded (audit 2026-09-26-round3 Task 2): a vet-then-kill keeps its
+  // vetted tag in notes but needs no experiment; paused stays (it can resume).
+  if (vettedNoExpOnly) { where.push("o.notes LIKE '%vetted]%' AND o.status != 'killed' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"); }
   const order = sort === "updated" ? "o.updated_at DESC" :
     sort === "oldest" ? "o.created_at ASC, o.id ASC" :
     sort === "value" ? "o.value DESC, o.score DESC" : "o.score DESC, o.updated_at DESC";
@@ -644,6 +654,8 @@ export async function onRequest(context) {
       for (let i = 0; i < 7; i++) vettedDays.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
       // One batched round-trip for every independent health select (paired
       // scans merged: lifetime totals, unreviewed+oldest; decisions split from revenue).
+      // The noise/swept split below runs as two auxiliary selects after the
+      // batch (they refine the noise probe, so they cannot batch with it).
       // Lifetime totals sum every row regardless of status (recorded cents
       // are recorded cents); the weekly probe stays bound to rows closed
       // in-window via ended_at.
@@ -664,7 +676,7 @@ export async function onRequest(context) {
         env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS total FROM experiments WHERE status IN ('won','lost') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')"),
         env.DB.prepare("SELECT COALESCE(SUM(revenue_cents),0) AS revenue, COALESCE(SUM(spent_cents),0) AS spent FROM experiments"),
         env.DB.prepare(`SELECT COUNT(*) AS n FROM opportunities WHERE ${vettedDays.map((d) => `notes LIKE '%[${d} vetted]%'`).join(" OR ")}`),
-        env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
+        env.DB.prepare("SELECT COUNT(*) AS n FROM opportunities o WHERE o.notes LIKE '%vetted]%' AND o.status != 'killed' AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.opportunity_id = o.id)"),
         env.DB.prepare("SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND created_at >= ?").bind(dayAgoIso),
         env.DB.prepare("SELECT substr(notes, -500) AS notes FROM opportunities WHERE notes LIKE '%vetted]%' OR notes LIKE '%killed]%' ORDER BY updated_at DESC LIMIT 2000"),
       ] : [];
@@ -753,6 +765,27 @@ export async function onRequest(context) {
       const vettedRow = firstRow(8);
       const vettedNoExpRow = firstRow(9);
       const noiseRow = firstRow(10);
+      // Swept/noise split (audit 2026-09-26-round3 Task 3): on tables
+      // carrying signals.swept, noise_24h narrows to model-verdict noise and
+      // swept_total reports time-expired discards. Pre-migration tables keep
+      // the combined count under noise_24h with swept_total null — never a
+      // failure, never a health_probe_failures entry.
+      let sweptTotal = null;
+      if (!healthDown && !probeFailed(10) && noiseRow && !sweptSplitUnavailable) {
+        try {
+          const verdictNoiseRow = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM signals WHERE processed = 1 AND opportunity_id IS NULL AND swept = 0 AND created_at >= ?").bind(dayAgoIso).first();
+          const sweptRow = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM signals WHERE swept = 1").first();
+          if (verdictNoiseRow && sweptRow) {
+            noiseRow.n = verdictNoiseRow.n;
+            sweptTotal = sweptRow.n;
+          }
+        } catch (err) {
+          const splitMsg = err instanceof Error ? err.message : String(err ?? "");
+          if (/no such column:\s*swept/i.test(splitMsg)) sweptSplitUnavailable = true;
+        }
+      }
       // Last-verdict date (finding 2, round3 F3): last_vetted stays the max
       // [YYYY-MM-DD vetted] tag (pure vet signal, null when never vetted);
       // last_verdict is the max over [date vetted] and [date killed] so a
@@ -817,7 +850,7 @@ export async function onRequest(context) {
           if (gotRev) { rev = gotRev; cachedHealthRev = gotRev; }
         }
       } catch { /* static file may be absent in previews */ }
-      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status: (healthDown || probeFailed(3)) ? null : experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(6)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(7)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(7)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(8)) ? null : (vettedRow ? vettedRow.n : 0), last_vetted: (healthDown || probeFailed(11)) ? null : last_vetted, last_verdict: (healthDown || probeFailed(11)) ? null : last_verdict, vetted_no_experiment: (healthDown || probeFailed(9)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(10)) ? null : (noiseRow ? noiseRow.n : 0), inflow_paused, time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}), ...(schemaNote && !schemaNote.disabled && schemaNote.failed && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "failed (migration attempted but columns are still missing; will retry on the next call)" } : {}) });
+      return json({ ok: !healthDown, rev, db: healthDown ? "down" : (db || healthProbeFailures ? "up" : "down"), opportunities: (healthDown || probeFailed(0)) ? null : (db ? db.n : 0), unreviewed: (healthDown || probeFailed(1)) ? null : (unreviewedRow ? unreviewedRow.n : 0), bare_without_brief: (healthDown || probeFailed(2)) ? null : (bareRow ? bareRow.n : 0), experiments_by_status: (healthDown || probeFailed(3)) ? null : experiments_by_status, hours_since_last_ok_run, oldest_unreviewed_age_h, decisions_last_7d: (healthDown || probeFailed(5)) ? null : (decisionsRow ? decisionsRow.n : 0), revenue_last_7d: (healthDown || probeFailed(6)) ? null : (revenueRow ? (revenueRow.total || 0) : 0), revenue_total: (healthDown || probeFailed(7)) ? null : (revenueTotalRow ? (revenueTotalRow.total || 0) : 0), spent_total: (healthDown || probeFailed(7)) ? null : (spentTotalRow ? (spentTotalRow.total || 0) : 0), vetted_last_7d: (healthDown || probeFailed(8)) ? null : (vettedRow ? vettedRow.n : 0), last_vetted: (healthDown || probeFailed(11)) ? null : last_vetted, last_verdict: (healthDown || probeFailed(11)) ? null : last_verdict, vetted_no_experiment: (healthDown || probeFailed(9)) ? null : (vettedNoExpRow ? vettedNoExpRow.n : 0), noise_24h: (healthDown || probeFailed(10)) ? null : (noiseRow ? noiseRow.n : 0), swept_total: (healthDown || probeFailed(10)) ? null : sweptTotal, inflow_paused, time: new Date().toISOString(), ...(healthProbeFailures ? { health_probe_failures: healthProbeFailures } : {}), ...(healthProbeDetail ? { health_probe_detail: healthProbeDetail } : {}), ...(schemaNote && schemaNote.disabled && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "disabled (set ALLOW_SCHEMA_MIGRATION=1 to add missing columns)" } : {}), ...(schemaNote && !schemaNote.disabled && schemaNote.failed && schemaNote.missing.length ? { schema_missing_columns: schemaNote.missing, schema_migration: "failed (migration attempted but columns are still missing; will retry on the next call)" } : {}) });
     }
     if (parts.length === 1 && parts[0] === "meta" && method === "GET") {
       return json({
