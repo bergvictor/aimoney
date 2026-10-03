@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "service": "aimoney-research",
+  "executor_host": "MAIN",
+  "source": {
+    "repo": "bergvictor/aimoney",
+    "remote": "origin",
+    "branch": "master",
+    "expected_revision": "fresh advertised refs/heads/master; HEAD must equal it and be content-clean"
+  },
+  "cloudflare": {
+    "account_id": "97120bae9770152d66a6881976a2a2d4",
+    "worker": "aimoney-research",
+    "public_url": "https://aimoney-research.levitinvlad.workers.dev",
+    "traffic_percent": 100,
+    "compatibility_date": "2026-05-01",
+    "compatibility_flags": [
+      "nodejs_compat"
+    ],
+    "crons": [
+      "0 */6 * * *"
+    ],
+    "bindings": [
+      {
+        "name": "ADMIN_TOKEN",
+        "type": "secret_text",
+        "preserve": true
+      },
+      {
+        "name": "AI",
+        "type": "ai",
+        "project": "<catalog>"
+      },
+      {
+        "name": "DB",
+        "type": "d1",
+        "database_id": "5f04098c-cb7c-4464-b8ae-e9063392ab70"
+      }
+    ],
+    "settings_policy": {
+      "unknown_settings": "decline before publication",
+      "observability": "absence and minimal enabled:false both mean disabled; never enable or replace nondefault options",
+      "managed_annotation": "workers/message=git:<full source SHA>",
+      "ignored_transport_annotation": "workers/triggered_by",
+      "normalized": {
+        "compatibility_date": "2026-05-01",
+        "compatibility_flags": [
+          "nodejs_compat"
+        ],
+        "usage_model": "standard",
+        "placement": {},
+        "logpush": false,
+        "tags": [],
+        "tail_consumers": [],
+        "streaming_tail_consumers": [],
+        "limits": {},
+        "cache_options": {},
+        "observability": {
+          "enabled": false
+        }
+      }
+    }
+  },
+  "tooling": {
+    "wrangler_version": "4.131.1",
+    "esbuild_version": "0.28.1",
+    "distribution": "external existing pinned direct wrangler-dist/cli.js, no installation or npx"
+  },
+  "build": {
+    "entry": "worker-entry.mjs",
+    "archive_paths": [
+      "worker/src/index.js",
+      "worker/src/lib.js",
+      "worker/src/rev.js",
+      "worker/wrangler.toml",
+      "deploy/stamp-worker-rev.sh",
+      "package.json",
+      "package-lock.json",
+      "deploy/worker-delivery.json",
+      "deploy/worker-delivery.mjs",
+      "deploy/worker-windowless.cjs",
+      "deploy/worker-delivery.test.mjs"
+    ],
+    "revision_stamp": "exact deterministic full-SHA worker/src/rev.js, consistent with deploy/stamp-worker-rev.sh",
+    "artifact_proof": "Exact raw compiled SHA256 by default; only a recognized named text multipart part whose raw hash differs may normalize physical CRLF to LF. Blob/file parts stay byte-exact; lone CR, trimming, sourcemap removal and substantive changes are rejected. Receipts separately report wire SHA and any text transport normalization.",
+    "source_config_sha256": "53a297baacb3f60fa59658fe9474c23e78673f1ad92685331e2597509cb882ef",
+    "stamp_helper_sha256": "52c1ad18be79882d061a91a54ac564c06bc0d3d74d9c123e459f60e95721fc7d"
+  },
+  "verification": {
+    "path": "/",
+    "status": 200,
+    "revision_field": "rev",
+    "agent": "research-v1",
+    "health_field": "ok",
+    "public_response_policy": "record only ok/agent/rev; never last_run or raw response bodies",
+    "provider": "one active100% version, git:<fullSHA> annotation, exact module SHA256, stable settings/binding/cron digest before and after"
+  },
+  "associated_pages": {
+    "url": "https://aimoney.pages.dev",
+    "public_artifacts": [
+      {
+        "source": "public/index.html",
+        "path": "/"
+      },
+      {
+        "source": "public/app.js",
+        "path": "/app.js"
+      },
+      {
+        "source": "public/favicon.svg",
+        "path": "/favicon.svg"
+      },
+      {
+        "source": "public/styles.css",
+        "path": "/styles.css"
+      }
+    ],
+    "revision_path": "/release.json",
+    "revision_policy": "require exact full fresh master SHA and exact served application bytes after automatic Git Pages build"
+  },
+  "constraints": [
+    "Worker-only infrastructure publication; no Pages upload, D1 execute/migrate/seed, AI requests, research runs, cron trigger, secrets update, recurring service or executor relocation.",
+    "Preserve exact existing D1, AI catalog, ADMIN_TOKEN secret name, compatibility, cron, logpush, tails and disabled observability.",
+    "Read named external root-provided token only in publish/verify; build-only is credential-free. Never log credential values, environment options, private body or last_run.",
+    "All native commands and descendants are windowless, shell:false, and on MAIN.",
+    "Do not stage, reset, change common Git configuration, or alter file permissions; ignore only Windows mode noise with per-command core.filemode=false."
+  ]
+}
