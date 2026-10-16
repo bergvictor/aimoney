@@ -13,6 +13,9 @@ money with AI:
   scans public sources (HN, Reddit, GitHub), proposes new
   opportunities, refreshes briefs, and re-scores the list with Workers AI.
   Every agent run is logged and visible on the dashboard.
+  **Paused since 2026-10-16** (owner decision): the worker has no cron trigger
+  (`crons = []` in `worker/wrangler.toml`), so it only runs on an admin
+  `POST /run`. The resume steps are in that file.
 
 ## Stack (matches the other deployments)
 

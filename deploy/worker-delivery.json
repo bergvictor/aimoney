@@ -17,9 +17,7 @@
     "compatibility_flags": [
       "nodejs_compat"
     ],
-    "crons": [
-      "0 */6 * * *"
-    ],
+    "crons": [],
     "bindings": [
       {
         "name": "ADMIN_TOKEN",
@@ -83,7 +81,7 @@
     ],
     "revision_stamp": "exact deterministic full-SHA worker/src/rev.js, consistent with deploy/stamp-worker-rev.sh",
     "artifact_proof": "Exact raw compiled SHA256 by default; only a recognized named text multipart part whose raw hash differs may normalize physical CRLF to LF. Blob/file parts stay byte-exact; lone CR, trimming, sourcemap removal and substantive changes are rejected. Receipts separately report wire SHA and any text transport normalization.",
-    "source_config_sha256": "53a297baacb3f60fa59658fe9474c23e78673f1ad92685331e2597509cb882ef",
+    "source_config_sha256": "850206f273798d587d607b534c632284c88bde45f68a97b1727456647b53852e",
     "stamp_helper_sha256": "52c1ad18be79882d061a91a54ac564c06bc0d3d74d9c123e459f60e95721fc7d"
   },
   "verification": {

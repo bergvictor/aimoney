@@ -144,13 +144,19 @@ else
 fi
 
 # Fresh agent runs: fail when the last ok run is older than 2x cron (12h).
-HOURS="$(curl -fsSL --max-time 25 "$PAGES/api/health?$CB" 2>/dev/null | python3 -c "import json,sys; v=json.load(sys.stdin).get('hours_since_last_ok_run'); print('' if v is None else v)" 2>/dev/null || echo '')"
-if [ -z "$HOURS" ]; then
-  echo "FAIL agent-freshness: hours_since_last_ok_run missing (no ok run yet?)"; FAIL=1
-elif awk "BEGIN{exit !( $HOURS > 12 )}"; then
-  echo "FAIL agent-freshness: last ok run ${HOURS}h ago (>12h)"; FAIL=1
+# A paused agent (crons = [] in worker/wrangler.toml, since 2026-10-16) has no
+# cadence to hold it to, so the gate names the pause instead of failing.
+if grep -q '^crons = \[\]$' worker/wrangler.toml 2>/dev/null; then
+  echo "skip agent-freshness (research agent paused: crons = [] in worker/wrangler.toml)"
 else
-  echo "ok   agent-freshness (${HOURS}h since last ok run)"
+  HOURS="$(curl -fsSL --max-time 25 "$PAGES/api/health?$CB" 2>/dev/null | python3 -c "import json,sys; v=json.load(sys.stdin).get('hours_since_last_ok_run'); print('' if v is None else v)" 2>/dev/null || echo '')"
+  if [ -z "$HOURS" ]; then
+    echo "FAIL agent-freshness: hours_since_last_ok_run missing (no ok run yet?)"; FAIL=1
+  elif awk "BEGIN{exit !( $HOURS > 12 )}"; then
+    echo "FAIL agent-freshness: last ok run ${HOURS}h ago (>12h)"; FAIL=1
+  else
+    echo "ok   agent-freshness (${HOURS}h since last ok run)"
+  fi
 fi
 
 if [ "$FAIL" -ne 0 ]; then

@@ -10,7 +10,7 @@ const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const manifest=JSON.parse(await fs.readFile(path.join(root,'deploy/worker-delivery.json'),'utf8'));
 const revision='8a0d7eab88e1dd896f7d2e9806879be3c729e899';
 const settings=()=>({bindings:[{name:'ADMIN_TOKEN',type:'secret_text'},{name:'AI',type:'ai',project:'<catalog>'},{name:'DB',type:'d1',id:'5f04098c-cb7c-4464-b8ae-e9063392ab70'}],compatibility_date:'2026-05-01',compatibility_flags:['nodejs_compat'],logpush:false,tail_consumers:[]});
-const schedules=()=>({schedules:[{cron:'0 */6 * * *',created_on:'old',modified_on:'later'}]});
+const schedules=()=>({schedules:[]}); // research agent paused 2026-10-16: the live worker has no cron trigger
 const clone=value=>JSON.parse(JSON.stringify(value));
 const fails=(fn,category)=>assert.throws(fn,error=>error instanceof delivery.DeliveryError&&error.diagnostic.category===category);
 test('manifest target, source branch, exact page artifacts and supported pins are fixed',()=>{
@@ -50,7 +50,7 @@ test('provider baseline preserves exact existing AI, D1, secret name, compatibil
   const b=settings();b.observability={enabled:false};
   const proof=delivery.settingsInventory(b,schedules(),manifest);
   delivery.assertConfiguration(a,proof);
-  assert.equal(a.bindings.length,3);assert.deepEqual(a.crons,['0 */6 * * *']);
+  assert.equal(a.bindings.length,3);assert.deepEqual(a.crons,[]);
   assert.equal(JSON.stringify(a).includes('secret value'),false);
 });
 test('unknown settings, secret/binding drift, revision override and observability enablement fail closed',()=>{
@@ -61,12 +61,15 @@ test('unknown settings, secret/binding drift, revision override and observabilit
     const s=settings();mutate(s);assert.throws(()=>delivery.settingsInventory(s,schedules(),manifest),delivery.DeliveryError);
   }
   fails(()=>delivery.settingsInventory(settings(),{schedules:[{cron:'* * * * *'}]},manifest),'cron-drift');
+  fails(()=>delivery.settingsInventory(settings(),{schedules:[{cron:'0 */6 * * *'}]},manifest),'cron-drift'); // a re-added 6-hourly cron is drift while paused
 });
 test('configuration digest detects changes while ignoring provider schedule timestamps',()=>{
   const before=delivery.settingsInventory(settings(),schedules(),manifest);
   const after=clone(before);after.configuration_sha256='0'.repeat(64);
   fails(()=>delivery.assertConfiguration(before,after),'changed-during-delivery');
-  delivery.assertConfiguration(before,delivery.settingsInventory(settings(),{schedules:[{cron:'0 */6 * * *',modified_on:'new'}]},manifest));
+  const cronManifest=clone(manifest);cronManifest.cloudflare.crons=['0 */6 * * *'];
+  const withCron=delivery.settingsInventory(settings(),{schedules:[{cron:'0 */6 * * *',created_on:'old',modified_on:'later'}]},cronManifest);
+  delivery.assertConfiguration(withCron,delivery.settingsInventory(settings(),{schedules:[{cron:'0 */6 * * *',modified_on:'new'}]},cronManifest));
 });
 test('active UUID requires single100percent traffic and exact full Git annotation',()=>{
   assert.equal(delivery.activeVersion({deployments:[{versions:[{percentage:100,version_id:'version-1'}]}]}),'version-1');

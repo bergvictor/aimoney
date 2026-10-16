@@ -3,10 +3,14 @@ main = "src/index.js"
 compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Research cadence: every 6 hours. The agent is idempotent (signals deduped,
-# briefs versioned), so overlapping or retried runs are harmless.
+# Research cadence: PAUSED since 2026-10-16 (owner decision: the agent's
+# proposals were noise and the review queue had stalled it since 4 Oct).
+# An empty list removes every cron trigger on deploy, so the agent never runs
+# on its own; an admin POST /run still does a one-off pass. To resume, restore
+# the 6-hourly schedule "0 */6 * * *" here and in deploy/worker-delivery.json
+# and .mjs, then run: wrangler triggers deploy --config worker/wrangler.toml
 [triggers]
-crons = ["0 */6 * * *"]
+crons = []
 
 [[d1_databases]]
 binding = "DB"

@@ -32,12 +32,12 @@ const fail = (phase,category,status) => {throw new DeliveryError(phase,category,
 export function validateManifest(m) {
   if(m?.schema_version!==1 || m.executor_host!=='MAIN' || m.source?.repo!=='bergvictor/aimoney' || m.source.remote!=='origin' || m.source.branch!=='master') fail('source','manifest-authority');
   if(m.cloudflare?.account_id!==ACCOUNT || m.cloudflare.worker!==WORKER || m.cloudflare.public_url!=='https://aimoney-research.levitinvlad.workers.dev' || m.cloudflare.traffic_percent!==100) fail('target','manifest-target');
-  if(!same(m.cloudflare.settings_policy?.normalized,PINNED_SETTINGS) || !same(m.cloudflare.crons,['0 */6 * * *']) || !same(m.build?.archive_paths,ARCHIVE_PATHS)) fail('configuration','manifest-policy');
+  if(!same(m.cloudflare.settings_policy?.normalized,PINNED_SETTINGS) || !same(m.cloudflare.crons,[]) || !same(m.build?.archive_paths,ARCHIVE_PATHS)) fail('configuration','manifest-policy');
   if(m.tooling?.wrangler_version!=='4.131.1'||m.tooling.esbuild_version!=='0.28.1'||m.build.entry!=='worker-entry.mjs') fail('build','manifest-tooling');
   if(m.verification?.path!=='/' || m.verification.status!==200 || m.verification.revision_field!=='rev' || m.verification.agent!=='research-v1') fail('public','manifest-contract');
   const pages=[{source:'public/index.html',path:'/'},{source:'public/app.js',path:'/app.js'},{source:'public/favicon.svg',path:'/favicon.svg'},{source:'public/styles.css',path:'/styles.css'}];
   if(m.associated_pages?.url!=='https://aimoney.pages.dev'||m.associated_pages.revision_path!=='/release.json'||!same(m.associated_pages.public_artifacts,pages)) fail('pages','manifest-scope');
-  if(m.build.source_config_sha256!=='53a297baacb3f60fa59658fe9474c23e78673f1ad92685331e2597509cb882ef'||m.build.stamp_helper_sha256!=='52c1ad18be79882d061a91a54ac564c06bc0d3d74d9c123e459f60e95721fc7d')fail('build','application-config-scope');
+  if(m.build.source_config_sha256!=='850206f273798d587d607b534c632284c88bde45f68a97b1727456647b53852e'||m.build.stamp_helper_sha256!=='52c1ad18be79882d061a91a54ac564c06bc0d3d74d9c123e459f60e95721fc7d')fail('build','application-config-scope');
   return m;
 }
 export function parseArgs(argv) {
@@ -232,7 +232,7 @@ export async function build(m,revision,tools,temp,gitFn=git,runFn=run) {
   for(const rel of m.build.archive_paths) {const destination=path.join(temp,rel);await fs.mkdir(path.dirname(destination),{recursive:true});await fs.writeFile(destination,files.get(rel));}
   if(sha256(files.get('worker/wrangler.toml'))!==m.build.source_config_sha256||sha256(files.get('deploy/stamp-worker-rev.sh'))!==m.build.stamp_helper_sha256)fail('build','source-config-scope');
   const toml=files.get('worker/wrangler.toml').toString('utf8');
-  if(!/^name\s*=\s*"aimoney-research"$/m.test(toml)||!/^main\s*=\s*"src\/index.js"$/m.test(toml)||!/^compatibility_date\s*=\s*"2026-05-01"$/m.test(toml)||!toml.includes('crons = ["0 */6 * * *"]')||!toml.includes('database_id = "'+DATABASE+'"')||!toml.includes('binding = "AI"'))fail('build','source-config');
+  if(!/^name\s*=\s*"aimoney-research"$/m.test(toml)||!/^main\s*=\s*"src\/index.js"$/m.test(toml)||!/^compatibility_date\s*=\s*"2026-05-01"$/m.test(toml)||!/^crons = \[\]$/m.test(toml)||!toml.includes('database_id = "'+DATABASE+'"')||!toml.includes('binding = "AI"'))fail('build','source-config');
   const lock=JSON.parse(files.get('package-lock.json').toString('utf8'));
   if(lock.packages?.['node_modules/wrangler']?.version!=='4.131.1'||lock.packages?.['node_modules/esbuild']?.version!=='0.28.1')fail('build','lock-pin');
   const rev=stampRevision(revision,files.get('worker/src/rev.js'));
